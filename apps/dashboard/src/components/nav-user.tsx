@@ -46,12 +46,8 @@ export function NavUser() {
               <Avatar className="h-8 w-8 rounded-lg">
                 <AvatarFallback className="rounded-lg">{fallback}</AvatarFallback>
               </Avatar>
-              <div className="grid flex-1 text-left text-sm leading-tight">
-                <span className="truncate font-medium">{fullName}</span>
-                <span className="truncate text-xs text-muted-foreground">
-                  {staff.email}
-                </span>
-              </div>
+              {/* Email and role stay in the dropdown below. */}
+              <span className="flex-1 truncate text-left text-sm font-medium">{fullName}</span>
               <EllipsisVerticalIcon className="ml-auto size-4" />
             </SidebarMenuButton>
           </DropdownMenuTrigger>

@@ -20,10 +20,10 @@ Cargo workspace of 9 crates under `crates/` (version, edition, and all dependenc
 | `domain` | Pure types: `Network`, `Token`, statuses, `StaffRole`, `DomainError`, amount conversion/tolerance helpers. No I/O, no async |
 | `wallet` | HD derivation from BIP39 mnemonic. ETH/Tron via BIP44 `m/44'/60'/0'/0/{index}` (secp256k1); Solana via SLIP-0010 `m/44'/501'/{index}'/0'` (ed25519), returning the USDT **associated token account** address |
 | `auth` | Pure auth primitives (no I/O, no async): argon2id password hashing, HS256 JWT issue/decode, refresh-token and API-key generation + SHA-256 hashing, constant-time comparison |
-| `db` | `Db` wrapper over a `PgPool`, row structs, all SQL queries, sqlx migrations (`crates/db/migrations/`). Split into `lib.rs` (payments/webhooks) + `staff.rs`, `api_keys.rs`, `admin_queries.rs`, `settings.rs`, `webhook_endpoints.rs` |
+| `db` | `Db` wrapper over a `PgPool`, row structs, all SQL queries, sqlx migrations (`crates/db/migrations/`). Split into `lib.rs` (payments/webhooks) + `staff.rs`, `api_keys.rs`, `admin_queries.rs`, `settings.rs`, `webhook_endpoints.rs`, `api_traffic.rs` (request log + aggregates) |
 | `chain` | HTTP clients for TronGrid, Alchemy (Ethereum JSON-RPC), Helius (Solana): transfer polling + USDT balance fetches, Tron rate-limit backoff |
-| `jobs` | `AppState` (shared by API + workers), background workers (`spawn_workers`): one monitor loop per network, webhook delivery loop, hourly wallet-balance sync; deposit confirmation logic (`process_detected_transfer`); manual retriggers (`retrigger_webhook`, `retrigger_failed_webhooks`) |
-| `api` | Axum router: `/healthz`, `/readyz`, `/api/v1/*` (guarded by `x-api-key`), `/api/admin/v1/*` (guarded by staff JWT; admin-only sub-routes for staff/API keys); `middleware.rs` (guards) + `admin.rs` (dashboard handlers); `ApiError` (`{"statusCode": ..., "message": ...}`) |
+| `jobs` | `AppState` (shared by API + workers), background workers (`spawn_workers`): one monitor loop per network, webhook delivery loop, hourly wallet-balance sync, API traffic writer + retention purge (`traffic.rs`, `TrafficRecorder`); deposit confirmation logic (`process_detected_transfer`); manual retriggers (`retrigger_webhook`, `retrigger_failed_webhooks`) |
+| `api` | Axum router: `/healthz`, `/readyz`, `/api/v1/*` (guarded by `x-api-key`), `/api/admin/v1/*` (guarded by staff JWT; admin-only sub-routes for staff/API keys); `middleware.rs` (guards) + `traffic.rs` (request-log middleware) + `admin.rs` (dashboard handlers); `ApiError` (`{"statusCode": ..., "message": ...}`) |
 | `gateway` | The binary. Wires config → wallet → db (+ migrations) → redis → chain → workers → HTTP server |
 
 Auth model: staff accounts live in `staff_users` (roles `ADMIN` / `OPERATOR`, argon2id hashes, `firstName`/`lastName`); merchant keys in `api_keys` (clear `prefix` for lookup + SHA-256 `keyHash`, revocation via `revokedAt`). Refresh tokens are stored hashed in Redis (`auth:refresh:{sha256}`, TTL `REFRESH_TOKEN_TTL_DAYS`, rotated on every refresh). The first admin is created through the dashboard's `/setup` wizard (guarded insert — only while `staff_users` is empty); there is no env-var seeding. `JWT_SECRET` (≥ 32 chars) is required or `/api/admin/v1` is not mounted.
@@ -41,7 +41,7 @@ cargo run -p gateway
 cd apps/dashboard && npm install && npm run dev
 
 # Tests — this is exactly what CI runs; keep it green
-cargo test -p domain -p wallet -p config -p jobs -p auth
+cargo test -p domain -p wallet -p config -p jobs -p auth -p api
 
 # Type-check + build the dashboard
 cd apps/dashboard && npm run build
@@ -53,7 +53,7 @@ cargo build --release -p gateway
 docker compose up --build
 ```
 
-Migrations run automatically at boot via `sqlx::migrate!` (failure is logged as a warning, not fatal). There are **no integration tests** for `api`/`chain`/`jobs` yet — unit tests live only in `domain` and `wallet` (BIP39/HD golden vectors, amount tolerance, enum roundtrips). If you change derivation logic, the golden-vector tests in `crates/wallet/src/lib.rs` must still pass byte-for-byte.
+Migrations run automatically at boot via `sqlx::migrate!` (failure is logged as a warning, not fatal). There are **no DB integration tests** — unit tests live in `domain`, `wallet` (BIP39/HD golden vectors, amount tolerance, enum roundtrips), `config`, `auth`, `jobs` (traffic queue) and `api` (traffic middleware via `tower::ServiceExt::oneshot`). If you change derivation logic, the golden-vector tests in `crates/wallet/src/lib.rs` must still pass byte-for-byte.
 
 ## Conventions
 
@@ -70,7 +70,8 @@ Migrations run automatically at boot via `sqlx::migrate!` (failure is logged as 
 - **ID confusion in webhooks**: the webhook JSON field `data.deposit_id` is actually `deposit_addresses.id` (for every event type), while the Redis queue and `webhook_deliveries.depositId` hold `deposits.id` for PAID. This is intentional and load-bearing for existing receivers — do not "fix" the payload.
 - **Event subscriptions**: `webhook_endpoints.events` (TEXT[], DB values `PENDING`/`PAID`/`EXPIRED`) gates every fan-out AND every delivery attempt (`deliver_webhook` re-checks it, like `isActive`). Payload `event_type` values are `payment_pending`, `deposit_confirmed` (historical name — never rename), `payment_expired`. PENDING fires on address creation (API handler), EXPIRED from `expire_addresses_and_notify` (called by monitor loops and the list endpoint), PAID at deposit confirmation.
 - **Per-endpoint deliveries**: PAID deliveries are tracked per (deposit, endpoint) pair; PENDING/EXPIRED per (address, event, endpoint) with `depositId` NULL. The authoritative row is the newest per key (`DISTINCT ON ("depositAddressId", "eventType", "depositId", "webhookEndpointId")`). Rows with a NULL `webhookEndpointId` are pre-multi-endpoint history. Redis ZSET members are `"{deposit_id}|{endpoint_id}"` for PAID and `"{EVENT}|{address_id}|{endpoint_id}"` for address events; a bare member (no `|`) is legacy and gets fanned out to all active PAID endpoints by `webhook_loop`. No active endpoints = webhooks silently disabled (503 only on manual retry).
-- **Admin-managed settings**: default payment expiry is `app_settings.depositExpiryMinutes` (default 60, max 1440), not an env var.
+- **Admin-managed settings**: default payment expiry is `app_settings.depositExpiryMinutes` (default 60, max 1440), not an env var. Likewise the traffic-log retention is `app_settings.apiTrafficRetentionDays` (default 730; `0` = keep forever, surfaced as `null` in the API), re-read by the purge loop on every hourly tick.
+- **API traffic log** (`api_requests`, Dashboard → Traffic): the `record_traffic` middleware must stay *outside* the auth guards in `router()` (added after both `nest`s, via `.layer` not `.route_layer`) so it sees rejected requests and the identity the guards copy into the **response** extensions (`CurrentApiKey` / `CurrentStaff`). It stores the matched route template, never the raw path or bodies, and **never the raw `x-api-key`** — only `apiKeyId`. Recording is a non-blocking `try_send` into a bounded channel; drops are counted and exposed as `dropped_events`. `/api/v1` is the `MERCHANT` surface, `/api/admin/v1` is `ADMIN` (the dashboard's own polling — hidden by default in the UI); health checks are not recorded.
 - **API key format**: `[{tag}_]{8 alnum}_{40 alnum}`. The tag is `app_settings.apiKeyPrefix` (≤ 5 alphanumeric chars, empty = no tag) and only affects newly generated keys. `auth::parse_api_key_prefix` is deliberately tag-agnostic (splits on the last `_`) so keys issued under any past tag — including the historic `spg` — keep validating after the setting changes. Never re-tighten it to a specific tag.
 - **API key expiry**: `api_keys.expiresAt` (NULL = never) with status machine `ACTIVE`/`REVOKED`/`EXPIRED`. Enforcement is two-level: `find_api_key_by_prefix` rejects past-deadline keys immediately (the security boundary), while `api_key_expiry_loop` (5 min, first run at boot) only materializes `EXPIRED` for listings/stats. List handlers derive the displayed status so a key can never show `active` after its deadline, even between sweeps.
 - **Confirmation thresholds**: Tron 19, Ethereum 12 (env-overridable), Solana hardcoded to 1 (`domain::required_confirmations`).

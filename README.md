@@ -141,12 +141,14 @@ the acting staff member's `Authorization: Bearer <access_token>`. Requires `JWT_
 | POST | `/auth/logout` · GET `/auth/me` | JWT | Session management |
 | GET/POST/PATCH | `/staff`, `/staff/{id}` | admin | List/create/update staff (roles `admin` / `operator`, activation, password) |
 | GET/POST/DELETE | `/api-keys`, `/api-keys/{id}` | admin | List/create/revoke merchant API keys (secret shown once; optional `expires_in_days` 30/90/180/365, omit for no expiry — expired keys get status `expired` and stop working) |
-| GET/PATCH | `/settings` | admin | Read/update system settings (`deposit_expiry_minutes` 1–1440, `api_key_prefix` ≤ 5 alphanum; PATCH is partial) |
+| GET/PATCH | `/settings` | admin | Read/update system settings (`deposit_expiry_minutes` 1–1440, `api_key_prefix` ≤ 5 alphanum, `api_traffic_retention_days` 1–3650 or `null` = keep forever; PATCH is partial) |
 | GET/POST/PATCH/DELETE | `/webhook-endpoints`, `/webhook-endpoints/{id}` | admin | Manage outgoing webhook endpoints (subscribed `events` — `pending`/`paid`/`expired` — activate/deactivate; delete only when unused) |
 | GET | `/webhooks?status=&limit=&offset=` | JWT | Latest delivery per event key, joined with deposit (if any) + address |
 | POST | `/webhooks/retry-failed` | JWT | Bulk-requeue all failed deliveries (paid ones only once their deposit is confirmed) |
 | POST | `/webhook-deliveries/{id}/retry` | JWT | Replay one delivery row (works for every event type) |
 | GET | `/stats` | JWT | Counters (addresses/deposits/webhooks by status) + confirmed volume |
+| GET | `/traffic/overview?surface=merchant\|admin\|all&window=15m\|1h\|24h` | JWT | API traffic aggregates: req/min, error rate, p50/p95 latency, per-bucket time series, top routes, top API keys |
+| GET | `/traffic/requests?surface=&status=2xx..5xx&route=&method=&api_key_id=&limit=&offset=` | JWT | Paginated request log (method, matched route, status, duration, key/staff identity, IP — no bodies, never the raw key) |
 | — | `/deposit-addresses*`, `/deposits/{id}/webhooks/retry`, `/balances`, `/wallet-balances` | JWT | Same handlers as `/api/v1`, JWT-authenticated for the dashboard |
 
 ## Webhook events & payloads
@@ -261,6 +263,7 @@ To report a vulnerability, use [GitHub Security Advisories](https://github.com/n
 | `REFRESH_TOKEN_TTL_DAYS` | No | `30` | Staff refresh-token lifetime (stored in Redis, rotated) |
 | `DASHBOARD_PORT` | No | `8080` | Host port of the dashboard container (docker compose) |
 | `CORS_ALLOWED_ORIGINS` | No | — | Comma-separated origins; only needed if the dashboard is not same-origin |
+| `API_TRAFFIC_ENABLED` | No | `true` | Record every `/api/*` request into the `api_requests` log shown on Dashboard → Traffic (retention is a dashboard setting, 2 years by default) |
 
 \* Required for monitoring on the respective network.
 \** Required for the admin API and the dashboard.

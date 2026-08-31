@@ -1,11 +1,12 @@
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use anyhow::Context;
 use api::router;
 use chain::ChainClients;
-use config::AppConfig;
+use config::{AppConfig, API_TRAFFIC_QUEUE_CAPACITY};
 use db::Db;
-use jobs::{spawn_workers, AppState};
+use jobs::{spawn_workers, AppState, TrafficRecorder};
 use redis::aio::ConnectionManager;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
@@ -58,20 +59,28 @@ async fn main() -> anyhow::Result<()> {
         .context("Failed to connect to Redis")?;
 
     let chain = ChainClients::new(config.clone());
+    let (traffic, traffic_rx) = TrafficRecorder::channel(API_TRAFFIC_QUEUE_CAPACITY);
     let state = AppState {
         config: config.clone(),
         db,
         wallet,
         chain,
         redis,
+        traffic,
     };
 
-    spawn_workers(state.clone());
+    spawn_workers(state.clone(), traffic_rx);
 
     let app = router(state);
     let addr = format!("0.0.0.0:{}", config.port);
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     info!("Listening on {addr}");
-    axum::serve(listener, app).await?;
+    // ConnectInfo gives the traffic log a peer address when no proxy header
+    // is present.
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await?;
     Ok(())
 }

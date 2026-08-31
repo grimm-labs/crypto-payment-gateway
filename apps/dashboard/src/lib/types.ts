@@ -170,6 +170,8 @@ export interface AppSettings {
   api_key_prefix: string | null
   /** Effective value — the default is returned when nothing is configured. */
   totp_issuer: string
+  /** Days the API traffic log is kept; null = forever. */
+  api_traffic_retention_days: number | null
 }
 
 /** PATCH /settings is partial — only provided fields are updated. */
@@ -178,7 +180,82 @@ export type AppSettingsUpdate = Partial<{
   api_key_prefix: string
   /** Empty string resets to the default issuer. */
   totp_issuer: string
+  /** 1–3650 days, or null to keep forever. */
+  api_traffic_retention_days: number | null
 }>
+
+/** `merchant` = /api/v1 (API keys), `admin` = dashboard calls, `all` = both. */
+export type TrafficSurface = "merchant" | "admin" | "all"
+export type TrafficWindow = "15m" | "1h" | "24h"
+export type StatusClass = "2xx" | "3xx" | "4xx" | "5xx"
+
+export interface TrafficSummary {
+  requests_total: number
+  requests_last_minute: number
+  requests_per_minute_avg: number
+  /** 0–1 fraction of 4xx+5xx over the window. */
+  error_rate: number
+  client_errors: number
+  server_errors: number
+  p50_ms: number | null
+  p95_ms: number | null
+  active_keys: number
+  /** Events lost since boot because the in-memory queue was full. */
+  dropped_events: number
+}
+
+export interface TrafficBucket {
+  bucket: string
+  ok: number
+  client_error: number
+  server_error: number
+  p95_ms: number | null
+}
+
+export interface TrafficRouteStat {
+  method: string
+  route: string
+  count: number
+  client_errors: number
+  server_errors: number
+  p95_ms: number | null
+}
+
+export interface TrafficApiKeyStat {
+  /** null = requests that carried no valid key. */
+  api_key_id: string | null
+  name: string | null
+  prefix: string | null
+  status: ApiKeyStatus | null
+  count: number
+  client_errors: number
+  server_errors: number
+  p95_ms: number | null
+  last_seen_at: string
+}
+
+export interface TrafficOverview {
+  surface: TrafficSurface
+  window: TrafficWindow
+  bucket_seconds: number
+  summary: TrafficSummary
+  timeseries: TrafficBucket[]
+  top_routes: TrafficRouteStat[]
+  top_api_keys: TrafficApiKeyStat[]
+}
+
+export interface TrafficRequest {
+  id: number
+  surface: Exclude<TrafficSurface, "all">
+  method: string
+  route: string
+  status: number
+  duration_ms: number
+  api_key: { id: string; name: string | null; prefix: string | null } | null
+  staff: { id: string; name: string | null } | null
+  ip: string | null
+  created_at: string
+}
 
 export interface WebhookEndpoint {
   id: string

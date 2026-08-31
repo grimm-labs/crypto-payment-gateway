@@ -330,6 +330,152 @@ impl StaffRole {
     }
 }
 
+/// Which public HTTP surface a recorded request hit. Used by the traffic
+/// log so the dashboard's own polling can be told apart from merchant calls.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ApiSurface {
+    Merchant,
+    Admin,
+}
+
+impl ApiSurface {
+    pub fn as_db(&self) -> &'static str {
+        match self {
+            Self::Merchant => "MERCHANT",
+            Self::Admin => "ADMIN",
+        }
+    }
+
+    pub fn as_api(&self) -> &'static str {
+        match self {
+            Self::Merchant => "merchant",
+            Self::Admin => "admin",
+        }
+    }
+
+    pub fn parse_api(value: &str) -> Result<Self, DomainError> {
+        match value.to_lowercase().as_str() {
+            "merchant" => Ok(Self::Merchant),
+            "admin" => Ok(Self::Admin),
+            _ => Err(DomainError::InvalidSurface(value.to_string())),
+        }
+    }
+
+    pub fn from_db(value: &str) -> Result<Self, DomainError> {
+        match value {
+            "MERCHANT" => Ok(Self::Merchant),
+            "ADMIN" => Ok(Self::Admin),
+            _ => Err(DomainError::InvalidSurface(value.to_string())),
+        }
+    }
+
+    /// Classify a request path. `None` for anything that is not a public
+    /// API route (health checks, unknown prefixes) — those are not recorded.
+    pub fn from_path(path: &str) -> Option<Self> {
+        if path == "/api/admin/v1" || path.starts_with("/api/admin/v1/") {
+            Some(Self::Admin)
+        } else if path == "/api/v1" || path.starts_with("/api/v1/") {
+            Some(Self::Merchant)
+        } else {
+            None
+        }
+    }
+}
+
+/// HTTP status class used to filter the traffic log.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatusClass {
+    Success,
+    Redirect,
+    ClientError,
+    ServerError,
+}
+
+impl StatusClass {
+    pub fn as_api(&self) -> &'static str {
+        match self {
+            Self::Success => "2xx",
+            Self::Redirect => "3xx",
+            Self::ClientError => "4xx",
+            Self::ServerError => "5xx",
+        }
+    }
+
+    pub fn parse_api(value: &str) -> Result<Self, DomainError> {
+        match value.to_lowercase().as_str() {
+            "2xx" => Ok(Self::Success),
+            "3xx" => Ok(Self::Redirect),
+            "4xx" => Ok(Self::ClientError),
+            "5xx" => Ok(Self::ServerError),
+            _ => Err(DomainError::InvalidStatus(value.to_string())),
+        }
+    }
+
+    /// Inclusive status-code bounds of the class.
+    pub fn range(&self) -> (i16, i16) {
+        match self {
+            Self::Success => (200, 299),
+            Self::Redirect => (300, 399),
+            Self::ClientError => (400, 499),
+            Self::ServerError => (500, 599),
+        }
+    }
+
+    pub fn of(status: u16) -> Option<Self> {
+        match status {
+            200..=299 => Some(Self::Success),
+            300..=399 => Some(Self::Redirect),
+            400..=499 => Some(Self::ClientError),
+            500..=599 => Some(Self::ServerError),
+            _ => None,
+        }
+    }
+}
+
+/// Trailing time window of the traffic overview, with its chart bucket size
+/// (30 / 60 / 96 points respectively).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrafficWindow {
+    M15,
+    H1,
+    H24,
+}
+
+impl TrafficWindow {
+    pub fn as_api(&self) -> &'static str {
+        match self {
+            Self::M15 => "15m",
+            Self::H1 => "1h",
+            Self::H24 => "24h",
+        }
+    }
+
+    pub fn parse_api(value: &str) -> Result<Self, DomainError> {
+        match value.to_lowercase().as_str() {
+            "15m" => Ok(Self::M15),
+            "1h" => Ok(Self::H1),
+            "24h" => Ok(Self::H24),
+            _ => Err(DomainError::InvalidWindow(value.to_string())),
+        }
+    }
+
+    pub fn secs(&self) -> i64 {
+        match self {
+            Self::M15 => 15 * 60,
+            Self::H1 => 60 * 60,
+            Self::H24 => 24 * 60 * 60,
+        }
+    }
+
+    pub fn bucket_secs(&self) -> i64 {
+        match self {
+            Self::M15 => 30,
+            Self::H1 => 60,
+            Self::H24 => 15 * 60,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct DetectedTransfer {
     pub deposit_address_id: String,
@@ -350,6 +496,10 @@ pub enum DomainError {
     InvalidAmount(String),
     #[error("Invalid role: {0}")]
     InvalidRole(String),
+    #[error("Invalid surface: {0}")]
+    InvalidSurface(String),
+    #[error("Invalid window: {0}")]
+    InvalidWindow(String),
 }
 
 pub fn raw_to_decimal(raw: &str) -> Result<Decimal, DomainError> {
@@ -450,6 +600,50 @@ mod tests {
         assert_eq!(StaffRole::from_db("OPERATOR").unwrap().as_api(), "operator");
         assert!(StaffRole::from_db("admin").is_err());
         assert!(StaffRole::parse_api("viewer").is_err());
+    }
+
+    #[test]
+    fn api_surface_roundtrip_and_paths() {
+        assert_eq!(ApiSurface::parse_api("Merchant").unwrap().as_db(), "MERCHANT");
+        assert_eq!(ApiSurface::from_db("ADMIN").unwrap().as_api(), "admin");
+        assert!(ApiSurface::from_db("admin").is_err());
+        assert!(ApiSurface::parse_api("all").is_err());
+
+        assert_eq!(ApiSurface::from_path("/api/v1/balances"), Some(ApiSurface::Merchant));
+        assert_eq!(ApiSurface::from_path("/api/v1"), Some(ApiSurface::Merchant));
+        assert_eq!(ApiSurface::from_path("/api/admin/v1/stats"), Some(ApiSurface::Admin));
+        assert_eq!(ApiSurface::from_path("/api/admin/v1"), Some(ApiSurface::Admin));
+        assert_eq!(ApiSurface::from_path("/healthz"), None);
+        assert_eq!(ApiSurface::from_path("/readyz"), None);
+        assert_eq!(ApiSurface::from_path("/api/v2/x"), None);
+        assert_eq!(ApiSurface::from_path("/api/v10/x"), None);
+    }
+
+    #[test]
+    fn status_class_boundaries() {
+        assert_eq!(StatusClass::of(199), None);
+        assert_eq!(StatusClass::of(200), Some(StatusClass::Success));
+        assert_eq!(StatusClass::of(299), Some(StatusClass::Success));
+        assert_eq!(StatusClass::of(300), Some(StatusClass::Redirect));
+        assert_eq!(StatusClass::of(399), Some(StatusClass::Redirect));
+        assert_eq!(StatusClass::of(400), Some(StatusClass::ClientError));
+        assert_eq!(StatusClass::of(499), Some(StatusClass::ClientError));
+        assert_eq!(StatusClass::of(500), Some(StatusClass::ServerError));
+        assert_eq!(StatusClass::of(599), Some(StatusClass::ServerError));
+        assert_eq!(StatusClass::of(600), None);
+        assert_eq!(StatusClass::parse_api("4XX").unwrap().range(), (400, 499));
+        assert_eq!(StatusClass::ServerError.as_api(), "5xx");
+        assert!(StatusClass::parse_api("1xx").is_err());
+    }
+
+    #[test]
+    fn traffic_window_buckets_divide_evenly() {
+        for window in [TrafficWindow::M15, TrafficWindow::H1, TrafficWindow::H24] {
+            assert_eq!(window.secs() % window.bucket_secs(), 0);
+            assert!(window.secs() / window.bucket_secs() <= 100);
+            assert_eq!(TrafficWindow::parse_api(window.as_api()).unwrap(), window);
+        }
+        assert!(TrafficWindow::parse_api("7d").is_err());
     }
 
     #[test]

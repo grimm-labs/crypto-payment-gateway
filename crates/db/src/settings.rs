@@ -1,11 +1,14 @@
 use anyhow::Result;
-use config::{DEPOSIT_EXPIRY_DEFAULT_MINUTES, TOTP_ISSUER};
+use config::{API_TRAFFIC_RETENTION_DEFAULT_DAYS, DEPOSIT_EXPIRY_DEFAULT_MINUTES, TOTP_ISSUER};
 
 use crate::Db;
 
 pub const DEPOSIT_EXPIRY_SETTING: &str = "depositExpiryMinutes";
 pub const API_KEY_PREFIX_SETTING: &str = "apiKeyPrefix";
 pub const TOTP_ISSUER_SETTING: &str = "totpIssuer";
+pub const API_TRAFFIC_RETENTION_SETTING: &str = "apiTrafficRetentionDays";
+/// Stored value meaning "never purge the traffic log".
+pub const API_TRAFFIC_RETENTION_FOREVER: &str = "0";
 
 impl Db {
     pub async fn get_setting(&self, key: &str) -> Result<Option<String>> {
@@ -60,5 +63,17 @@ impl Db {
             .and_then(|v| v.parse::<i64>().ok())
             .filter(|v| *v > 0)
             .unwrap_or(DEPOSIT_EXPIRY_DEFAULT_MINUTES))
+    }
+
+    /// Retention of the API traffic log, admin-configurable from the
+    /// dashboard. `Ok(None)` means indefinite (stored as "0" — rows are never
+    /// purged). A missing or unparsable row falls back to the code default.
+    pub async fn api_traffic_retention_days(&self) -> Result<Option<i64>> {
+        let value = self.get_setting(API_TRAFFIC_RETENTION_SETTING).await?;
+        Ok(match value.and_then(|v| v.trim().parse::<i64>().ok()) {
+            Some(0) => None,
+            Some(days) if days > 0 => Some(days),
+            _ => Some(API_TRAFFIC_RETENTION_DEFAULT_DAYS),
+        })
     }
 }

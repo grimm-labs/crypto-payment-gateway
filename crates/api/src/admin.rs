@@ -3,11 +3,13 @@ use axum::http::StatusCode;
 use chrono::Utc;
 use axum::routing::{delete, get, patch, post};
 use axum::{Extension, Json, Router};
-use db::StaffUserRow;
-use domain::{StaffRole, WebhookDeliveryStatus, WebhookEventType};
+use db::{ApiRequestFilter, ApiRequestRow, StaffUserRow};
+use domain::{
+    ApiSurface, StaffRole, StatusClass, TrafficWindow, WebhookDeliveryStatus, WebhookEventType,
+};
 use jobs::{retrigger_delivery, retrigger_failed_webhooks, AppState, RetriggerError};
 use redis::AsyncCommands;
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 use serde_json::{json, Value};
 
 use crate::middleware::{require_admin, require_jwt, CurrentStaff};
@@ -59,6 +61,8 @@ pub fn admin_router(state: &AppState) -> Router<AppState> {
         )
         .route("/stats", get(stats))
         .route("/stats/deposits-timeseries", get(deposits_timeseries))
+        .route("/traffic/overview", get(traffic_overview))
+        .route("/traffic/requests", get(traffic_requests))
         .route(
             "/deposit-addresses",
             post(create_deposit_address).get(list_deposit_addresses),
@@ -706,6 +710,19 @@ struct UpdateSettingsRequest {
     deposit_expiry_minutes: Option<i64>,
     api_key_prefix: Option<String>,
     totp_issuer: Option<String>,
+    /// Absent = untouched; explicit `null` = keep forever.
+    #[serde(default, deserialize_with = "deserialize_some")]
+    api_traffic_retention_days: Option<Option<i64>>,
+}
+
+/// Distinguishes a missing JSON field (`None`) from an explicit `null`
+/// (`Some(None)`) — serde collapses both to `None` on a plain `Option`.
+fn deserialize_some<'de, D, T>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer).map(Some)
 }
 
 /// Keep the otpauth label reasonable — authenticator apps truncate long ones.
@@ -755,6 +772,24 @@ async fn update_settings(
         state.db.set_setting(db::TOTP_ISSUER_SETTING, issuer).await?;
     }
 
+    if let Some(retention) = body.api_traffic_retention_days {
+        let value = match retention {
+            None => db::API_TRAFFIC_RETENTION_FOREVER.to_string(),
+            Some(days) if (1..=config::API_TRAFFIC_RETENTION_MAX_DAYS).contains(&days) => {
+                days.to_string()
+            }
+            Some(_) => {
+                return Err(ApiError::bad_request(
+                    "api_traffic_retention_days must be between 1 and 3650, or null to keep forever",
+                ))
+            }
+        };
+        state
+            .db
+            .set_setting(db::API_TRAFFIC_RETENTION_SETTING, &value)
+            .await?;
+    }
+
     settings_json(&state).await
 }
 
@@ -762,11 +797,189 @@ async fn settings_json(state: &AppState) -> Result<Json<Value>, ApiError> {
     let minutes = state.db.deposit_expiry_minutes().await?;
     let api_key_prefix = state.db.api_key_prefix().await?;
     let totp_issuer = state.db.totp_issuer().await?;
+    let api_traffic_retention_days = state.db.api_traffic_retention_days().await?;
     Ok(Json(json!({
         "deposit_expiry_minutes": minutes,
         "api_key_prefix": api_key_prefix,
         "totp_issuer": totp_issuer,
+        // null = indefinite (never purged).
+        "api_traffic_retention_days": api_traffic_retention_days,
     })))
+}
+
+#[derive(Debug, Deserialize)]
+struct TrafficOverviewQuery {
+    surface: Option<String>,
+    window: Option<String>,
+    top_limit: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TrafficRequestsQuery {
+    surface: Option<String>,
+    status: Option<String>,
+    route: Option<String>,
+    method: Option<String>,
+    api_key_id: Option<String>,
+    limit: Option<i64>,
+    offset: Option<i64>,
+}
+
+/// `merchant` (default) / `admin` / `all` (= no filter).
+fn parse_surface(value: Option<&str>) -> Result<Option<ApiSurface>, ApiError> {
+    match value.map(str::trim) {
+        None | Some("") => Ok(Some(ApiSurface::Merchant)),
+        Some(v) if v.eq_ignore_ascii_case("all") => Ok(None),
+        Some(v) => ApiSurface::parse_api(v)
+            .map(Some)
+            .map_err(|_| ApiError::bad_request("surface must be merchant, admin or all")),
+    }
+}
+
+fn parse_window(value: Option<&str>) -> Result<TrafficWindow, ApiError> {
+    match value.map(str::trim) {
+        None | Some("") => Ok(TrafficWindow::M15),
+        Some(v) => TrafficWindow::parse_api(v)
+            .map_err(|_| ApiError::bad_request("window must be 15m, 1h or 24h")),
+    }
+}
+
+fn ms(value: Option<f64>) -> Value {
+    value.map(|v| json!((v * 100.0).round() / 100.0)).unwrap_or(Value::Null)
+}
+
+async fn traffic_overview(
+    State(state): State<AppState>,
+    Query(query): Query<TrafficOverviewQuery>,
+) -> Result<Json<Value>, ApiError> {
+    let surface = parse_surface(query.surface.as_deref())?;
+    let window = parse_window(query.window.as_deref())?;
+    let top_limit = query.top_limit.unwrap_or(10).clamp(1, 25);
+    let secs = window.secs();
+
+    let (summary, timeseries, top_routes, top_keys) = tokio::join!(
+        state.db.traffic_summary(surface, secs),
+        state.db.traffic_timeseries(surface, secs, window.bucket_secs()),
+        state.db.traffic_top_routes(surface, secs, top_limit),
+        state.db.traffic_top_api_keys(secs, top_limit),
+    );
+    let summary = summary?;
+    let timeseries = timeseries?;
+    let top_routes = top_routes?;
+    // Keys only exist on the merchant surface; an admin-only view gets none.
+    let top_keys = if surface == Some(ApiSurface::Admin) {
+        Vec::new()
+    } else {
+        top_keys?
+    };
+
+    let errors = summary.client_errors + summary.server_errors;
+    let error_rate = if summary.total > 0 {
+        errors as f64 / summary.total as f64
+    } else {
+        0.0
+    };
+    let per_minute_avg = summary.total as f64 / (secs as f64 / 60.0);
+
+    Ok(Json(json!({
+        "surface": surface.map(|s| s.as_api()).unwrap_or("all"),
+        "window": window.as_api(),
+        "bucket_seconds": window.bucket_secs(),
+        "summary": {
+            "requests_total": summary.total,
+            "requests_last_minute": summary.last_minute,
+            "requests_per_minute_avg": (per_minute_avg * 100.0).round() / 100.0,
+            "error_rate": (error_rate * 10_000.0).round() / 10_000.0,
+            "client_errors": summary.client_errors,
+            "server_errors": summary.server_errors,
+            "p50_ms": ms(summary.p50_ms),
+            "p95_ms": ms(summary.p95_ms),
+            "active_keys": summary.active_keys,
+            "dropped_events": state.traffic.dropped(),
+        },
+        "timeseries": timeseries.iter().map(|b| json!({
+            "bucket": b.bucket.to_rfc3339(),
+            "ok": b.ok,
+            "client_error": b.client_error,
+            "server_error": b.server_error,
+            "p95_ms": ms(b.p95_ms),
+        })).collect::<Vec<_>>(),
+        "top_routes": top_routes.iter().map(|r| json!({
+            "method": r.method,
+            "route": r.route,
+            "count": r.count,
+            "client_errors": r.client_errors,
+            "server_errors": r.server_errors,
+            "p95_ms": ms(r.p95_ms),
+        })).collect::<Vec<_>>(),
+        "top_api_keys": top_keys.iter().map(|k| json!({
+            // null = requests that carried no valid key.
+            "api_key_id": k.api_key_id,
+            "name": k.name,
+            "prefix": k.prefix,
+            "status": k.status.as_deref().map(|s| {
+                domain::ApiKeyStatus::from_db(s).map(|s| s.as_api()).unwrap_or("active")
+            }),
+            "count": k.count,
+            "client_errors": k.client_errors,
+            "server_errors": k.server_errors,
+            "p95_ms": ms(k.p95_ms),
+            "last_seen_at": k.last_seen_at.to_rfc3339(),
+        })).collect::<Vec<_>>(),
+    })))
+}
+
+async fn traffic_requests(
+    State(state): State<AppState>,
+    Query(query): Query<TrafficRequestsQuery>,
+) -> Result<Json<Value>, ApiError> {
+    let status_class = match query.status.as_deref().map(str::trim) {
+        None | Some("") | Some("all") => None,
+        Some(v) => Some(
+            StatusClass::parse_api(v)
+                .map_err(|_| ApiError::bad_request("status must be 2xx, 3xx, 4xx or 5xx"))?,
+        ),
+    };
+    let non_empty = |v: Option<String>| v.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+    let filter = ApiRequestFilter {
+        surface: parse_surface(query.surface.as_deref())?,
+        status_class,
+        route: non_empty(query.route),
+        method: non_empty(query.method).map(|m| m.to_ascii_uppercase()),
+        api_key_id: non_empty(query.api_key_id),
+    };
+    let limit = query.limit.unwrap_or(50).clamp(1, 100);
+    let offset = query.offset.unwrap_or(0).max(0);
+
+    let (rows, total) = state.db.list_api_requests(&filter, limit, offset).await?;
+    Ok(Json(json!({
+        "data": rows.iter().map(request_to_json).collect::<Vec<_>>(),
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+    })))
+}
+
+fn request_to_json(r: &ApiRequestRow) -> Value {
+    json!({
+        "id": r.id,
+        "surface": ApiSurface::from_db(&r.surface).map(|s| s.as_api()).unwrap_or("merchant"),
+        "method": r.method,
+        "route": r.route,
+        "status": r.status,
+        "duration_ms": (r.duration_ms * 100.0).round() / 100.0,
+        "api_key": r.api_key_id.as_ref().map(|id| json!({
+            "id": id,
+            "name": r.api_key_name,
+            "prefix": r.api_key_prefix,
+        })),
+        "staff": r.staff_id.as_ref().map(|id| json!({
+            "id": id,
+            "name": r.staff_name,
+        })),
+        "ip": r.ip,
+        "created_at": r.created_at.to_rfc3339(),
+    })
 }
 
 /// API values ("pending"/"paid"/"expired") of an endpoint's subscriptions.

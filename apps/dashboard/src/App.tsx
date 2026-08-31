@@ -12,6 +12,7 @@ import { PaymentsPage } from "@/pages/PaymentsPage"
 import { SettingsPage } from "@/pages/SettingsPage"
 import { SetupPage } from "@/pages/SetupPage"
 import { StaffPage } from "@/pages/StaffPage"
+import { TrafficPage } from "@/pages/TrafficPage"
 import { WalletsPage } from "@/pages/WalletsPage"
 import { WebhooksPage } from "@/pages/WebhooksPage"
 
@@ -26,6 +27,7 @@ export default function App() {
           <Route path="/payments" element={<PaymentsPage />} />
           <Route path="/payments/:id" element={<PaymentDetailPage />} />
           <Route path="/deliveries" element={<DeliveriesPage />} />
+          <Route path="/traffic" element={<TrafficPage />} />
           <Route path="/wallets" element={<WalletsPage />} />
           <Route path="/account/2fa" element={<AccountSecurityPage />} />
           <Route element={<RequireAdmin />}>

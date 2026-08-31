@@ -1,4 +1,5 @@
 import {
+  keepPreviousData,
   useMutation,
   useQuery,
   useQueryClient,
@@ -16,6 +17,10 @@ import type {
   Paginated,
   Staff,
   TotpSetup,
+  TrafficOverview,
+  TrafficRequest,
+  TrafficSurface,
+  TrafficWindow,
   WalletBalances,
   WebhookDelivery,
   WebhookEndpoint,
@@ -52,6 +57,38 @@ export function useDepositsTimeseries(days: number) {
       `/stats/deposits-timeseries?days=${days}`,
     ),
     refetchInterval: 60_000,
+  })
+}
+
+/** Near-real-time: 5 s polling (30 s on the 24 h window, whose percentile
+ * queries scan far more rows). Previous data is kept so refetches never
+ * flash a skeleton. */
+export function useTrafficOverview(params: { surface: TrafficSurface; window: TrafficWindow }) {
+  return useQuery({
+    queryKey: ["traffic", "overview", params],
+    queryFn: () => api<TrafficOverview>(`/traffic/overview${listParams(params)}`),
+    refetchInterval: params.window === "24h" ? 30_000 : 5_000,
+    placeholderData: keepPreviousData,
+  })
+}
+
+export interface TrafficRequestFilters {
+  surface: TrafficSurface
+  status?: string
+  route?: string
+  api_key_id?: string
+  limit: number
+  offset: number
+}
+
+/** Only the first page auto-refreshes, so deeper pages don't shift under
+ * the reader as new rows arrive. */
+export function useTrafficRequests(filters: TrafficRequestFilters) {
+  return useQuery({
+    queryKey: ["traffic", "requests", filters],
+    queryFn: () => api<Paginated<TrafficRequest>>(`/traffic/requests${listParams({ ...filters })}`),
+    refetchInterval: filters.offset === 0 ? 5_000 : false,
+    placeholderData: keepPreviousData,
   })
 }
 
@@ -166,10 +203,12 @@ export function useRetryAllFailedWebhooks() {
   })
 }
 
-export function useSettings() {
+/** Admin-only endpoint — pass `enabled: false` for non-admin viewers. */
+export function useSettings(enabled = true) {
   return useQuery({
     queryKey: ["settings"],
     queryFn: () => api<AppSettings>("/settings"),
+    enabled,
   })
 }
 

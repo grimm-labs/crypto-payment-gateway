@@ -22,6 +22,7 @@ use tower_http::trace::TraceLayer;
 
 mod admin;
 mod middleware;
+mod traffic;
 
 const READINESS_TIMEOUT: StdDuration = StdDuration::from_secs(2);
 
@@ -54,6 +55,19 @@ pub fn router(state: AppState) -> Router {
         tracing::warn!(
             "JWT_SECRET is not set (min 32 chars) — /api/admin/v1 and the dashboard are disabled"
         );
+    }
+
+    // Traffic log goes on after both `nest`s and outside the auth guards
+    // (which are `route_layer`s inside the nested routers): it then sees the
+    // matched route template, the final status of rejected requests, and the
+    // identity the guards copy into the response extensions. `.layer` rather
+    // than `.route_layer` so `/api/...` 404s are counted too; non-API paths
+    // are filtered out by `ApiSurface::from_path`.
+    if state.config.api_traffic_enabled {
+        app = app.layer(axum::middleware::from_fn_with_state(
+            state.traffic.clone(),
+            traffic::record_traffic,
+        ));
     }
 
     let app = app.layer(TraceLayer::new_for_http());

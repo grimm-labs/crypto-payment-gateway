@@ -20,6 +20,9 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, error, info, warn};
 use wallet::WalletService;
 
+pub mod traffic;
+pub use traffic::TrafficRecorder;
+
 /// Legacy LIST queue, only drained at startup (pre-backoff deploys).
 const LEGACY_WEBHOOK_LIST_KEY: &str = "queue:webhook-delivery";
 /// ZSET scored by next-attempt epoch seconds. New suffix on purpose: a Redis
@@ -34,6 +37,8 @@ pub struct AppState {
     pub wallet: WalletService,
     pub chain: ChainClients,
     pub redis: ConnectionManager,
+    /// Non-blocking producer side of the API traffic log.
+    pub traffic: TrafficRecorder,
 }
 
 impl AppState {
@@ -558,7 +563,22 @@ fn address_event_payload(
     }))
 }
 
-pub fn spawn_workers(state: AppState) {
+/// `traffic_rx` is the consumer side of `state.traffic`; it is dropped when
+/// the traffic log is disabled, which turns every `record` into a no-op.
+pub fn spawn_workers(
+    state: AppState,
+    traffic_rx: tokio::sync::mpsc::Receiver<db::ApiTrafficEvent>,
+) {
+    if state.config.api_traffic_enabled {
+        let db = state.db.clone();
+        tokio::spawn(async move { traffic::api_traffic_writer_loop(db, traffic_rx).await });
+        let s0 = state.clone();
+        tokio::spawn(async move { traffic::api_traffic_purge_loop(s0).await });
+    } else {
+        drop(traffic_rx);
+        info!("API_TRAFFIC_ENABLED=false — API traffic log disabled");
+    }
+
     let poll_secs = state.config.polling_interval_seconds.max(1);
     let s1 = state.clone();
     tokio::spawn(async move { monitor_loop(s1, Network::Tron, poll_secs).await });

@@ -1,5 +1,6 @@
 import * as React from "react"
 import {
+  ActivityIcon,
   CoinsIcon,
   KeyRoundIcon,
   LayoutDashboardIcon,
@@ -33,6 +34,7 @@ const NAV_MAIN: NavItem[] = [
   { title: "Overview", url: "/", icon: <LayoutDashboardIcon /> },
   { title: "Payments", url: "/payments", icon: <ReceiptTextIcon /> },
   { title: "Deliveries", url: "/deliveries", icon: <SendIcon /> },
+  { title: "Traffic", url: "/traffic", icon: <ActivityIcon /> },
   { title: "Wallets", url: "/wallets", icon: <WalletIcon /> },
 ]
 

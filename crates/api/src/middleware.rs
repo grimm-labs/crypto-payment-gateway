@@ -8,7 +8,9 @@ use jobs::AppState;
 use crate::ApiError;
 
 /// Authenticated staff member, inserted as a request extension by
-/// [`require_jwt`]. Admin handlers act on behalf of this user.
+/// [`require_jwt`]. Admin handlers act on behalf of this user. Also copied
+/// into the *response* extensions so outer middleware (the traffic log) can
+/// attribute the request after the handler ran.
 #[derive(Debug, Clone)]
 pub struct CurrentStaff {
     pub id: String,
@@ -16,11 +18,18 @@ pub struct CurrentStaff {
     pub role: StaffRole,
 }
 
+/// Authenticated merchant API key, inserted into the request and response
+/// extensions by [`require_api_key`]. Never carries the raw key.
+#[derive(Debug, Clone)]
+pub struct CurrentApiKey {
+    pub id: String,
+}
+
 /// Merchant-API guard: validates the `x-api-key` header against the hashed
 /// `api_keys` table.
 pub async fn require_api_key(
     State(state): State<AppState>,
-    request: Request,
+    mut request: Request,
     next: Next,
 ) -> Result<Response, ApiError> {
     let key = request
@@ -38,6 +47,8 @@ pub async fn require_api_key(
         return Err(ApiError::unauthorized("Invalid API key"));
     }
 
+    let current = CurrentApiKey { id: row.id.clone() };
+
     // Fire-and-forget: never block the request on the usage timestamp.
     let db = state.db.clone();
     tokio::spawn(async move {
@@ -46,7 +57,10 @@ pub async fn require_api_key(
         }
     });
 
-    Ok(next.run(request).await)
+    request.extensions_mut().insert(current.clone());
+    let mut response = next.run(request).await;
+    response.extensions_mut().insert(current);
+    Ok(response)
 }
 
 /// Dashboard guard: validates the `Authorization: Bearer` access token and
@@ -81,12 +95,15 @@ pub async fn require_jwt(
     let role = StaffRole::from_db(&staff.role)
         .map_err(|e| ApiError::internal(e.to_string()))?;
 
-    request.extensions_mut().insert(CurrentStaff {
+    let current = CurrentStaff {
         id: staff.id,
         email: staff.email,
         role,
-    });
-    Ok(next.run(request).await)
+    };
+    request.extensions_mut().insert(current.clone());
+    let mut response = next.run(request).await;
+    response.extensions_mut().insert(current);
+    Ok(response)
 }
 
 /// Must sit inside a [`require_jwt`] layer; rejects non-admin staff.

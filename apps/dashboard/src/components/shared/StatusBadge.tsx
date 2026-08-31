@@ -19,6 +19,12 @@ const STYLES: Record<string, string> = {
   revoked: "bg-red-100 text-red-900 dark:bg-red-900/40 dark:text-red-200",
   admin: "bg-violet-100 text-violet-900 dark:bg-violet-900/40 dark:text-violet-200",
   operator: "bg-sky-100 text-sky-900 dark:bg-sky-900/40 dark:text-sky-200",
+  // api traffic (HTTP status classes / surfaces)
+  "2xx": "bg-emerald-100 text-emerald-900 dark:bg-emerald-900/40 dark:text-emerald-200",
+  "3xx": "bg-sky-100 text-sky-900 dark:bg-sky-900/40 dark:text-sky-200",
+  "4xx": "bg-amber-100 text-amber-900 dark:bg-amber-900/40 dark:text-amber-200",
+  "5xx": "bg-red-100 text-red-900 dark:bg-red-900/40 dark:text-red-200",
+  merchant: "bg-sky-100 text-sky-900 dark:bg-sky-900/40 dark:text-sky-200",
 }
 
 export function StatusBadge({ status }: { status: string }) {

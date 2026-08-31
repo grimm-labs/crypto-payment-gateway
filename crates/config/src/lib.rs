@@ -27,6 +27,28 @@ pub const API_KEY_EXPIRY_SWEEP_INTERVAL_SECS: u64 = 300;
 /// admins can override it from the dashboard Settings (`app_settings`).
 pub const TOTP_ISSUER: &str = "Stablecoin Payment Gateway";
 
+// API traffic log (`api_requests`). Requests are recorded through a bounded
+// in-memory queue and batch-inserted by a background writer so the request
+// path never waits on Postgres; when the queue is full, events are dropped
+// (and counted) rather than applying back-pressure.
+pub const API_TRAFFIC_QUEUE_CAPACITY: usize = 10_000;
+pub const API_TRAFFIC_FLUSH_INTERVAL_MS: u64 = 1_000;
+pub const API_TRAFFIC_BATCH_MAX: usize = 500;
+pub const API_TRAFFIC_PURGE_INTERVAL_SECS: u64 = 60 * 60;
+/// Rows deleted per purge statement — keeps each DELETE short-lived.
+pub const API_TRAFFIC_PURGE_BATCH: i64 = 10_000;
+/// Default retention of the traffic log when the DB setting is absent; the
+/// value itself lives in `app_settings` (`0` = keep forever) and is managed
+/// from the dashboard.
+pub const API_TRAFFIC_RETENTION_DEFAULT_DAYS: i64 = 730;
+pub const API_TRAFFIC_RETENTION_MAX_DAYS: i64 = 3650;
+const _: () = assert!(API_TRAFFIC_BATCH_MAX > 0 && API_TRAFFIC_BATCH_MAX <= API_TRAFFIC_QUEUE_CAPACITY);
+const _: () = assert!(API_TRAFFIC_FLUSH_INTERVAL_MS > 0 && API_TRAFFIC_PURGE_BATCH > 0);
+const _: () = assert!(
+    API_TRAFFIC_RETENTION_DEFAULT_DAYS >= 1
+        && API_TRAFFIC_RETENTION_DEFAULT_DAYS <= API_TRAFFIC_RETENTION_MAX_DAYS
+);
+
 pub const USDT_ETH: &str = "0xdAC17F958D2ee523a2206206994597C13D831ec7";
 pub const USDT_TRON: &str = "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t";
 pub const USDT_SOLANA: &str = "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB";
@@ -55,6 +77,8 @@ pub struct AppConfig {
     pub access_token_ttl_minutes: i64,
     pub refresh_token_ttl_days: i64,
     pub cors_allowed_origins: Option<String>,
+    /// Kill-switch for the API traffic log (middleware + writer + purge).
+    pub api_traffic_enabled: bool,
 }
 
 impl AppConfig {
@@ -104,6 +128,7 @@ impl AppConfig {
             access_token_ttl_minutes: parse_or("ACCESS_TOKEN_TTL_MINUTES", 15),
             refresh_token_ttl_days: parse_or("REFRESH_TOKEN_TTL_DAYS", 30),
             cors_allowed_origins: optional("CORS_ALLOWED_ORIGINS"),
+            api_traffic_enabled: parse_or("API_TRAFFIC_ENABLED", true),
         })
     }
 
