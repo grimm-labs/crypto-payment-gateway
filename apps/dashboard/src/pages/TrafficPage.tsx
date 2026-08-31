@@ -122,7 +122,7 @@ export function TrafficPage() {
   function updateParams(updates: Record<string, string | undefined>) {
     const next = new URLSearchParams(searchParams)
     for (const [key, value] of Object.entries(updates)) {
-      if (value === undefined || value === ALL) next.delete(key)
+      if (value === undefined) next.delete(key)
       else next.set(key, value)
     }
     setSearchParams(next)
@@ -429,7 +429,9 @@ export function TrafficPage() {
           <CardAction>
             <Select
               value={status}
-              onValueChange={(value) => updateParams({ status: value, offset: undefined })}
+              onValueChange={(value) =>
+                updateParams({ status: value === ALL ? undefined : value, offset: undefined })
+              }
             >
               <SelectTrigger className="w-36" aria-label="Status class">
                 <SelectValue placeholder="Status" />
