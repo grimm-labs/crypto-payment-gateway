@@ -5,6 +5,7 @@ Thanks for your interest in improving this project.
 ## Prerequisites
 
 - Rust stable toolchain
+- `protoc` (the Breez SDK compiles gRPC protos): `brew install protobuf` / `apt-get install protobuf-compiler`
 - Docker (for Postgres and Redis via `docker compose`)
 
 ## Setup
@@ -22,10 +23,10 @@ Never commit a real `.env`. Keep secrets and production mnemonics out of the rep
 ## Tests
 
 ```bash
-cargo test -p domain -p wallet -p config -p jobs
+cargo test -p domain -p wallet -p config -p chain -p lightning-client -p jobs -p auth -p api
 ```
 
-This matches what CI runs. Prefer small, focused PRs with tests when you change `domain`, `wallet`, `config`, or `jobs` logic.
+This matches what CI runs. Prefer small, focused PRs with tests when you change `domain`, `wallet`, `config`, `chain`, `lightning-client`, or `jobs` logic.
 
 ## Pull requests
 

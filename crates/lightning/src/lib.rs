@@ -190,7 +190,7 @@ impl LightningClient {
                 .context("Breez list_payments failed")?
                 .payments;
             let page_len = page.len();
-            received.extend(page.into_iter().filter_map(received_lightning));
+            received.extend(page.into_iter().filter_map(settled_lightning_receive));
             if page_len < LIST_PAGE_SIZE as usize {
                 return Ok(received);
             }
@@ -221,12 +221,13 @@ impl LightningClient {
 /// through other methods (Spark transfers, on-chain deposits).
 pub fn received_lightning_payment(event: SdkEvent) -> Option<ReceivedPayment> {
     match event {
-        SdkEvent::PaymentSucceeded { payment } => received_lightning(payment),
+        SdkEvent::PaymentSucceeded { payment } => settled_lightning_receive(payment),
         _ => None,
     }
 }
 
-fn received_lightning(payment: Payment) -> Option<ReceivedPayment> {
+/// A completed incoming payment made over Lightning, else `None`.
+fn settled_lightning_receive(payment: Payment) -> Option<ReceivedPayment> {
     if payment.payment_type != PaymentType::Receive || payment.status != PaymentStatus::Completed
     {
         return None;

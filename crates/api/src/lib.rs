@@ -10,7 +10,7 @@ use chrono::{DateTime, Duration, Utc};
 use db::{DepositAddressRow, WebhookDeliveryRow};
 use domain::{
     decimal_to_raw, format_amount, parse_sats, raw_to_decimal, round_to_token, supports,
-    DepositAddressStatus, Network, Token, WebhookDeliveryStatus, WebhookEventType,
+    DepositAddressStatus, Network, Token, WebhookDeliveryStatus, WebhookEventType, BTC_MAX_SATS,
 };
 use jobs::{
     expire_addresses_and_notify, get_cached_wallet_balances, get_live_balances,
@@ -279,10 +279,11 @@ fn validate_create_request(
                     "expected_amount_sats is required on bitcoin/lightning",
                 ));
             };
-            let sats = parse_sats(raw).map_err(|_| {
-                ApiError::bad_request(
-                    "Invalid expected_amount_sats (integer string, 1 to 2100000000000000)",
-                )
+            let sats = parse_sats(raw).map_err(|_| ApiError {
+                status: StatusCode::BAD_REQUEST,
+                message: format!(
+                    "Invalid expected_amount_sats (integer string, 1 to {BTC_MAX_SATS})"
+                ),
             })?;
             let amount = raw_to_decimal(&sats.to_string(), token).map_err(ApiError::from)?;
             (amount, Some(sats))
@@ -307,9 +308,12 @@ fn validate_create_request(
             return Err(ApiError::bad_request("description is only accepted on lightning"));
         }
         if description.chars().count() > INVOICE_DESCRIPTION_MAX_CHARS {
-            return Err(ApiError::bad_request(
-                "description must be at most 128 characters",
-            ));
+            return Err(ApiError {
+                status: StatusCode::BAD_REQUEST,
+                message: format!(
+                    "description must be at most {INVOICE_DESCRIPTION_MAX_CHARS} characters"
+                ),
+            });
         }
     }
 
@@ -803,7 +807,7 @@ mod tests {
             address: "addr".into(),
             derivation_index: 0,
             expected_amount: amount,
-            status: "PENDING".into(),
+            status: DepositAddressStatus::Pending.as_db().into(),
             expires_at: now,
             metadata: json!({}),
             created_at: now,

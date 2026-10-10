@@ -284,6 +284,22 @@ impl Db {
         Ok(rows)
     }
 
+    /// PENDING addresses whatever their deadline — includes rows the expiry
+    /// sweep has not reached yet (boot-time Lightning reconciliation).
+    pub async fn unsettled_addresses(&self, network: Network) -> Result<Vec<DepositAddressRow>> {
+        let rows = sqlx::query_as::<_, DepositAddressRow>(&format!(
+            r#"
+            SELECT {DEPOSIT_ADDRESS_COLUMNS} FROM deposit_addresses
+            WHERE network = $1::"Network"
+              AND status = 'PENDING'::"DepositAddressStatus"
+            "#
+        ))
+        .bind(network.as_db())
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
     pub async fn addresses_for_network(&self, network: Network) -> Result<Vec<String>> {
         let rows: Vec<(String,)> = sqlx::query_as(
             r#"SELECT DISTINCT address FROM deposit_addresses WHERE network = $1::"Network""#,

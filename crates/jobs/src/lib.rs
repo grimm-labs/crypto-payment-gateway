@@ -153,10 +153,10 @@ pub async fn process_detected_transfer(state: &AppState, transfer: DetectedTrans
 
 /// Map a settled Lightning payment to its gateway invoice row. `None` for
 /// invoices the gateway did not issue (the Breez wallet may receive other
-/// funds), rows that are not PENDING Lightning invoices, and payment ids that
-/// could not be stored safely. The tx hash is the SDK payment id and a
-/// settled payment is final (1 confirmation); `process_detected_transfer`
-/// upserts on (address, tx) so seeing the same payment twice is a no-op.
+/// funds) and rows that are not PENDING Lightning invoices. The tx hash is
+/// the SDK payment id and a settled payment is final (1 confirmation);
+/// `process_detected_transfer` upserts on (address, tx) so seeing the same
+/// payment twice is a no-op.
 pub fn lightning_transfer(
     payment: &ReceivedPayment,
     row: Option<&DepositAddressRow>,
@@ -167,15 +167,14 @@ pub fn lightning_transfer(
     {
         return None;
     }
-    // Stored as `deposits.txHash`; ids never reach the webhook queue (which
-    // keys on our UUIDs), but keep `|` out so no future member encoding can
-    // be ambiguous.
+    // Stored as `deposits.txHash`. SDK ids are Spark transfer UUIDs and never
+    // enter webhook queue members (those key on deposits.id), so an odd shape
+    // is flagged but the settled payment is still credited.
     if payment.payment_id.is_empty() || payment.payment_id.contains('|') {
-        warn!(
-            "Ignoring Lightning payment with unexpected id shape for address {}",
-            row.id
+        error!(
+            "Lightning payment for address {} has an unexpected id shape {:?}",
+            row.id, payment.payment_id
         );
-        return None;
     }
     Some(DetectedTransfer {
         deposit_address_id: row.id.clone(),
@@ -199,8 +198,24 @@ pub async fn handle_lightning_payment(state: &AppState, payment: ReceivedPayment
     process_detected_transfer(state, transfer).await
 }
 
+/// Reconciliation matching: the transfers that settled `payments` make for
+/// the `pending` invoices (unknown invoices are skipped).
+pub fn reconciled_transfers(
+    payments: &[ReceivedPayment],
+    pending: &[DepositAddressRow],
+) -> Vec<DetectedTransfer> {
+    let by_invoice: HashMap<&str, &DepositAddressRow> =
+        pending.iter().map(|a| (a.address.as_str(), a)).collect();
+    payments
+        .iter()
+        .filter_map(|payment| {
+            lightning_transfer(payment, by_invoice.get(payment.invoice.as_str()).copied())
+        })
+        .collect()
+}
+
 /// Reconciliation path (events missed across restarts): match settled
-/// payments since the oldest pending invoice against the pending rows.
+/// payments since the oldest of `pending` against those invoices.
 async fn reconcile_lightning(state: &AppState, pending: &[DepositAddressRow]) -> Result<()> {
     let Some(lightning) = &state.lightning else {
         return Ok(());
@@ -209,24 +224,30 @@ async fn reconcile_lightning(state: &AppState, pending: &[DepositAddressRow]) ->
         return Ok(());
     };
     let since = u64::try_from(oldest.timestamp()).unwrap_or(0);
-    let by_invoice: HashMap<&str, &DepositAddressRow> =
-        pending.iter().map(|a| (a.address.as_str(), a)).collect();
-
-    for payment in lightning.list_received_since(since).await? {
-        let Some(transfer) =
-            lightning_transfer(&payment, by_invoice.get(payment.invoice.as_str()).copied())
-        else {
-            continue;
-        };
+    let payments = lightning.list_received_since(since).await?;
+    for transfer in reconciled_transfers(&payments, pending) {
         info!(
             "Lightning reconciliation: payment {} settles address {}",
-            payment.payment_id, transfer.deposit_address_id
+            transfer.tx_hash, transfer.deposit_address_id
         );
+        let tx_hash = transfer.tx_hash.clone();
         if let Err(err) = process_detected_transfer(state, transfer).await {
-            error!("process Lightning payment {} error: {err:#}", payment.payment_id);
+            error!("process Lightning payment {tx_hash} error: {err:#}");
         }
     }
     Ok(())
+}
+
+/// Boot-time reconciliation, run before any expiry sweep: also covers
+/// invoices whose deadline passed while the gateway was down. A settled
+/// payment always predates the deadline (the BOLT11 expires at the same
+/// instant), so such an invoice is paid, not expired.
+pub async fn reconcile_lightning_backlog(state: &AppState) -> Result<()> {
+    if state.lightning.is_none() {
+        return Ok(());
+    }
+    let unsettled = state.db.unsettled_addresses(Network::Lightning).await?;
+    reconcile_lightning(state, &unsettled).await
 }
 
 /// Fan an address lifecycle event (PENDING at creation, EXPIRED at expiry)
@@ -542,7 +563,7 @@ pub async fn deliver_webhook(
                     "deposit_id": deposit.deposit_address_id,
                     "address": address.address,
                     "network": network.as_api(),
-                    "token": address.token,
+                    "token": token.as_api(),
                     "amount": format_amount(deposit.amount, token),
                     "amount_raw": deposit.amount_raw,
                     "tx_hash": deposit.tx_hash,
@@ -656,13 +677,14 @@ fn address_event_payload(
     address: &DepositAddressRow,
 ) -> Result<serde_json::Value> {
     let network = Network::from_db(&address.network)?;
+    let token = Token::from_db(&address.token)?;
     Ok(serde_json::json!({
         "event_type": event.payload_event_type(),
         "data": {
             "deposit_id": address.id,
             "address": address.address,
             "network": network.as_api(),
-            "token": address.token,
+            "token": token.as_api(),
             "expected_amount": address.expected_amount.normalize().to_string(),
             "status": event.as_api(),
             "expires_at": address.expires_at.to_rfc3339(),
@@ -688,7 +710,7 @@ pub fn spawn_workers(
     }
 
     let poll_secs = state.config.polling_interval_seconds.max(1);
-    for network in [Network::Tron, Network::Ethereum, Network::Solana, Network::Bitcoin] {
+    for network in CHAIN_NETWORKS {
         let s = state.clone();
         tokio::spawn(async move { monitor_loop(s, network, poll_secs).await });
     }
@@ -935,30 +957,32 @@ pub struct TokenTotals {
 
 impl TokenTotals {
     pub fn total_usdt(&self) -> String {
-        raw_to_decimal_string(&self.usdt_raw.to_string(), Token::Usdt)
-            .unwrap_or_else(|_| "0".into())
+        format_raw(self.usdt_raw, Token::Usdt)
     }
 
     pub fn total_btc(&self) -> String {
-        raw_to_decimal_string(&self.btc_raw.to_string(), Token::Btc)
-            .unwrap_or_else(|_| "0".into())
+        format_raw(self.btc_raw, Token::Btc)
     }
 }
 
-pub fn token_totals<'a>(entries: impl IntoIterator<Item = (Token, &'a str)>) -> TokenTotals {
+/// Sum `(token, amount_raw)` entries as reported in balance payloads;
+/// unknown tokens and unparsable amounts count as zero.
+pub fn token_totals<'a>(entries: impl IntoIterator<Item = (&'a str, &'a str)>) -> TokenTotals {
     let mut totals = TokenTotals::default();
     for (token, amount_raw) in entries {
         let raw = amount_raw.parse::<u128>().unwrap_or(0);
-        match token {
-            Token::Usdt => totals.usdt_raw += raw,
-            Token::Btc => totals.btc_raw += raw,
+        match Token::parse_api(token) {
+            Ok(Token::Usdt) => totals.usdt_raw += raw,
+            Ok(Token::Btc) => totals.btc_raw += raw,
+            Err(_) => {}
         }
     }
     totals
 }
 
-/// Networks whose balance is the sum over derived addresses.
-const ADDRESS_BALANCE_NETWORKS: [Network; 4] =
+/// Networks served by a chain provider, polled per derived address
+/// (Lightning goes through the Breez client instead).
+const CHAIN_NETWORKS: [Network; 4] =
     [Network::Tron, Network::Ethereum, Network::Solana, Network::Bitcoin];
 
 async fn fetch_address_balance(state: &AppState, network: Network, address: &str) -> Result<u128> {
@@ -980,16 +1004,12 @@ pub async fn sync_wallet_balances(state: &AppState) -> Result<()> {
 
     info!("Starting wallet HD balance sync");
     let mut networks = Vec::new();
-    for network in ADDRESS_BALANCE_NETWORKS {
+    for network in CHAIN_NETWORKS {
         networks.push(sync_network(state, network).await?);
     }
     networks.push(lightning_wallet_balance(state).await);
 
-    let totals = token_totals(
-        networks
-            .iter()
-            .filter_map(|n| Token::parse_api(&n.token).ok().map(|t| (t, n.amount_raw.as_str()))),
-    );
+    let totals = token_totals(networks.iter().map(|n| (n.token.as_str(), n.amount_raw.as_str())));
     let payload = CachedWalletBalances {
         total_usdt: totals.total_usdt(),
         total_usdt_raw: totals.usdt_raw.to_string(),
@@ -1051,24 +1071,48 @@ async fn sync_network(state: &AppState, network: Network) -> Result<NetworkWalle
 }
 
 /// The Breez/Spark wallet balance — a single entry, no derived addresses.
-async fn lightning_wallet_balance(state: &AppState) -> NetworkWalletBalance {
-    let mut entry = empty_wallet_network(Network::Lightning);
-    let Some(lightning) = &state.lightning else {
-        entry.message = Some(state.network_disabled_message(Network::Lightning).to_string());
-        return entry;
+struct LightningBalance {
+    amount: String,
+    amount_raw: String,
+    available: bool,
+    message: Option<String>,
+}
+
+async fn lightning_balance(state: &AppState, ensure_synced: bool) -> LightningBalance {
+    let mut balance = LightningBalance {
+        amount: "0".into(),
+        amount_raw: "0".into(),
+        available: false,
+        message: None,
     };
-    match lightning.balance_sats(true).await {
+    let Some(lightning) = &state.lightning else {
+        balance.message = Some(state.network_disabled_message(Network::Lightning).to_string());
+        return balance;
+    };
+    match lightning.balance_sats(ensure_synced).await {
         Ok(sats) => {
-            entry.amount = format_raw(u128::from(sats), Token::Btc);
-            entry.amount_raw = sats.to_string();
-            entry.available = true;
+            balance.amount = format_raw(u128::from(sats), Token::Btc);
+            balance.amount_raw = sats.to_string();
+            balance.available = true;
         }
         Err(err) => {
             warn!("Failed to fetch Lightning wallet balance: {err:#}");
-            entry.message = Some("Failed to read the Lightning wallet balance".into());
+            balance.message = Some("Failed to read the Lightning wallet balance".into());
         }
     }
-    entry
+    balance
+}
+
+async fn lightning_wallet_balance(state: &AppState) -> NetworkWalletBalance {
+    // The hourly sync can afford a fresh figure.
+    let balance = lightning_balance(state, true).await;
+    NetworkWalletBalance {
+        amount: balance.amount,
+        amount_raw: balance.amount_raw,
+        available: balance.available,
+        message: balance.message,
+        ..empty_wallet_network(Network::Lightning)
+    }
 }
 
 pub async fn get_cached_wallet_balances(state: &AppState) -> Result<WalletBalancesResponse> {
@@ -1094,16 +1138,12 @@ pub async fn get_cached_wallet_balances(state: &AppState) -> Result<WalletBalanc
 
 pub async fn get_live_balances(state: &AppState) -> Result<BalancesResponse> {
     let mut networks = Vec::new();
-    for network in ADDRESS_BALANCE_NETWORKS {
+    for network in CHAIN_NETWORKS {
         networks.push(live_network_balance(state, network).await?);
     }
     networks.push(live_lightning_balance(state).await);
 
-    let totals = token_totals(
-        networks
-            .iter()
-            .filter_map(|n| Token::parse_api(&n.token).ok().map(|t| (t, n.amount_raw.as_str()))),
-    );
+    let totals = token_totals(networks.iter().map(|n| (n.token.as_str(), n.amount_raw.as_str())));
     Ok(BalancesResponse {
         total_usdt: totals.total_usdt(),
         total_btc: totals.total_btc(),
@@ -1147,31 +1187,16 @@ async fn live_network_balance(state: &AppState, network: Network) -> Result<Netw
 }
 
 async fn live_lightning_balance(state: &AppState) -> NetworkBalance {
-    let mut entry = NetworkBalance {
+    let balance = lightning_balance(state, false).await;
+    NetworkBalance {
         network: Network::Lightning.as_api().into(),
         token: Token::Btc.as_api().into(),
-        amount: "0".into(),
-        amount_raw: "0".into(),
+        amount: balance.amount,
+        amount_raw: balance.amount_raw,
         addresses_checked: 0,
-        available: false,
-        message: None,
-    };
-    let Some(lightning) = &state.lightning else {
-        entry.message = Some(state.network_disabled_message(Network::Lightning).to_string());
-        return entry;
-    };
-    match lightning.balance_sats(false).await {
-        Ok(sats) => {
-            entry.amount = format_raw(u128::from(sats), Token::Btc);
-            entry.amount_raw = sats.to_string();
-            entry.available = true;
-        }
-        Err(err) => {
-            warn!("Failed to fetch Lightning wallet balance: {err:#}");
-            entry.message = Some("Failed to read the Lightning wallet balance".into());
-        }
+        available: balance.available,
+        message: balance.message,
     }
-    entry
 }
 
 fn empty_wallet_network(network: Network) -> NetworkWalletBalance {
@@ -1301,35 +1326,71 @@ mod tests {
     }
 
     #[test]
-    fn payment_ids_with_a_queue_separator_are_rejected_before_storage() {
+    fn unexpected_payment_id_shapes_are_still_credited() {
+        // SDK ids are Spark transfer UUIDs and never reach the webhook queue
+        // (members key on deposits.id): an odd shape is logged, never dropped
+        // — dropping would leave a settled payment uncredited.
         let row = invoice_row(Network::Lightning, DepositAddressStatus::Pending);
-        assert!(lightning_transfer(&settled("pay|abc"), Some(&row)).is_none());
-        assert!(lightning_transfer(&settled(""), Some(&row)).is_none());
+        let transfer = lightning_transfer(&settled("pay|abc"), Some(&row)).expect("credited");
+        assert_eq!(transfer.tx_hash, "pay|abc");
+    }
+
+    fn other_invoice(id: &str, address: &str) -> DepositAddressRow {
+        DepositAddressRow {
+            id: id.into(),
+            address: address.into(),
+            ..invoice_row(Network::Lightning, DepositAddressStatus::Pending)
+        }
     }
 
     #[test]
-    fn event_and_reconciliation_yield_the_same_upsert_key() {
-        // The event push and the reconciliation poll can both see the same
-        // payment; they must produce the same (address, tx) key so the
-        // per-address tx-hash upsert in `process_detected_transfer` makes the
-        // second delivery a no-op (and the address is PAID by then anyway).
+    fn reconciliation_matches_only_pending_invoices() {
+        let pending = vec![
+            invoice_row(Network::Lightning, DepositAddressStatus::Pending),
+            other_invoice("addr-2", "lnbc2unpaid"),
+        ];
+        let payments = vec![
+            settled("pay-abc"),
+            ReceivedPayment {
+                invoice: "lnbc9unrelated".into(),
+                payment_id: "pay-unrelated".into(),
+                amount_sats: 1,
+            },
+        ];
+        let transfers = reconciled_transfers(&payments, &pending);
+        assert_eq!(transfers.len(), 1);
+        assert_eq!(transfers[0].deposit_address_id, "addr-1");
+        assert_eq!(transfers[0].tx_hash, "pay-abc");
+    }
+
+    #[test]
+    fn reconciliation_and_event_share_the_upsert_key() {
+        // The event push and the reconciliation poll can both see a payment,
+        // and the listing can repeat it: every sighting must produce the same
+        // (address, tx) key, which the per-address tx-hash upsert in
+        // `process_detected_transfer` turns into a no-op after the first.
         let row = invoice_row(Network::Lightning, DepositAddressStatus::Pending);
         let from_event = lightning_transfer(&settled("pay-abc"), Some(&row)).unwrap();
-        let from_poll = lightning_transfer(&settled("pay-abc"), Some(&row)).unwrap();
-        assert_eq!(
-            (from_event.deposit_address_id, from_event.tx_hash, from_event.amount_raw),
-            (from_poll.deposit_address_id, from_poll.tx_hash, from_poll.amount_raw)
-        );
+        let from_poll =
+            reconciled_transfers(&[settled("pay-abc"), settled("pay-abc")], &[row.clone()]);
+        assert_eq!(from_poll.len(), 2);
+        for transfer in from_poll {
+            assert_eq!(
+                (&transfer.deposit_address_id, &transfer.tx_hash, &transfer.amount_raw),
+                (&from_event.deposit_address_id, &from_event.tx_hash, &from_event.amount_raw)
+            );
+        }
     }
 
     #[test]
     fn totals_never_mix_sats_into_usdt() {
         let totals = token_totals([
-            (Token::Usdt, "25000000"),
-            (Token::Btc, "150000"),
-            (Token::Usdt, "1"),
-            (Token::Btc, "50000"),
-            (Token::Usdt, "not-a-number"),
+            ("USDT", "25000000"),
+            ("BTC", "150000"),
+            ("USDT", "1"),
+            ("BTC", "50000"),
+            ("USDT", "not-a-number"),
+            ("DOGE", "999"),
         ]);
         assert_eq!(totals.usdt_raw, 25_000_001);
         assert_eq!(totals.btc_raw, 200_000);

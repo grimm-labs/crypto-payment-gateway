@@ -3,7 +3,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use config::{AppConfig, USDT_ETH, USDT_SOLANA, USDT_TRON};
-use domain::{Network, Token};
+use domain::{decimal_str_to_raw, Network, Token};
 use serde::Deserialize;
 use solana_sdk::pubkey::Pubkey;
 use tracing::{debug, warn};
@@ -55,7 +55,7 @@ impl ChainClients {
     }
 
     pub fn has_any_network_available(&self) -> bool {
-        [Network::Tron, Network::Ethereum, Network::Solana, Network::Bitcoin]
+        Network::ALL
             .into_iter()
             .any(|network| self.is_network_available(network))
     }
@@ -281,8 +281,12 @@ impl ChainClients {
                     .raw_token_amount
                     .and_then(|r| r.token_amount)
                     .unwrap_or_else(|| {
-                        let unit = 10f64.powi(Token::Usdt.decimals() as i32);
-                        ((transfer.token_amount.unwrap_or(0.0) * unit).round() as i64).to_string()
+                        // Helius only gave the UI amount: convert its decimal
+                        // text, never through float arithmetic.
+                        transfer
+                            .token_amount
+                            .and_then(|ui| decimal_str_to_raw(&ui.to_string(), Token::Usdt).ok())
+                            .unwrap_or_else(|| "0".into())
                     });
                 out.push(DetectedOnChainTransfer {
                     tx_hash: parsed.signature.clone(),

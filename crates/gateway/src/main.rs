@@ -75,6 +75,12 @@ async fn main() -> anyhow::Result<()> {
         lightning: lightning.clone(),
     };
 
+    // Before any expiry sweep (monitor loops, list endpoint): settle invoices
+    // paid while the gateway was down, even if their deadline has passed.
+    if let Err(err) = jobs::reconcile_lightning_backlog(&state).await {
+        tracing::warn!("Boot Lightning reconciliation failed: {err:#}");
+    }
+
     spawn_workers(state.clone(), traffic_rx);
 
     let app = router(state);

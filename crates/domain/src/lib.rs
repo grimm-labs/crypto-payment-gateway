@@ -577,6 +577,16 @@ pub fn decimal_to_raw(amount: Decimal, token: Token) -> String {
     scaled.trunc().normalize().to_string()
 }
 
+/// Decimal string (plain or scientific notation, as provider JSON numbers
+/// print) → integer string in token base units, without float arithmetic.
+pub fn decimal_str_to_raw(value: &str, token: Token) -> Result<String, DomainError> {
+    let amount = value
+        .parse::<Decimal>()
+        .or_else(|_| Decimal::from_scientific(value))
+        .map_err(|_| DomainError::InvalidAmount(value.to_string()))?;
+    Ok(decimal_to_raw(round_to_token(amount, token), token))
+}
+
 /// Round to the token's decimals the way a Postgres `NUMERIC(_, decimals)`
 /// column would (half away from zero) — keeps USDT amounts identical to what
 /// the former DECIMAL(18,6) columns stored.
@@ -694,6 +704,15 @@ mod tests {
         assert_eq!(decimal_to_raw(dec!(25.5), Token::Usdt), "25500000");
         assert_eq!(decimal_to_raw(dec!(25.000000), Token::Usdt), "25000000");
         assert_eq!(decimal_to_raw(dec!(21000000), Token::Btc), "2100000000000000");
+    }
+
+    #[test]
+    fn decimal_strings_convert_to_base_units() {
+        assert_eq!(decimal_str_to_raw("25.1", Token::Usdt).unwrap(), "25100000");
+        assert_eq!(decimal_str_to_raw("0.000001", Token::Usdt).unwrap(), "1");
+        assert_eq!(decimal_str_to_raw("1e-6", Token::Usdt).unwrap(), "1");
+        assert_eq!(decimal_str_to_raw("0.0015", Token::Btc).unwrap(), "150000");
+        assert!(decimal_str_to_raw("abc", Token::Usdt).is_err());
     }
 
     #[test]
