@@ -6,6 +6,7 @@ use anyhow::Result;
 use chain::ChainClients;
 use config::{
     AppConfig, ADDRESS_REQUEST_DELAY_MS, API_KEY_EXPIRY_SWEEP_INTERVAL_SECS,
+    LIGHTNING_PAYOUT_CATCH_UP_MARGIN_SECS, LIGHTNING_PAYOUT_WATERMARK_INTERVAL_SECS,
     WALLET_BALANCE_SYNC_INTERVAL_SECS, WEBHOOK_MAX_ATTEMPTS, WEBHOOK_RETRY_DELAYS_SECS,
 };
 use db::Db;
@@ -15,7 +16,10 @@ use domain::{
     DetectedTransfer, DepositAddressStatus, DepositStatus, Network, Token, WebhookDeliveryStatus,
     WebhookEventType, is_amount_within_tolerance,
 };
-use lightning_client::{LightningClient, ReceivedPayment, WalletPayment};
+use lightning_client::{
+    LightningClient, LightningEvent, PaymentDirection, ReceivedPayment, WalletPayment,
+    WalletPaymentStatus,
+};
 use redis::aio::ConnectionManager;
 use redis::AsyncCommands;
 use serde::{Deserialize, Serialize};
@@ -31,6 +35,8 @@ const LEGACY_WEBHOOK_LIST_KEY: &str = "queue:webhook-delivery";
 /// key cannot change type in place (WRONGTYPE against the old LIST).
 const WEBHOOK_ZSET_KEY: &str = "zset:webhook-delivery";
 const WALLET_BALANCES_KEY: &str = "wallet-balances";
+/// Unix seconds up to which finished wallet sends have been notified.
+const PAYOUT_WATERMARK_KEY: &str = "lightning:payout-watermark";
 
 #[derive(Clone)]
 pub struct AppState {
@@ -314,6 +320,146 @@ pub async fn lightning_payment_history(
     }))
 }
 
+/// Lightning is not configured (no key, or the SDK did not connect).
+#[derive(Debug)]
+pub enum LightningError {
+    Disabled,
+    Failed(anyhow::Error),
+}
+
+impl From<anyhow::Error> for LightningError {
+    fn from(value: anyhow::Error) -> Self {
+        Self::Failed(value)
+    }
+}
+
+/// Pay a Lightning address from the wallet (fees on top). Returns the send
+/// as accepted — usually pending; its outcome arrives as a payout webhook.
+pub async fn send_payout(
+    state: &AppState,
+    ln_address: &str,
+    amount_sats: u64,
+    comment: Option<String>,
+    idempotency_key: Option<String>,
+) -> Result<WalletPayment, LightningError> {
+    let lightning = state.lightning.as_ref().ok_or(LightningError::Disabled)?;
+    let payment = lightning
+        .pay_lightning_address(ln_address, amount_sats, comment, idempotency_key)
+        .await?;
+    info!(
+        "Lightning payout {} accepted: {amount_sats} sats to {ln_address} ({})",
+        payment.id,
+        payment.status.as_api()
+    );
+    Ok(payment)
+}
+
+/// One wallet payment (any direction) linked to its gateway invoice, if any.
+pub async fn lightning_payment_entry(
+    state: &AppState,
+    payment_id: &str,
+) -> Result<Option<LightningHistoryEntry>, LightningError> {
+    let lightning = state.lightning.as_ref().ok_or(LightningError::Disabled)?;
+    let Some(payment) = lightning.get_payment(payment_id).await? else {
+        return Ok(None);
+    };
+    let invoices: Vec<String> = payment.invoice.iter().cloned().collect();
+    let links: HashMap<String, String> = state
+        .db
+        .lightning_invoice_ids(&invoices)
+        .await?
+        .into_iter()
+        .collect();
+    Ok(link_history(vec![payment], &links).pop())
+}
+
+/// The payout webhook a finished wallet send triggers; `None` while it is
+/// still pending, and for anything that is not a send.
+pub fn payout_event_for(payment: &WalletPayment) -> Option<WebhookEventType> {
+    if payment.direction != PaymentDirection::Send {
+        return None;
+    }
+    match payment.status {
+        WalletPaymentStatus::Completed => Some(WebhookEventType::PayoutSucceeded),
+        WalletPaymentStatus::Failed => Some(WebhookEventType::PayoutFailed),
+        WalletPaymentStatus::Pending => None,
+    }
+}
+
+/// Where the boot catch-up starts: the watermark minus a safety margin.
+/// `None` on first boot (no watermark yet): history is never replayed.
+pub fn payout_catch_up_from(watermark: Option<u64>) -> Option<u64> {
+    watermark.map(|ts| ts.saturating_sub(LIGHTNING_PAYOUT_CATCH_UP_MARGIN_SECS))
+}
+
+/// Queue the payout webhook of a finished send for every subscribed
+/// endpoint — every wallet send counts, whoever made it (the wallet may be
+/// shared). Keys already queued or delivered are skipped, so events,
+/// SDK replays and the boot catch-up never double-notify.
+pub async fn notify_payout(state: &AppState, payment: &WalletPayment) -> Result<usize> {
+    let Some(event) = payout_event_for(payment) else {
+        return Ok(0);
+    };
+    let mut queued = 0;
+    for endpoint in state.db.active_webhook_endpoints_for_event(event).await? {
+        if state
+            .db
+            .find_payout_webhook_delivery(&payment.id, event, &endpoint.id)
+            .await?
+            .is_some()
+        {
+            continue;
+        }
+        enqueue_webhook(state, event, &payment.id, &endpoint.id).await?;
+        queued += 1;
+    }
+    Ok(queued)
+}
+
+/// Webhook body of a payout event.
+pub fn payout_payload(event: WebhookEventType, payment: &WalletPayment) -> serde_json::Value {
+    serde_json::json!({
+        "event_type": event.payload_event_type(),
+        "data": {
+            "payment_id": payment.id,
+            "status": payment.status.as_api(),
+            "network": Network::Lightning.as_api(),
+            "token": Token::Btc.as_api(),
+            "amount": format_raw(payment.amount_sats, Token::Btc),
+            "amount_sats": payment.amount_sats.to_string(),
+            "fees_sats": payment.fees_sats.to_string(),
+            "method": payment.method,
+            "ln_address": payment.ln_address,
+            "comment": payment.comment,
+            "invoice": payment.invoice,
+            "created_at": i64::try_from(payment.timestamp)
+                .ok()
+                .and_then(|ts| chrono::DateTime::from_timestamp(ts, 0))
+                .map(|dt| dt.to_rfc3339()),
+        },
+    })
+}
+
+/// Boot-time catch-up: notify sends that finished while the gateway was
+/// down, then move the watermark to now. First boot only sets it.
+async fn catch_up_payouts(state: &AppState, lightning: &LightningClient) -> Result<()> {
+    let key = state.config.redis_key(PAYOUT_WATERMARK_KEY);
+    let mut redis = state.redis.clone();
+    let watermark: Option<u64> = redis.get(&key).await?;
+    let now = u64::try_from(chrono::Utc::now().timestamp()).unwrap_or(0);
+    if let Some(from) = payout_catch_up_from(watermark) {
+        let mut queued = 0;
+        for payment in lightning.list_sends_since(from).await? {
+            queued += notify_payout(state, &payment).await?;
+        }
+        if queued > 0 {
+            info!("Payout catch-up queued {queued} webhook(s)");
+        }
+    }
+    let _: () = redis.set(&key, now).await?;
+    Ok(())
+}
+
 /// Fan an address lifecycle event (PENDING at creation, EXPIRED at expiry)
 /// out to every active endpoint subscribed to it. Returns the number of
 /// deliveries queued; none subscribed is a no-op.
@@ -505,7 +651,14 @@ pub async fn retrigger_delivery(state: &AppState, delivery_id: &str) -> Result<(
             }
             deposit_id
         }
-        _ => delivery.deposit_address_id.clone(),
+        event if event.is_payout() => delivery
+            .lightning_payment_id
+            .clone()
+            .ok_or(RetriggerError::DeliveryNotFound)?,
+        _ => delivery
+            .deposit_address_id
+            .clone()
+            .ok_or(RetriggerError::DeliveryNotFound)?,
     };
 
     state.db.reset_webhook_delivery_by_id(&delivery.id).await?;
@@ -541,7 +694,14 @@ pub async fn retrigger_failed_webhooks(state: &AppState) -> Result<usize, Retrig
                 Some(id) => id,
                 None => continue,
             },
-            _ => target.deposit_address_id.as_str(),
+            event if event.is_payout() => match target.lightning_payment_id.as_deref() {
+                Some(id) => id,
+                None => continue,
+            },
+            _ => match target.deposit_address_id.as_deref() {
+                Some(id) => id,
+                None => continue,
+            },
         };
         let target_endpoints: Vec<&str> = match &target.webhook_endpoint_id {
             Some(id) => vec![id.as_str()],
@@ -553,6 +713,13 @@ pub async fn retrigger_failed_webhooks(state: &AppState) -> Result<usize, Retrig
                 match event {
                     WebhookEventType::Paid => {
                         state.db.reset_webhook_delivery(subject_id, endpoint_id).await?;
+                    }
+                    event if event.is_payout() => {
+                        let row = state
+                            .db
+                            .get_or_create_payout_webhook_delivery(subject_id, event, endpoint_id)
+                            .await?;
+                        state.db.reset_webhook_delivery_by_id(&row.id).await?;
                     }
                     _ => {
                         let row = state
@@ -577,8 +744,9 @@ pub async fn retrigger_failed_webhooks(state: &AppState) -> Result<usize, Retrig
     Ok(retried)
 }
 
-/// Deliver one queued webhook. `subject_id` is a deposit id for PAID and a
-/// deposit-address id for PENDING/EXPIRED.
+/// Deliver one queued webhook. `subject_id` is a deposit id for PAID, a
+/// deposit-address id for PENDING/EXPIRED and a Lightning payment id for
+/// payout events.
 pub async fn deliver_webhook(
     state: &AppState,
     event: WebhookEventType,
@@ -601,6 +769,7 @@ pub async fn deliver_webhook(
     let webhook_url = &endpoint.url;
     let subject_label = match event {
         WebhookEventType::Paid => format!("deposit {subject_id}"),
+        event if event.is_payout() => format!("payout {subject_id} ({})", event.as_api()),
         _ => format!("address {subject_id} ({})", event.as_api()),
     };
 
@@ -646,6 +815,20 @@ pub async fn deliver_webhook(
                 .get_or_create_address_webhook_delivery(subject_id, event, endpoint_id)
                 .await?;
             (delivery, address_event_payload(event, &address)?)
+        }
+        WebhookEventType::PayoutSucceeded | WebhookEventType::PayoutFailed => {
+            let Some(lightning) = &state.lightning else {
+                anyhow::bail!("Lightning is not configured — payout {subject_id} not delivered");
+            };
+            let Some(payment) = lightning.get_payment(subject_id).await? else {
+                warn!("Payout webhook skipped — wallet has no payment {subject_id}");
+                return Ok(DeliveryOutcome::Skipped);
+            };
+            let delivery = state
+                .db
+                .get_or_create_payout_webhook_delivery(subject_id, event, endpoint_id)
+                .await?;
+            (delivery, payout_payload(event, &payment))
         }
     };
 
@@ -808,21 +991,57 @@ async fn api_key_expiry_loop(state: AppState) {
     }
 }
 
-/// Primary Lightning detection: SDK `PaymentSucceeded` events. The SDK
-/// callback only enqueues; settlement runs here, off the SDK dispatch.
+/// Lightning wallet events: received payments settle gateway invoices
+/// (primary detection), finished sends trigger payout webhooks. The SDK
+/// callback only enqueues; the work runs here, off the SDK dispatch.
 async fn lightning_event_loop(state: AppState, lightning: LightningClient) {
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ReceivedPayment>();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<LightningEvent>();
     let listener_id = lightning
-        .subscribe(move |payment| {
-            let _ = tx.send(payment);
+        .subscribe(move |event| {
+            let _ = tx.send(event);
         })
         .await;
     info!("Lightning payment listener registered ({listener_id})");
-    while let Some(payment) = rx.recv().await {
-        let payment_id = payment.payment_id.clone();
-        if let Err(err) = handle_lightning_payment(&state, payment).await {
-            // The reconciliation loop picks it up on its next tick.
-            error!("Lightning payment {payment_id} processing error: {err:#}");
+
+    // Subscribed first, so nothing finishing during the catch-up is missed.
+    if let Err(err) = catch_up_payouts(&state, &lightning).await {
+        warn!("Payout webhook catch-up failed: {err:#}");
+    }
+    let watermark_state = state.clone();
+    tokio::spawn(async move { payout_watermark_loop(watermark_state).await });
+
+    while let Some(event) = rx.recv().await {
+        match event {
+            LightningEvent::Received(payment) => {
+                let payment_id = payment.payment_id.clone();
+                if let Err(err) = handle_lightning_payment(&state, payment).await {
+                    // The reconciliation loop picks it up on its next tick.
+                    error!("Lightning payment {payment_id} processing error: {err:#}");
+                }
+            }
+            LightningEvent::SendFinished(payment) => {
+                if let Err(err) = notify_payout(&state, &payment).await {
+                    // The next boot catch-up picks it up.
+                    error!("Payout webhook queueing error for {}: {err:#}", payment.id);
+                }
+            }
+        }
+    }
+}
+
+/// Keep the payout watermark close to now while running, so a restart only
+/// re-lists the downtime (plus the margin).
+async fn payout_watermark_loop(state: AppState) {
+    let key = state.config.redis_key(PAYOUT_WATERMARK_KEY);
+    let mut interval =
+        tokio::time::interval(Duration::from_secs(LIGHTNING_PAYOUT_WATERMARK_INTERVAL_SECS));
+    interval.tick().await;
+    loop {
+        interval.tick().await;
+        let now = chrono::Utc::now().timestamp().max(0);
+        let mut redis = state.redis.clone();
+        if let Err(err) = redis.set::<_, _, ()>(&key, now).await {
+            warn!("Payout watermark update failed: {err}");
         }
     }
 }
@@ -1458,6 +1677,8 @@ mod tests {
             invoice: invoice.map(Into::into),
             description: None,
             tx_id: None,
+            ln_address: None,
+            comment: None,
         }
     }
 
@@ -1479,6 +1700,91 @@ mod tests {
             .collect();
         // Order (newest first) is preserved; only gateway invoices link.
         assert_eq!(linked, vec![("p1", Some("addr-1")), ("p2", None), ("p3", None)]);
+    }
+
+    fn sent(status: WalletPaymentStatus) -> WalletPayment {
+        WalletPayment {
+            direction: PaymentDirection::Send,
+            status,
+            amount_sats: 150_000,
+            fees_sats: 3,
+            ln_address: Some("alice@example.com".into()),
+            comment: Some("thanks".into()),
+            invoice: Some("lnbc1500u1recipient".into()),
+            ..history_payment("6f1c7a8e-2f43-4d55-9a8b-1c2d3e4f5a6b", None)
+        }
+    }
+
+    #[test]
+    fn payout_events_follow_the_final_send_status() {
+        assert_eq!(
+            payout_event_for(&sent(WalletPaymentStatus::Completed)),
+            Some(WebhookEventType::PayoutSucceeded)
+        );
+        assert_eq!(
+            payout_event_for(&sent(WalletPaymentStatus::Failed)),
+            Some(WebhookEventType::PayoutFailed)
+        );
+        assert_eq!(payout_event_for(&sent(WalletPaymentStatus::Pending)), None);
+        // A received payment is never a payout.
+        let received = WalletPayment {
+            direction: PaymentDirection::Receive,
+            ..sent(WalletPaymentStatus::Completed)
+        };
+        assert_eq!(payout_event_for(&received), None);
+    }
+
+    #[test]
+    fn payout_catch_up_starts_before_the_watermark_and_never_on_first_boot() {
+        // First boot: nothing to catch up (no history replay).
+        assert_eq!(payout_catch_up_from(None), None);
+        assert_eq!(
+            payout_catch_up_from(Some(1_700_003_600)),
+            Some(1_700_003_600 - config::LIGHTNING_PAYOUT_CATCH_UP_MARGIN_SECS)
+        );
+        assert_eq!(payout_catch_up_from(Some(10)), Some(0));
+    }
+
+    #[test]
+    fn payout_queue_members_roundtrip() {
+        for event in [WebhookEventType::PayoutSucceeded, WebhookEventType::PayoutFailed] {
+            let member =
+                encode_queue_member(event, "6f1c7a8e-2f43-4d55-9a8b-1c2d3e4f5a6b", "ep-456");
+            assert_eq!(
+                member,
+                format!("{}|6f1c7a8e-2f43-4d55-9a8b-1c2d3e4f5a6b|ep-456", event.as_db())
+            );
+            assert_eq!(
+                decode_queue_member(&member),
+                Some((event, "6f1c7a8e-2f43-4d55-9a8b-1c2d3e4f5a6b", "ep-456"))
+            );
+        }
+    }
+
+    #[test]
+    fn payout_payload_reports_the_send() {
+        let payload =
+            payout_payload(WebhookEventType::PayoutSucceeded, &sent(WalletPaymentStatus::Completed));
+        assert_eq!(
+            payload,
+            serde_json::json!({
+                "event_type": "payout_succeeded",
+                "data": {
+                    "payment_id": "6f1c7a8e-2f43-4d55-9a8b-1c2d3e4f5a6b",
+                    "status": "completed",
+                    "network": "lightning",
+                    "token": "BTC",
+                    "amount": "0.0015",
+                    "amount_sats": "150000",
+                    "fees_sats": "3",
+                    "method": "lightning",
+                    "ln_address": "alice@example.com",
+                    "comment": "thanks",
+                    "invoice": "lnbc1500u1recipient",
+                    "created_at": "2023-11-14T22:13:20+00:00",
+                },
+            })
+        );
     }
 
     #[test]

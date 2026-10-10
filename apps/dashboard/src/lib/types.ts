@@ -88,7 +88,12 @@ export interface DepositAddressDetail extends DepositAddress {
   deposits: Deposit[]
 }
 
-export type WebhookEventType = "pending" | "paid" | "expired"
+export type WebhookEventType =
+  | "pending"
+  | "paid"
+  | "expired"
+  | "payout_succeeded"
+  | "payout_failed"
 
 export interface WebhookDelivery {
   id: string
@@ -96,17 +101,20 @@ export interface WebhookDelivery {
   event: WebhookEventType
   /** deposits.id — null on pending/expired event deliveries (no deposit). */
   deposit_id: string | null
-  /** deposit_addresses.id — what the outgoing webhook payload calls deposit_id. */
-  deposit_address_id: string
+  /** deposit_addresses.id — what the outgoing webhook payload calls deposit_id. Null on payouts. */
+  deposit_address_id: string | null
+  /** Lightning wallet payment id — payout deliveries only. */
+  lightning_payment_id: string | null
   /** null on deliveries from before per-endpoint tracking. */
   webhook_endpoint_id: string | null
   endpoint_url: string | null
   /** null on pending/expired event deliveries. */
   tx_hash: string | null
-  address: string
+  /** null on payout deliveries. */
+  address: string | null
   network: Network | "unknown"
-  /** Deposit amount for paid events, expected amount otherwise. */
-  amount: string
+  /** Deposit amount for paid events, expected amount for address events, sent amount for payouts. */
+  amount: string | null
   deposit_status: DepositStatus | null
   status: WebhookStatus
   attempts: number
@@ -130,6 +138,8 @@ export interface ApiKey {
   revoked_at: string | null
   /** null = never expires (revocable only). */
   expires_at: string | null
+  /** May send Lightning payouts through /api/v1. */
+  can_send: boolean
   created_at: string
 }
 
@@ -141,6 +151,7 @@ export interface CreatedApiKey {
   key: string
   status: ApiKeyStatus
   expires_at: string | null
+  can_send: boolean
   created_at: string
 }
 
@@ -189,6 +200,9 @@ export interface LightningPayment {
   description: string | null
   /** On-chain txid, for deposits into / withdrawals from the wallet. */
   tx_id: string | null
+  /** Lightning address paid (LNURL-pay sends). */
+  ln_address: string | null
+  comment: string | null
   created_at: string | null
   /** Gateway payment (deposit_addresses.id) this settled — null otherwise. */
   deposit_address_id: string | null

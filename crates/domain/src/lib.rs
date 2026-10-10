@@ -244,24 +244,35 @@ impl WebhookDeliveryStatus {
     }
 }
 
-/// Address lifecycle event a webhook endpoint can subscribe to. Mirrors
+/// Event a webhook endpoint can subscribe to. Address lifecycle events mirror
 /// `DepositAddressStatus`: PENDING fires at address creation, PAID at deposit
-/// confirmation, EXPIRED when the address expires unpaid.
+/// confirmation, EXPIRED when the address expires unpaid. Payout events
+/// report the final outcome of every outgoing Lightning wallet payment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum WebhookEventType {
     Pending,
     Paid,
     Expired,
+    PayoutSucceeded,
+    PayoutFailed,
 }
 
 impl WebhookEventType {
-    pub const ALL: [Self; 3] = [Self::Pending, Self::Paid, Self::Expired];
+    pub const ALL: [Self; 5] = [
+        Self::Pending,
+        Self::Paid,
+        Self::Expired,
+        Self::PayoutSucceeded,
+        Self::PayoutFailed,
+    ];
 
     pub fn as_db(&self) -> &'static str {
         match self {
             Self::Pending => "PENDING",
             Self::Paid => "PAID",
             Self::Expired => "EXPIRED",
+            Self::PayoutSucceeded => "PAYOUT_SUCCEEDED",
+            Self::PayoutFailed => "PAYOUT_FAILED",
         }
     }
 
@@ -270,6 +281,8 @@ impl WebhookEventType {
             Self::Pending => "pending",
             Self::Paid => "paid",
             Self::Expired => "expired",
+            Self::PayoutSucceeded => "payout_succeeded",
+            Self::PayoutFailed => "payout_failed",
         }
     }
 
@@ -280,7 +293,15 @@ impl WebhookEventType {
             Self::Pending => "payment_pending",
             Self::Paid => "deposit_confirmed",
             Self::Expired => "payment_expired",
+            Self::PayoutSucceeded => "payout_succeeded",
+            Self::PayoutFailed => "payout_failed",
         }
+    }
+
+    /// Payout events are keyed on a Lightning wallet payment id, not on a
+    /// deposit address.
+    pub fn is_payout(&self) -> bool {
+        matches!(self, Self::PayoutSucceeded | Self::PayoutFailed)
     }
 
     pub fn parse_api(value: &str) -> Result<Self, DomainError> {
@@ -288,6 +309,8 @@ impl WebhookEventType {
             "pending" => Ok(Self::Pending),
             "paid" => Ok(Self::Paid),
             "expired" => Ok(Self::Expired),
+            "payout_succeeded" => Ok(Self::PayoutSucceeded),
+            "payout_failed" => Ok(Self::PayoutFailed),
             _ => Err(DomainError::InvalidStatus(value.to_string())),
         }
     }
@@ -297,6 +320,8 @@ impl WebhookEventType {
             "PENDING" => Ok(Self::Pending),
             "PAID" => Ok(Self::Paid),
             "EXPIRED" => Ok(Self::Expired),
+            "PAYOUT_SUCCEEDED" => Ok(Self::PayoutSucceeded),
+            "PAYOUT_FAILED" => Ok(Self::PayoutFailed),
             _ => Err(DomainError::InvalidStatus(value.to_string())),
         }
     }
@@ -873,6 +898,42 @@ mod tests {
             assert_eq!(TrafficWindow::parse_api(window.as_api()).unwrap(), window);
         }
         assert!(TrafficWindow::parse_api("7d").is_err());
+    }
+
+    #[test]
+    fn payout_event_casings_roundtrip() {
+        assert_eq!(WebhookEventType::PayoutSucceeded.as_db(), "PAYOUT_SUCCEEDED");
+        assert_eq!(WebhookEventType::PayoutFailed.as_db(), "PAYOUT_FAILED");
+        assert_eq!(
+            WebhookEventType::from_db("PAYOUT_SUCCEEDED").unwrap().as_api(),
+            "payout_succeeded"
+        );
+        assert_eq!(
+            WebhookEventType::parse_api("payout_failed").unwrap(),
+            WebhookEventType::PayoutFailed
+        );
+        assert_eq!(
+            WebhookEventType::PayoutSucceeded.payload_event_type(),
+            "payout_succeeded"
+        );
+        assert_eq!(WebhookEventType::PayoutFailed.payload_event_type(), "payout_failed");
+        assert!(WebhookEventType::from_db("payout_failed").is_err());
+        assert_eq!(WebhookEventType::ALL.len(), 5);
+    }
+
+    #[test]
+    fn payout_events_are_not_address_events() {
+        assert!(WebhookEventType::PayoutSucceeded.is_payout());
+        assert!(WebhookEventType::PayoutFailed.is_payout());
+        for event in [
+            WebhookEventType::Pending,
+            WebhookEventType::Paid,
+            WebhookEventType::Expired,
+        ] {
+            assert!(!event.is_payout());
+        }
+        // The historical names are untouched.
+        assert_eq!(WebhookEventType::Paid.payload_event_type(), "deposit_confirmed");
     }
 
     #[test]

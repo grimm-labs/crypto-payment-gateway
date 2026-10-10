@@ -39,7 +39,7 @@ pub struct Db {
 // are UTC instants) instead of using SELECT * / RETURNING *.
 const DEPOSIT_ADDRESS_COLUMNS: &str = r#"id, network::text AS network, token::text AS token, address, "derivationIndex", "expectedAmount", status::text AS status, "expiresAt" AT TIME ZONE 'UTC' AS "expiresAt", metadata, "createdAt" AT TIME ZONE 'UTC' AS "createdAt", "updatedAt" AT TIME ZONE 'UTC' AS "updatedAt""#;
 const DEPOSIT_COLUMNS: &str = r#"id, "depositAddressId", "txHash", amount, "amountRaw", confirmations, status::text AS status, "detectedAt" AT TIME ZONE 'UTC' AS "detectedAt", "confirmedAt" AT TIME ZONE 'UTC' AS "confirmedAt""#;
-const WEBHOOK_DELIVERY_COLUMNS: &str = r#"id, "depositId", "depositAddressId", "eventType", "webhookEndpointId", status::text AS status, attempts, "lastResponse", "lastError", "createdAt" AT TIME ZONE 'UTC' AS "createdAt", "updatedAt" AT TIME ZONE 'UTC' AS "updatedAt""#;
+const WEBHOOK_DELIVERY_COLUMNS: &str = r#"id, "depositId", "depositAddressId", "lightningPaymentId", "eventType", "webhookEndpointId", status::text AS status, attempts, "lastResponse", "lastError", "createdAt" AT TIME ZONE 'UTC' AS "createdAt", "updatedAt" AT TIME ZONE 'UTC' AS "updatedAt""#;
 
 #[derive(Debug, Clone, FromRow)]
 pub struct DepositAddressRow {
@@ -85,8 +85,12 @@ pub struct WebhookDeliveryRow {
     /// NULL on PENDING/EXPIRED event deliveries (no deposit involved).
     #[sqlx(rename = "depositId")]
     pub deposit_id: Option<String>,
+    /// NULL on payout deliveries (keyed on `lightning_payment_id`).
     #[sqlx(rename = "depositAddressId")]
-    pub deposit_address_id: String,
+    pub deposit_address_id: Option<String>,
+    /// SDK payment id — set on payout deliveries only.
+    #[sqlx(rename = "lightningPaymentId")]
+    pub lightning_payment_id: Option<String>,
     /// DB value of the `WebhookEventType` this delivery notifies.
     #[sqlx(rename = "eventType")]
     pub event_type: String,
@@ -558,6 +562,64 @@ impl Db {
             "#
         ))
         .bind(address_id)
+        .bind(event.as_db())
+        .bind(endpoint_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row)
+    }
+
+    /// Get-or-create for a payout event delivery, keyed on (Lightning
+    /// payment id, event, endpoint).
+    pub async fn get_or_create_payout_webhook_delivery(
+        &self,
+        payment_id: &str,
+        event: WebhookEventType,
+        endpoint_id: &str,
+    ) -> Result<WebhookDeliveryRow> {
+        if let Some(row) = self
+            .find_payout_webhook_delivery(payment_id, event, endpoint_id)
+            .await?
+        {
+            return Ok(row);
+        }
+
+        let id = Uuid::new_v4().to_string();
+        let now = Utc::now();
+        let row = sqlx::query_as::<_, WebhookDeliveryRow>(&format!(
+            r#"
+            INSERT INTO webhook_deliveries
+              (id, "lightningPaymentId", "eventType", "webhookEndpointId", status, attempts, "createdAt", "updatedAt")
+            VALUES
+              ($1, $2, $3, $4, 'PENDING'::"WebhookDeliveryStatus", 0, $5, $5)
+            RETURNING {WEBHOOK_DELIVERY_COLUMNS}
+            "#
+        ))
+        .bind(&id)
+        .bind(payment_id)
+        .bind(event.as_db())
+        .bind(endpoint_id)
+        .bind(now)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(row)
+    }
+
+    /// Most recent delivery row for a (Lightning payment, event, endpoint).
+    pub async fn find_payout_webhook_delivery(
+        &self,
+        payment_id: &str,
+        event: WebhookEventType,
+        endpoint_id: &str,
+    ) -> Result<Option<WebhookDeliveryRow>> {
+        let row = sqlx::query_as::<_, WebhookDeliveryRow>(&format!(
+            r#"
+            SELECT {WEBHOOK_DELIVERY_COLUMNS} FROM webhook_deliveries
+            WHERE "lightningPaymentId" = $1 AND "eventType" = $2 AND "webhookEndpointId" = $3
+            ORDER BY "createdAt" DESC LIMIT 1
+            "#
+        ))
+        .bind(payment_id)
         .bind(event.as_db())
         .bind(endpoint_id)
         .fetch_optional(&self.pool)

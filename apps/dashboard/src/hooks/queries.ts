@@ -14,6 +14,7 @@ import type {
   CreatedApiKey,
   DepositAddress,
   DepositAddressDetail,
+  LightningPayment,
   LightningPaymentsPage,
   Paginated,
   Staff,
@@ -116,6 +117,31 @@ export function useLightningPayments(page: { limit: number; offset: number }) {
     queryKey: ["lightning-payments", page],
     queryFn: () => api<LightningPaymentsPage>(`/lightning/payments${listParams(page)}`),
     placeholderData: (previous) => previous,
+  })
+}
+
+export interface PayoutPayload {
+  ln_address: string
+  /** Integer sats string; fees come on top. */
+  amount_sats: string
+  comment?: string
+  /** UUID — a replay with the same key never pays twice. */
+  idempotencyKey: string
+}
+
+/** Pay a Lightning address from the wallet (admin only). */
+export function usePayLightningAddress() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: ({ idempotencyKey, ...body }: PayoutPayload) =>
+      api<LightningPayment>("/lightning/payments", {
+        body,
+        headers: { "Idempotency-Key": idempotencyKey },
+      }),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["lightning-payments"] })
+      queryClient.invalidateQueries({ queryKey: ["wallet-balances"] })
+    },
   })
 }
 
@@ -308,8 +334,21 @@ export function useApiKeys() {
 export function useCreateApiKey() {
   const queryClient = useQueryClient()
   return useMutation({
-    mutationFn: (payload: { name: string; expires_in_days: number | null }) =>
+    mutationFn: (payload: { name: string; expires_in_days: number | null; can_send: boolean }) =>
       api<CreatedApiKey>("/api-keys", { body: payload }),
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ["api-keys"] }),
+  })
+}
+
+/** Grant or withdraw a key's Lightning payout permission. */
+export function useUpdateApiKey() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: ({ id, can_send }: { id: string; can_send: boolean }) =>
+      api<{ id: string; can_send: boolean }>(`/api-keys/${id}`, {
+        method: "PATCH",
+        body: { can_send },
+      }),
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ["api-keys"] }),
   })
 }

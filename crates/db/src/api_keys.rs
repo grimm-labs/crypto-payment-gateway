@@ -5,7 +5,7 @@ use uuid::Uuid;
 
 use crate::Db;
 
-const API_KEY_COLUMNS: &str = r#"id, name, prefix, "keyHash", status::text AS status, "createdById", "lastUsedAt" AT TIME ZONE 'UTC' AS "lastUsedAt", "revokedAt" AT TIME ZONE 'UTC' AS "revokedAt", "expiresAt" AT TIME ZONE 'UTC' AS "expiresAt", "createdAt" AT TIME ZONE 'UTC' AS "createdAt""#;
+const API_KEY_COLUMNS: &str = r#"id, name, prefix, "keyHash", status::text AS status, "createdById", "lastUsedAt" AT TIME ZONE 'UTC' AS "lastUsedAt", "revokedAt" AT TIME ZONE 'UTC' AS "revokedAt", "expiresAt" AT TIME ZONE 'UTC' AS "expiresAt", "canSend", "createdAt" AT TIME ZONE 'UTC' AS "createdAt""#;
 
 #[derive(Debug, Clone, FromRow)]
 pub struct ApiKeyRow {
@@ -24,6 +24,9 @@ pub struct ApiKeyRow {
     /// NULL = never expires (revocable only).
     #[sqlx(rename = "expiresAt")]
     pub expires_at: Option<DateTime<Utc>>,
+    /// May send Lightning payouts (granted by an admin; off by default).
+    #[sqlx(rename = "canSend")]
+    pub can_send: bool,
     #[sqlx(rename = "createdAt")]
     pub created_at: DateTime<Utc>,
 }
@@ -45,6 +48,8 @@ pub struct ApiKeyListRow {
     pub revoked_at: Option<DateTime<Utc>>,
     #[sqlx(rename = "expiresAt")]
     pub expires_at: Option<DateTime<Utc>>,
+    #[sqlx(rename = "canSend")]
+    pub can_send: bool,
     #[sqlx(rename = "createdAt")]
     pub created_at: DateTime<Utc>,
 }
@@ -57,15 +62,16 @@ impl Db {
         key_hash: &str,
         created_by_id: &str,
         expires_at: Option<DateTime<Utc>>,
+        can_send: bool,
     ) -> Result<ApiKeyRow> {
         let id = Uuid::new_v4().to_string();
         let now = Utc::now();
         let row = sqlx::query_as::<_, ApiKeyRow>(&format!(
             r#"
             INSERT INTO api_keys
-              (id, name, prefix, "keyHash", status, "createdById", "expiresAt", "createdAt")
+              (id, name, prefix, "keyHash", status, "createdById", "expiresAt", "canSend", "createdAt")
             VALUES
-              ($1, $2, $3, $4, 'ACTIVE'::"ApiKeyStatus", $5, $6, $7)
+              ($1, $2, $3, $4, 'ACTIVE'::"ApiKeyStatus", $5, $6, $7, $8)
             RETURNING {API_KEY_COLUMNS}
             "#
         ))
@@ -75,6 +81,7 @@ impl Db {
         .bind(key_hash)
         .bind(created_by_id)
         .bind(expires_at)
+        .bind(can_send)
         .bind(now)
         .fetch_one(&self.pool)
         .await?;
@@ -89,6 +96,7 @@ impl Db {
                    k."lastUsedAt" AT TIME ZONE 'UTC' AS "lastUsedAt",
                    k."revokedAt" AT TIME ZONE 'UTC' AS "revokedAt",
                    k."expiresAt" AT TIME ZONE 'UTC' AS "expiresAt",
+                   k."canSend",
                    k."createdAt" AT TIME ZONE 'UTC' AS "createdAt"
             FROM api_keys k
             LEFT JOIN staff_users s ON s.id = k."createdById"
@@ -116,6 +124,17 @@ impl Db {
         .fetch_optional(&self.pool)
         .await?;
         Ok(row)
+    }
+
+    /// Grant or withdraw the payout permission. `false` when the key does
+    /// not exist.
+    pub async fn set_api_key_can_send(&self, id: &str, can_send: bool) -> Result<bool> {
+        let result = sqlx::query(r#"UPDATE api_keys SET "canSend" = $2 WHERE id = $1"#)
+            .bind(id)
+            .bind(can_send)
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected() > 0)
     }
 
     /// Returns `false` when the key does not exist or is already revoked.

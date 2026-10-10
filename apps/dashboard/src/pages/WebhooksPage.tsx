@@ -55,6 +55,16 @@ const EVENT_OPTIONS: Array<{
   { value: "pending", label: "Pending", description: "A payment address is created" },
   { value: "paid", label: "Paid", description: "A deposit is confirmed on-chain" },
   { value: "expired", label: "Expired", description: "An address expires unpaid" },
+  {
+    value: "payout_succeeded",
+    label: "Payout succeeded",
+    description: "An outgoing Lightning wallet payment completed (any sender)",
+  },
+  {
+    value: "payout_failed",
+    label: "Payout failed",
+    description: "An outgoing Lightning wallet payment failed (any sender)",
+  },
 ]
 
 /** 32 random alphanumeric chars for the signing secret. */
@@ -92,9 +102,9 @@ export function WebhooksPage() {
         <div>
           <h1 className="text-2xl font-semibold tracking-tight">Webhooks</h1>
           <p className="text-sm text-muted-foreground">
-            Each active endpoint receives a POST for the payment events it
-            subscribes to — pending (address created), paid (deposit
-            confirmed) and expired.
+            Each active endpoint receives a POST for the events it subscribes
+            to — pending (address created), paid (deposit confirmed), expired,
+            and payout succeeded / failed (outgoing Lightning payments).
           </p>
         </div>
         <AddEndpointDialog />

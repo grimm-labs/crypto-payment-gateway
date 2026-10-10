@@ -43,6 +43,7 @@ import {
   SelectValue,
 } from "@/components/ui/select"
 import { Skeleton } from "@/components/ui/skeleton"
+import { Switch } from "@/components/ui/switch"
 import {
   Table,
   TableBody,
@@ -56,6 +57,7 @@ import {
   useCreateApiKey,
   useRevokeApiKey,
   useSettings,
+  useUpdateApiKey,
   useUpdateSettings,
 } from "@/hooks/queries"
 import { formatDate } from "@/lib/format"
@@ -64,6 +66,20 @@ import type { CreatedApiKey } from "@/lib/types"
 export function ApiKeysPage() {
   const keys = useApiKeys()
   const revokeKey = useRevokeApiKey()
+  const updateKey = useUpdateApiKey()
+
+  async function handleCanSend(id: string, name: string, canSend: boolean) {
+    try {
+      await updateKey.mutateAsync({ id, can_send: canSend })
+      toast.success(
+        canSend
+          ? `“${name}” can now send Lightning payments`
+          : `“${name}” can no longer send payments`,
+      )
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "Update failed")
+    }
+  }
 
   async function handleRevoke(id: string) {
     try {
@@ -100,6 +116,7 @@ export function ApiKeysPage() {
                 <TableHead>Prefix</TableHead>
                 <TableHead>Status</TableHead>
                 <TableHead>Expires</TableHead>
+                <TableHead>Payouts</TableHead>
                 <TableHead>Created by</TableHead>
                 <TableHead>Last used</TableHead>
                 <TableHead>Created</TableHead>
@@ -109,7 +126,7 @@ export function ApiKeysPage() {
             <TableBody>
               {keys.data?.data.length === 0 && (
                 <TableRow>
-                  <TableCell colSpan={8} className="h-24 text-center text-muted-foreground">
+                  <TableCell colSpan={9} className="h-24 text-center text-muted-foreground">
                     No API keys yet. Merchant calls to /api/v1 require one.
                   </TableCell>
                 </TableRow>
@@ -130,6 +147,14 @@ export function ApiKeysPage() {
                   </TableCell>
                   <TableCell className="text-muted-foreground">
                     {key.expires_at ? formatDate(key.expires_at) : "Never"}
+                  </TableCell>
+                  <TableCell>
+                    <Switch
+                      checked={key.can_send}
+                      disabled={key.status !== "active" || updateKey.isPending}
+                      aria-label={`Allow ${key.name} to send Lightning payments`}
+                      onCheckedChange={(checked) => handleCanSend(key.id, key.name, checked)}
+                    />
                   </TableCell>
                   <TableCell className="text-muted-foreground">
                     {key.created_by ?? "—"}
@@ -260,6 +285,7 @@ function CreateApiKeyDialog() {
   const [open, setOpen] = useState(false)
   const [name, setName] = useState("")
   const [expiry, setExpiry] = useState<string>("never")
+  const [canSend, setCanSend] = useState(false)
   const [created, setCreated] = useState<CreatedApiKey | null>(null)
   const createKey = useCreateApiKey()
 
@@ -273,6 +299,7 @@ function CreateApiKeyDialog() {
       const key = await createKey.mutateAsync({
         name: name.trim(),
         expires_in_days: choice?.days ?? null,
+        can_send: canSend,
       })
       setCreated(key)
     } catch (error) {
@@ -286,6 +313,7 @@ function CreateApiKeyDialog() {
       setCreated(null)
       setName("")
       setExpiry("never")
+      setCanSend(false)
     }
   }
 
@@ -363,6 +391,16 @@ function CreateApiKeyDialog() {
                 <p className="text-xs text-muted-foreground">
                   An expired key stops working immediately and cannot be reactivated.
                 </p>
+              </div>
+              <div className="flex items-start gap-3">
+                <Switch id="key-can-send" checked={canSend} onCheckedChange={setCanSend} />
+                <div className="grid gap-0.5 leading-none">
+                  <Label htmlFor="key-can-send">Can send Lightning payments</Label>
+                  <p className="text-xs text-muted-foreground">
+                    Lets this key pay any Lightning address from the wallet, with no
+                    amount limit. Leave off unless the integration needs it.
+                  </p>
+                </div>
               </div>
             </div>
             <DialogFooter>

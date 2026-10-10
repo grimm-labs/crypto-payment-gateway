@@ -2,10 +2,10 @@ use std::collections::HashMap;
 use std::time::Duration as StdDuration;
 
 use axum::extract::{Path, Query, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
-use axum::{Json, Router};
+use axum::{Extension, Json, Router};
 use chrono::{DateTime, Duration, Utc};
 use db::{DepositAddressRow, WebhookDeliveryRow};
 use domain::{
@@ -15,9 +15,10 @@ use domain::{
 };
 use jobs::{
     expire_addresses_and_notify, get_cached_wallet_balances, get_live_balances,
-    lightning_payment_history, notify_address_event, retrigger_webhook, AppState,
-    LightningHistoryEntry, RetriggerError,
+    lightning_payment_entry, lightning_payment_history, notify_address_event, retrigger_webhook,
+    send_payout, AppState, LightningError, LightningHistoryEntry, RetriggerError,
 };
+use middleware::{CurrentApiKey, CurrentStaff};
 use rust_decimal::Decimal;
 use axum::http::HeaderValue;
 use serde::{Deserialize, Serialize};
@@ -46,7 +47,11 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/balances", get(get_balances))
         .route("/wallet-balances", get(get_wallet_balances))
-        .route("/lightning/payments", get(list_lightning_payments))
+        .route(
+            "/lightning/payments",
+            get(list_lightning_payments).post(create_lightning_payout),
+        )
+        .route("/lightning/payments/{id}", get(get_lightning_payment))
         .route_layer(axum::middleware::from_fn_with_state(
             state.clone(),
             middleware::require_api_key,
@@ -533,6 +538,156 @@ async fn list_lightning_payments(
     }
 }
 
+/// Longest Lightning address accepted (local part + `@` + domain).
+const LN_ADDRESS_MAX_LEN: usize = 320;
+
+#[derive(Debug, Deserialize)]
+struct PayoutRequest {
+    /// `user@domain` — the only payout destination (no LNURL strings or
+    /// invoices).
+    ln_address: String,
+    /// Integer string, sats; fees come on top.
+    amount_sats: String,
+    /// Sent to the recipient; its maximum length is the recipient's.
+    comment: Option<String>,
+}
+
+#[derive(Debug)]
+struct ValidPayout {
+    ln_address: String,
+    amount_sats: u64,
+    comment: Option<String>,
+    /// Canonical (lowercase, hyphenated) UUID, as the SDK requires.
+    idempotency_key: Option<String>,
+}
+
+fn validate_payout_request(
+    body: &PayoutRequest,
+    idempotency_key: Option<&str>,
+) -> Result<ValidPayout, ApiError> {
+    let ln_address = body.ln_address.trim();
+    if !is_lightning_address(ln_address) {
+        return Err(ApiError::bad_request(
+            "ln_address must be a Lightning address (user@domain)",
+        ));
+    }
+    let amount_sats = parse_sats(&body.amount_sats).map_err(|_| ApiError {
+        status: StatusCode::BAD_REQUEST,
+        message: format!("Invalid amount_sats (integer string, 1 to {BTC_MAX_SATS})"),
+    })?;
+    let idempotency_key = idempotency_key
+        .map(|key| {
+            uuid::Uuid::parse_str(key.trim())
+                .map(|uuid| uuid.hyphenated().to_string())
+                .map_err(|_| ApiError::bad_request("Idempotency-Key must be a UUID"))
+        })
+        .transpose()?;
+    Ok(ValidPayout {
+        ln_address: ln_address.to_string(),
+        amount_sats,
+        comment: body.comment.clone().filter(|c| !c.trim().is_empty()),
+        idempotency_key,
+    })
+}
+
+/// `user@domain` (LUD-16): one `@`, a local part of letters, digits and
+/// `-_.+`, a dotted DNS name. Everything else the SDK could parse (LNURL,
+/// invoices, on-chain addresses) is refused before reaching it.
+fn is_lightning_address(value: &str) -> bool {
+    if value.len() > LN_ADDRESS_MAX_LEN {
+        return false;
+    }
+    let Some((user, domain)) = value.split_once('@') else {
+        return false;
+    };
+    let user_ok = !user.is_empty()
+        && user
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "-_.+".contains(c));
+    let domain_ok = domain.contains('.')
+        && !domain.starts_with(['.', '-'])
+        && !domain.ends_with(['.', '-'])
+        && domain.chars().all(|c| c.is_ascii_alphanumeric() || "-.".contains(c));
+    user_ok && domain_ok
+}
+
+/// Payouts: a merchant key granted `can_send`, or ADMIN staff.
+fn authorize_payout(
+    api_key: Option<&CurrentApiKey>,
+    staff: Option<&CurrentStaff>,
+) -> Result<(), ApiError> {
+    match (api_key, staff) {
+        (Some(key), _) if key.can_send => Ok(()),
+        (Some(_), _) => Err(ApiError::forbidden(
+            "This API key is not allowed to send payments",
+        )),
+        (None, Some(staff)) if staff.role == domain::StaffRole::Admin => Ok(()),
+        (None, Some(_)) => Err(ApiError::forbidden("Admin role required")),
+        (None, None) => Err(ApiError::unauthorized("Not authenticated")),
+    }
+}
+
+/// Pay a Lightning address from the wallet. Answers as soon as the send is
+/// accepted (usually `pending`); the outcome follows as a payout webhook and
+/// through `GET /lightning/payments/{id}`.
+async fn create_lightning_payout(
+    State(state): State<AppState>,
+    api_key: Option<Extension<CurrentApiKey>>,
+    staff: Option<Extension<CurrentStaff>>,
+    headers: HeaderMap,
+    Json(body): Json<PayoutRequest>,
+) -> Result<(StatusCode, Json<Value>), ApiError> {
+    authorize_payout(api_key.as_deref(), staff.as_deref())?;
+    let idempotency_key = headers
+        .get("idempotency-key")
+        .map(|value| value.to_str().unwrap_or_default());
+    let payout = validate_payout_request(&body, idempotency_key)?;
+
+    match send_payout(
+        &state,
+        &payout.ln_address,
+        payout.amount_sats,
+        payout.comment,
+        payout.idempotency_key,
+    )
+    .await
+    {
+        Ok(payment) => Ok((
+            StatusCode::ACCEPTED,
+            Json(lightning_history_json(&LightningHistoryEntry {
+                payment,
+                deposit_address_id: None,
+            })),
+        )),
+        Err(LightningError::Disabled) => Err(ApiError::service_unavailable(
+            "Lightning is not configured".into(),
+        )),
+        Err(LightningError::Failed(err)) => {
+            // Generic on purpose: the SDK detail stays server-side.
+            tracing::warn!("Lightning payout to {} failed: {err:#}", payout.ln_address);
+            Err(ApiError::bad_gateway("Payment failed"))
+        }
+    }
+}
+
+/// One wallet payment (any direction) — e.g. a payout's current status.
+async fn get_lightning_payment(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    match lightning_payment_entry(&state, &id).await {
+        Ok(Some(entry)) => Ok(Json(lightning_history_json(&entry))),
+        Ok(None) => Err(ApiError::not_found(format!("Lightning payment not found: {id}"))),
+        Err(LightningError::Disabled) => Err(ApiError::service_unavailable(
+            "Lightning is not configured".into(),
+        )),
+        Err(LightningError::Failed(err)) => {
+            tracing::error!("Lightning payment lookup failed: {err:#}");
+            Err(ApiError::internal("Failed to read Lightning payment".into()))
+        }
+    }
+}
+
 /// `(limit, offset)`: limit defaults to 50, clamped to 1–100.
 fn history_paging(query: &PageQuery) -> (u32, u32) {
     let limit = query.limit.unwrap_or(50).clamp(1, 100) as u32;
@@ -555,6 +710,8 @@ fn lightning_history_json(entry: &LightningHistoryEntry) -> Value {
         "invoice": payment.invoice,
         "description": payment.description,
         "tx_id": payment.tx_id,
+        "ln_address": payment.ln_address,
+        "comment": payment.comment,
         "created_at": i64::try_from(payment.timestamp)
             .ok()
             .and_then(|ts| DateTime::from_timestamp(ts, 0))
@@ -677,6 +834,12 @@ impl ApiError {
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,
             message,
+        }
+    }
+    fn bad_gateway(message: &str) -> Self {
+        Self {
+            status: StatusCode::BAD_GATEWAY,
+            message: message.into(),
         }
     }
     fn service_unavailable(message: String) -> Self {
@@ -878,6 +1041,8 @@ mod tests {
                 invoice: Some("lnbc1500u1invoice".into()),
                 description: Some("order #123".into()),
                 tx_id: None,
+                ln_address: None,
+                comment: None,
             },
             deposit_address_id: Some("addr-1".into()),
         };
@@ -894,6 +1059,8 @@ mod tests {
                 "invoice": "lnbc1500u1invoice",
                 "description": "order #123",
                 "tx_id": null,
+                "ln_address": null,
+                "comment": null,
                 "created_at": "2023-11-14T22:13:20+00:00",
                 "deposit_address_id": "addr-1",
             })
@@ -909,6 +1076,101 @@ mod tests {
         assert_eq!(page(Some(500), Some(-3)), (100, 0));
         assert_eq!(page(Some(0), Some(40)), (1, 40));
         assert_eq!(page(Some(20), Some(i64::MAX)), (20, u32::MAX));
+    }
+
+    fn payout(body: Value) -> PayoutRequest {
+        serde_json::from_value(body).expect("valid payout shape")
+    }
+
+    #[test]
+    fn payout_request_accepts_a_lightning_address_and_sats() {
+        let valid = validate_payout_request(
+            &payout(json!({
+                "ln_address": " Alice@Example.com ", "amount_sats": "150000", "comment": "thanks"
+            })),
+            Some("6F1C7A8E-2F43-4D55-9A8B-1C2D3E4F5A6B"),
+        )
+        .unwrap();
+        assert_eq!(valid.ln_address, "Alice@Example.com");
+        assert_eq!(valid.amount_sats, 150_000);
+        assert_eq!(valid.comment.as_deref(), Some("thanks"));
+        // The SDK requires a canonical UUID.
+        assert_eq!(
+            valid.idempotency_key.as_deref(),
+            Some("6f1c7a8e-2f43-4d55-9a8b-1c2d3e4f5a6b")
+        );
+
+        let no_key = validate_payout_request(
+            &payout(json!({ "ln_address": "alice@example.com", "amount_sats": "1" })),
+            None,
+        )
+        .unwrap();
+        assert_eq!(no_key.idempotency_key, None);
+        assert_eq!(no_key.comment, None);
+    }
+
+    #[test]
+    fn payout_request_only_takes_user_at_domain() {
+        for address in [
+            "alice",
+            "@example.com",
+            "alice@",
+            "alice@localhost",
+            "alice@@example.com",
+            "a b@example.com",
+            "lnurl1dp68gurn8ghj7um9wfmxjcm99e3k7mf0v9cxj0m385ekvcenxc6r2c35xvukxefcv5mkvv34x5ekzd3ev56nyd3hxqurzepexejxxepnxscrvwfnv9nxzcn9xq6xyefhvgcxxcmyxymnserxfq5fns",
+            "lnbc1500n1pjexample",
+        ] {
+            let err = validate_payout_request(
+                &payout(json!({ "ln_address": address, "amount_sats": "1000" })),
+                None,
+            )
+            .expect_err(address);
+            assert_eq!(err.status, StatusCode::BAD_REQUEST, "{address}");
+        }
+        let too_long = format!("{}@example.com", "a".repeat(400));
+        assert!(validate_payout_request(
+            &payout(json!({ "ln_address": too_long, "amount_sats": "1000" })),
+            None,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn payout_request_rejects_bad_amounts_and_keys() {
+        for sats in ["0", "-1", "1.5", "abc", ""] {
+            let err = validate_payout_request(
+                &payout(json!({ "ln_address": "alice@example.com", "amount_sats": sats })),
+                None,
+            )
+            .expect_err(sats);
+            assert_eq!(err.status, StatusCode::BAD_REQUEST, "{sats}");
+        }
+        let err = validate_payout_request(
+            &payout(json!({ "ln_address": "alice@example.com", "amount_sats": "1000" })),
+            Some("order-123"),
+        )
+        .unwrap_err();
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+        assert!(err.message.contains("Idempotency-Key"), "{}", err.message);
+    }
+
+    #[test]
+    fn payouts_need_a_permitted_key_or_an_admin() {
+        use crate::middleware::{CurrentApiKey, CurrentStaff};
+        let key = |can_send| CurrentApiKey { id: "k".into(), can_send };
+        let staff = |role| CurrentStaff { id: "s".into(), email: "s@example.com".into(), role };
+
+        assert!(authorize_payout(Some(&key(true)), None).is_ok());
+        let err = authorize_payout(Some(&key(false)), None).unwrap_err();
+        assert_eq!(err.status, StatusCode::FORBIDDEN);
+
+        assert!(authorize_payout(None, Some(&staff(domain::StaffRole::Admin))).is_ok());
+        let err = authorize_payout(None, Some(&staff(domain::StaffRole::Operator))).unwrap_err();
+        assert_eq!(err.status, StatusCode::FORBIDDEN);
+
+        let err = authorize_payout(None, None).unwrap_err();
+        assert_eq!(err.status, StatusCode::UNAUTHORIZED);
     }
 
     #[test]

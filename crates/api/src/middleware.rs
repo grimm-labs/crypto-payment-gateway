@@ -23,6 +23,8 @@ pub struct CurrentStaff {
 #[derive(Debug, Clone)]
 pub struct CurrentApiKey {
     pub id: String,
+    /// May send Lightning payouts.
+    pub can_send: bool,
 }
 
 /// Merchant-API guard: validates the `x-api-key` header against the hashed
@@ -47,7 +49,10 @@ pub async fn require_api_key(
         return Err(ApiError::unauthorized("Invalid API key"));
     }
 
-    let current = CurrentApiKey { id: row.id.clone() };
+    let current = CurrentApiKey {
+        id: row.id.clone(),
+        can_send: row.can_send,
+    };
 
     // Fire-and-forget: never block the request on the usage timestamp.
     let db = state.db.clone();

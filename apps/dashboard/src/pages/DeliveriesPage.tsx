@@ -191,19 +191,31 @@ export function DeliveriesPage() {
                 {webhooks.data?.data.map((webhook) => (
                   <TableRow key={webhook.id}>
                     <TableCell>
-                      <Link
-                        to={`/payments/${webhook.deposit_address_id}`}
-                        className="font-mono text-xs underline-offset-4 hover:underline"
-                      >
-                        {shortHash(webhook.address, 6)}
-                      </Link>
+                      {webhook.deposit_address_id && webhook.address ? (
+                        <Link
+                          to={`/payments/${webhook.deposit_address_id}`}
+                          className="font-mono text-xs underline-offset-4 hover:underline"
+                        >
+                          {shortHash(webhook.address, 6)}
+                        </Link>
+                      ) : webhook.lightning_payment_id ? (
+                        <Link
+                          to="/lightning"
+                          className="font-mono text-xs underline-offset-4 hover:underline"
+                          title={webhook.lightning_payment_id}
+                        >
+                          Payout {shortHash(webhook.lightning_payment_id, 6)}
+                        </Link>
+                      ) : (
+                        <span className="text-xs text-muted-foreground">—</span>
+                      )}
                       <p className="text-xs text-muted-foreground">
                         {networkLabel(webhook.network)}
                       </p>
                     </TableCell>
                     <TableCell>
                       <Badge variant="secondary" className="capitalize">
-                        {webhook.event}
+                        {webhook.event.replace("_", " ")}
                       </Badge>
                     </TableCell>
                     <TableCell>
@@ -223,7 +235,9 @@ export function DeliveriesPage() {
                       )}
                     </TableCell>
                     <TableCell className="tabular-nums">
-                      {formatAmount(webhook.amount, networkToken(webhook.network))}
+                      {webhook.amount
+                        ? formatAmount(webhook.amount, networkToken(webhook.network))
+                        : "—"}
                     </TableCell>
                     <TableCell>
                       <StatusBadge status={webhook.status} />

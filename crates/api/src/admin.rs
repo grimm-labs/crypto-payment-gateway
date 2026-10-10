@@ -14,8 +14,9 @@ use serde_json::{json, Value};
 
 use crate::middleware::{require_admin, require_jwt, CurrentStaff};
 use crate::{
-    create_deposit_address, get_balances, get_deposit_address, get_wallet_balances,
-    list_deposit_addresses, list_lightning_payments, retry_deposit_webhook, ApiError, ListQuery,
+    create_deposit_address, create_lightning_payout, get_balances, get_deposit_address,
+    get_lightning_payment, get_wallet_balances, list_deposit_addresses, list_lightning_payments,
+    retry_deposit_webhook, ApiError, ListQuery,
 };
 
 const MIN_PASSWORD_LEN: usize = 8;
@@ -35,7 +36,7 @@ pub fn admin_router(state: &AppState) -> Router<AppState> {
         .route("/staff/{id}", patch(update_staff))
         .route("/staff/{id}/totp/reset", post(reset_staff_totp))
         .route("/api-keys", get(list_api_keys).post(create_api_key))
-        .route("/api-keys/{id}", delete(revoke_api_key))
+        .route("/api-keys/{id}", delete(revoke_api_key).patch(update_api_key))
         .route("/settings", get(get_settings).patch(update_settings))
         .route(
             "/webhook-endpoints",
@@ -74,7 +75,12 @@ pub fn admin_router(state: &AppState) -> Router<AppState> {
         )
         .route("/balances", get(get_balances))
         .route("/wallet-balances", get(get_wallet_balances))
-        .route("/lightning/payments", get(list_lightning_payments))
+        // POST is ADMIN-only, enforced in the handler (shared with /api/v1).
+        .route(
+            "/lightning/payments",
+            get(list_lightning_payments).post(create_lightning_payout),
+        )
+        .route("/lightning/payments/{id}", get(get_lightning_payment))
         .merge(admin_only)
         .route_layer(axum::middleware::from_fn_with_state(
             state.clone(),
@@ -626,6 +632,7 @@ async fn list_api_keys(State(state): State<AppState>) -> Result<Json<Value>, Api
                 "last_used_at": k.last_used_at.map(|t| t.to_rfc3339()),
                 "revoked_at": k.revoked_at.map(|t| t.to_rfc3339()),
                 "expires_at": k.expires_at.map(|t| t.to_rfc3339()),
+                "can_send": k.can_send,
                 "created_at": k.created_at.to_rfc3339(),
             })
         })
@@ -638,6 +645,9 @@ struct CreateApiKeyRequest {
     name: String,
     /// Days until expiry — one of 30/90/180/365; absent or null = no expiry.
     expires_in_days: Option<i64>,
+    /// Grant the Lightning payout permission (default false).
+    #[serde(default)]
+    can_send: bool,
 }
 
 async fn create_api_key(
@@ -671,6 +681,7 @@ async fn create_api_key(
             &material.sha256_hex,
             &current.id,
             expires_at,
+            body.can_send,
         )
         .await?;
 
@@ -684,9 +695,28 @@ async fn create_api_key(
             "key": material.full_key,
             "status": api_key_display_status(&row.status, row.expires_at),
             "expires_at": row.expires_at.map(|t| t.to_rfc3339()),
+            "can_send": row.can_send,
             "created_at": row.created_at.to_rfc3339(),
         })),
     ))
+}
+
+#[derive(Debug, Deserialize)]
+struct UpdateApiKeyRequest {
+    can_send: bool,
+}
+
+/// Grant or withdraw a key's Lightning payout permission.
+async fn update_api_key(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<UpdateApiKeyRequest>,
+) -> Result<Json<Value>, ApiError> {
+    if !state.db.set_api_key_can_send(&id, body.can_send).await? {
+        return Err(ApiError::not_found(format!("API key not found: {id}")));
+    }
+    tracing::info!("API key {id} payout permission set to {}", body.can_send);
+    Ok(Json(json!({ "id": id, "can_send": body.can_send })))
 }
 
 async fn revoke_api_key(
@@ -998,7 +1028,9 @@ fn parse_events(events: &[String]) -> Result<Vec<WebhookEventType>, ApiError> {
     let mut parsed: Vec<WebhookEventType> = Vec::new();
     for value in events {
         let event = WebhookEventType::parse_api(value).map_err(|_| {
-            ApiError::bad_request("Invalid event: expected pending, paid or expired")
+            ApiError::bad_request(
+                "Invalid event: expected pending, paid, expired, payout_succeeded or payout_failed",
+            )
         })?;
         if !parsed.contains(&event) {
             parsed.push(event);
@@ -1006,7 +1038,7 @@ fn parse_events(events: &[String]) -> Result<Vec<WebhookEventType>, ApiError> {
     }
     if parsed.is_empty() {
         return Err(ApiError::bad_request(
-            "At least one event is required (pending, paid or expired)",
+            "At least one event is required (pending, paid, expired, payout_succeeded or payout_failed)",
         ));
     }
     Ok(parsed)
@@ -1213,15 +1245,29 @@ async fn list_webhooks(
                 // NULL on pending/expired event deliveries (no deposit).
                 "deposit_id": w.deposit_id,
                 // deposit_addresses.id — what the webhook payload calls deposit_id.
+                // NULL on payout deliveries.
                 "deposit_address_id": w.deposit_address_id,
+                // SDK payment id — payout deliveries only.
+                "lightning_payment_id": w.lightning_payment_id,
                 // NULL on deliveries from before per-endpoint tracking.
                 "webhook_endpoint_id": w.webhook_endpoint_id,
                 "endpoint_url": w.endpoint_url,
                 "tx_hash": w.tx_hash,
                 "address": w.address,
-                "network": domain::Network::from_db(&w.network).map(|n| n.as_api()).unwrap_or("unknown"),
-                // Deposit amount for paid events, expected amount otherwise.
-                "amount": w.amount.unwrap_or(w.expected_amount).normalize().to_string(),
+                "network": match (&w.network, &w.lightning_payment_id) {
+                    (Some(network), _) => domain::Network::from_db(network).map(|n| n.as_api()).unwrap_or("unknown"),
+                    (None, Some(_)) => domain::Network::Lightning.as_api(),
+                    (None, None) => "unknown",
+                },
+                // Deposit amount for paid events, expected amount for address
+                // events, the sent amount (from the last payload) for payouts.
+                "amount": w.amount.or(w.expected_amount)
+                    .map(|a| a.normalize().to_string())
+                    .or_else(|| {
+                        w.last_payload.as_ref()
+                            .and_then(|p| p["data"]["amount"].as_str())
+                            .map(str::to_owned)
+                    }),
                 "deposit_status": w.deposit_status.as_deref().map(|s| {
                     domain::DepositStatus::from_db(s).map(|s| s.as_api()).unwrap_or("detected")
                 }),

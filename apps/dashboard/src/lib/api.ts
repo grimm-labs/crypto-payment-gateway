@@ -41,6 +41,8 @@ interface RequestOptions {
   body?: unknown
   /** Skip the Authorization header and the 401-refresh dance (login, setup). */
   anonymous?: boolean
+  /** Extra request headers (e.g. Idempotency-Key). */
+  headers?: Record<string, string>
 }
 
 export async function api<T>(path: string, options: RequestOptions = {}): Promise<T> {
@@ -59,7 +61,7 @@ export async function api<T>(path: string, options: RequestOptions = {}): Promis
 }
 
 function send(path: string, options: RequestOptions): Promise<Response> {
-  const headers: Record<string, string> = {}
+  const headers: Record<string, string> = { ...options.headers }
   if (options.body !== undefined) {
     headers["Content-Type"] = "application/json"
   }

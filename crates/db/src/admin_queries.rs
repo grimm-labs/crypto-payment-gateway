@@ -7,8 +7,9 @@ use sqlx::FromRow;
 use crate::Db;
 
 /// Authoritative delivery row (newest per logical key — (deposit, endpoint)
-/// for PAID, (address, event, endpoint) for PENDING/EXPIRED) joined with its
-/// deposit (if any), address and target endpoint. `deposit_id` is
+/// for PAID, (address, event, endpoint) for PENDING/EXPIRED, (Lightning
+/// payment, event, endpoint) for payouts) joined with its deposit and
+/// address (if any) and target endpoint. `deposit_id` is
 /// `deposits.id` (what the deposit retry endpoint takes) and is NULL on
 /// address-scoped events; `deposit_address_id` is `deposit_addresses.id`
 /// (what the webhook payload calls `deposit_id` — intentional, see
@@ -40,36 +41,41 @@ pub struct WebhookDeliveryDetailRow {
     #[sqlx(rename = "txHash")]
     pub tx_hash: Option<String>,
     pub amount: Option<Decimal>,
+    /// NULL on payout deliveries (no deposit address).
     #[sqlx(rename = "expectedAmount")]
-    pub expected_amount: Decimal,
+    pub expected_amount: Option<Decimal>,
     #[sqlx(rename = "depositStatus")]
     pub deposit_status: Option<String>,
     #[sqlx(rename = "depositAddressId")]
-    pub deposit_address_id: String,
-    pub address: String,
-    pub network: String,
+    pub deposit_address_id: Option<String>,
+    /// SDK payment id — payout deliveries only.
+    #[sqlx(rename = "lightningPaymentId")]
+    pub lightning_payment_id: Option<String>,
+    pub address: Option<String>,
+    pub network: Option<String>,
 }
 
 const WEBHOOK_DETAIL_INNER: &str = r#"
-    SELECT DISTINCT ON (w."depositAddressId", w."eventType", w."depositId", w."webhookEndpointId")
+    SELECT DISTINCT ON (w."depositAddressId", w."lightningPaymentId", w."eventType", w."depositId", w."webhookEndpointId")
         w.id, w."eventType", w."depositId", w."webhookEndpointId", e.url AS "endpointUrl",
         w.status::text AS status, w.attempts,
         w."lastResponse", w."lastError", w."lastPayload",
         w."createdAt" AT TIME ZONE 'UTC' AS "createdAt",
         w."updatedAt" AT TIME ZONE 'UTC' AS "updatedAt",
         d."txHash", d.amount, d.status::text AS "depositStatus",
-        a.id AS "depositAddressId", a.address, a.network::text AS network,
+        w."depositAddressId", w."lightningPaymentId", a.address, a.network::text AS network,
         a."expectedAmount"
     FROM webhook_deliveries w
     LEFT JOIN deposits d ON d.id = w."depositId"
-    JOIN deposit_addresses a ON a.id = w."depositAddressId"
+    LEFT JOIN deposit_addresses a ON a.id = w."depositAddressId"
     LEFT JOIN webhook_endpoints e ON e.id = w."webhookEndpointId"
-    ORDER BY w."depositAddressId", w."eventType", w."depositId", w."webhookEndpointId", w."createdAt" DESC
+    ORDER BY w."depositAddressId", w."lightningPaymentId", w."eventType", w."depositId", w."webhookEndpointId", w."createdAt" DESC
 "#;
 
 /// One (delivery key) eligible for a bulk manual retry. `deposit_id` is set
-/// on PAID targets; `webhook_endpoint_id` is `None` on legacy rows (callers
-/// fan those out to all active endpoints).
+/// on PAID targets, `lightning_payment_id` on payout targets;
+/// `webhook_endpoint_id` is `None` on legacy rows (callers fan those out to
+/// all active endpoints).
 #[derive(Debug, Clone, FromRow)]
 pub struct FailedWebhookTarget {
     #[sqlx(rename = "eventType")]
@@ -77,7 +83,9 @@ pub struct FailedWebhookTarget {
     #[sqlx(rename = "depositId")]
     pub deposit_id: Option<String>,
     #[sqlx(rename = "depositAddressId")]
-    pub deposit_address_id: String,
+    pub deposit_address_id: Option<String>,
+    #[sqlx(rename = "lightningPaymentId")]
+    pub lightning_payment_id: Option<String>,
     #[sqlx(rename = "webhookEndpointId")]
     pub webhook_endpoint_id: Option<String>,
 }
@@ -146,14 +154,14 @@ impl Db {
     pub async fn failed_webhook_targets(&self) -> Result<Vec<FailedWebhookTarget>> {
         let rows = sqlx::query_as::<_, FailedWebhookTarget>(
             r#"
-            SELECT t."eventType", t."depositId", t."depositAddressId", t."webhookEndpointId" FROM (
-                SELECT DISTINCT ON (w."depositAddressId", w."eventType", w."depositId", w."webhookEndpointId")
-                    w."eventType", w."depositId", w."depositAddressId", w."webhookEndpointId",
+            SELECT t."eventType", t."depositId", t."depositAddressId", t."lightningPaymentId", t."webhookEndpointId" FROM (
+                SELECT DISTINCT ON (w."depositAddressId", w."lightningPaymentId", w."eventType", w."depositId", w."webhookEndpointId")
+                    w."eventType", w."depositId", w."depositAddressId", w."lightningPaymentId", w."webhookEndpointId",
                     w.status::text AS status
                 FROM webhook_deliveries w
                 LEFT JOIN deposits d ON d.id = w."depositId"
                 WHERE w."depositId" IS NULL OR d.status = 'CONFIRMED'::"DepositStatus"
-                ORDER BY w."depositAddressId", w."eventType", w."depositId", w."webhookEndpointId", w."createdAt" DESC
+                ORDER BY w."depositAddressId", w."lightningPaymentId", w."eventType", w."depositId", w."webhookEndpointId", w."createdAt" DESC
             ) t
             LEFT JOIN webhook_endpoints e ON e.id = t."webhookEndpointId"
             WHERE t.status = 'FAILED'
@@ -236,9 +244,9 @@ impl Db {
         let webhook_counts: Vec<(String, i64)> = sqlx::query_as(
             r#"
             SELECT t.status, COUNT(*) FROM (
-                SELECT DISTINCT ON ("depositAddressId", "eventType", "depositId", "webhookEndpointId") status::text AS status
+                SELECT DISTINCT ON ("depositAddressId", "lightningPaymentId", "eventType", "depositId", "webhookEndpointId") status::text AS status
                 FROM webhook_deliveries
-                ORDER BY "depositAddressId", "eventType", "depositId", "webhookEndpointId", "createdAt" DESC
+                ORDER BY "depositAddressId", "lightningPaymentId", "eventType", "depositId", "webhookEndpointId", "createdAt" DESC
             ) t GROUP BY t.status
             "#,
         )
