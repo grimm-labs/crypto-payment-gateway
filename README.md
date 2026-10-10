@@ -160,8 +160,9 @@ curl -X POST http://localhost:3000/api/v1/lightning/payments \
   -d '{ "ln_address": "alice@example.com", "amount_sats": "10000", "comment": "withdrawal" }'
 ```
 
-Sends from the Breez/Spark wallet to a Lightning address (`user@domain` only — no LNURL
-strings, invoices or on-chain addresses). Network fees are added on top of `amount_sats`
+Sends from the Breez/Spark wallet to a Lightning address (`user@domain` only, user part
+`[a-z0-9-_.]`, public domain — no LNURL strings, invoices, on-chain addresses, IP literals or
+local names). Network fees are added on top of `amount_sats`
 (the recipient receives the amount) and are **not capped**. There is **no amount limit and
 no destination allowlist**.
 
@@ -217,7 +218,7 @@ the acting staff member's `Authorization: Bearer <access_token>`. Requires `JWT_
 | GET/POST/PATCH | `/staff`, `/staff/{id}` | admin | List/create/update staff (roles `admin` / `operator`, activation, password) |
 | GET/POST/PATCH/DELETE | `/api-keys`, `/api-keys/{id}` | admin | List/create/revoke merchant API keys (secret shown once; optional `expires_in_days` 30/90/180/365, omit for no expiry — expired keys get status `expired` and stop working); `can_send` (create or PATCH) grants the Lightning payout permission |
 | GET/PATCH | `/settings` | admin | Read/update system settings (`deposit_expiry_minutes` 1–1440, `api_key_prefix` ≤ 5 alphanum, `api_traffic_retention_days` 1–3650 or `null` = keep forever; PATCH is partial) |
-| GET/POST/PATCH/DELETE | `/webhook-endpoints`, `/webhook-endpoints/{id}` | admin | Manage outgoing webhook endpoints (subscribed `events` — `pending`/`paid`/`expired` — activate/deactivate; delete only when unused) |
+| GET/POST/PATCH/DELETE | `/webhook-endpoints`, `/webhook-endpoints/{id}` | admin | Manage outgoing webhook endpoints (subscribed `events` — `pending`/`paid`/`expired`/`payout_succeeded`/`payout_failed` — activate/deactivate; delete only when unused) |
 | GET | `/webhooks?status=&limit=&offset=` | JWT | Latest delivery per event key, joined with deposit (if any) + address |
 | POST | `/webhooks/retry-failed` | JWT | Bulk-requeue all failed deliveries (paid ones only once their deposit is confirmed) |
 | POST | `/webhook-deliveries/{id}/retry` | JWT | Replay one delivery row (works for every event type) |
@@ -235,7 +236,7 @@ Webhook endpoints are managed in Dashboard → Webhooks (admin). Each endpoint s
 | `pending` | A deposit address is created | `payment_pending` |
 | `paid` | A deposit is confirmed on-chain | `deposit_confirmed` |
 | `expired` | A pending address passes its expiry unpaid | `payment_expired` |
-| `payout_succeeded` | An outgoing Lightning wallet payment completed — **any** send of the wallet, not only the gateway's own | `payout_succeeded` |
+| `payout_succeeded` | An outgoing Lightning wallet payment completed — **any** bitcoin send of the wallet, not only the gateway's own (token sends are not reported) | `payout_succeeded` |
 | `payout_failed` | An outgoing Lightning wallet payment failed | `payout_failed` |
 
 Payout events are opt-in per endpoint (unchecked by default). Sends that finish while the

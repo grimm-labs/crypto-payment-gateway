@@ -51,6 +51,10 @@ pub struct WebhookDeliveryDetailRow {
     /// SDK payment id — payout deliveries only.
     #[sqlx(rename = "lightningPaymentId")]
     pub lightning_payment_id: Option<String>,
+    /// Sent amount (BTC) of a payout, from its last payload; NULL until an
+    /// attempt is made, and on non-payout rows.
+    #[sqlx(rename = "payoutAmount")]
+    pub payout_amount: Option<String>,
     pub address: Option<String>,
     pub network: Option<String>,
 }
@@ -63,7 +67,9 @@ const WEBHOOK_DETAIL_INNER: &str = r#"
         w."createdAt" AT TIME ZONE 'UTC' AS "createdAt",
         w."updatedAt" AT TIME ZONE 'UTC' AS "updatedAt",
         d."txHash", d.amount, d.status::text AS "depositStatus",
-        w."depositAddressId", w."lightningPaymentId", a.address, a.network::text AS network,
+        w."depositAddressId", w."lightningPaymentId",
+        CASE WHEN w."lightningPaymentId" IS NOT NULL THEN w."lastPayload"->'data'->>'amount' END AS "payoutAmount",
+        a.address, a.network::text AS network,
         a."expectedAmount"
     FROM webhook_deliveries w
     LEFT JOIN deposits d ON d.id = w."depositId"

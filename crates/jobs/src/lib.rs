@@ -320,10 +320,12 @@ pub async fn lightning_payment_history(
     }))
 }
 
-/// Lightning is not configured (no key, or the SDK did not connect).
+/// Why a Lightning wallet operation could not be served.
 #[derive(Debug)]
 pub enum LightningError {
+    /// Lightning is not configured (no key, or the SDK did not connect).
     Disabled,
+    /// The SDK (or the DB) failed; the detail is for the logs only.
     Failed(anyhow::Error),
 }
 
@@ -447,6 +449,11 @@ async fn catch_up_payouts(state: &AppState, lightning: &LightningClient) -> Resu
     let mut redis = state.redis.clone();
     let watermark: Option<u64> = redis.get(&key).await?;
     let now = u64::try_from(chrono::Utc::now().timestamp()).unwrap_or(0);
+    if watermark.is_none() {
+        warn!(
+            "No payout watermark — first boot or lost Redis data: payout webhooks start from now"
+        );
+    }
     if let Some(from) = payout_catch_up_from(watermark) {
         let mut queued = 0;
         for payment in lightning.list_sends_since(from).await? {
@@ -818,7 +825,10 @@ pub async fn deliver_webhook(
         }
         WebhookEventType::PayoutSucceeded | WebhookEventType::PayoutFailed => {
             let Some(lightning) = &state.lightning else {
-                anyhow::bail!("Lightning is not configured — payout {subject_id} not delivered");
+                // Dropped rather than retried forever: once Lightning is back,
+                // the boot catch-up re-queues it (no delivery row exists yet).
+                warn!("Payout webhook {subject_id} dropped — Lightning is not configured");
+                return Ok(DeliveryOutcome::Skipped);
             };
             let Some(payment) = lightning.get_payment(subject_id).await? else {
                 warn!("Payout webhook skipped — wallet has no payment {subject_id}");
@@ -1004,11 +1014,18 @@ async fn lightning_event_loop(state: AppState, lightning: LightningClient) {
     info!("Lightning payment listener registered ({listener_id})");
 
     // Subscribed first, so nothing finishing during the catch-up is missed.
-    if let Err(err) = catch_up_payouts(&state, &lightning).await {
-        warn!("Payout webhook catch-up failed: {err:#}");
-    }
+    let caught_up = match catch_up_payouts(&state, &lightning).await {
+        Ok(()) => true,
+        Err(err) => {
+            warn!("Payout webhook catch-up failed, retrying on the next watermark tick: {err:#}");
+            false
+        }
+    };
     let watermark_state = state.clone();
-    tokio::spawn(async move { payout_watermark_loop(watermark_state).await });
+    let watermark_client = lightning.clone();
+    tokio::spawn(async move {
+        payout_watermark_loop(watermark_state, watermark_client, caught_up).await
+    });
 
     while let Some(event) = rx.recv().await {
         match event {
@@ -1030,14 +1047,23 @@ async fn lightning_event_loop(state: AppState, lightning: LightningClient) {
 }
 
 /// Keep the payout watermark close to now while running, so a restart only
-/// re-lists the downtime (plus the margin).
-async fn payout_watermark_loop(state: AppState) {
+/// re-lists the downtime (plus the margin). Until the boot catch-up has
+/// succeeded the watermark is left alone and the catch-up retried — moving
+/// it first would lose the downtime for good.
+async fn payout_watermark_loop(state: AppState, lightning: LightningClient, mut caught_up: bool) {
     let key = state.config.redis_key(PAYOUT_WATERMARK_KEY);
     let mut interval =
         tokio::time::interval(Duration::from_secs(LIGHTNING_PAYOUT_WATERMARK_INTERVAL_SECS));
     interval.tick().await;
     loop {
         interval.tick().await;
+        if !caught_up {
+            match catch_up_payouts(&state, &lightning).await {
+                Ok(()) => caught_up = true,
+                Err(err) => warn!("Payout webhook catch-up retry failed: {err:#}"),
+            }
+            continue;
+        }
         let now = chrono::Utc::now().timestamp().max(0);
         let mut redis = state.redis.clone();
         if let Err(err) = redis.set::<_, _, ()>(&key, now).await {

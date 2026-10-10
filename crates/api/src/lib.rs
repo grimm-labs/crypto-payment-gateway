@@ -590,9 +590,15 @@ fn validate_payout_request(
     })
 }
 
-/// `user@domain` (LUD-16): one `@`, a local part of letters, digits and
-/// `-_.+`, a dotted DNS name. Everything else the SDK could parse (LNURL,
-/// invoices, on-chain addresses) is refused before reaching it.
+/// Domain suffixes that only resolve inside a private network.
+const LOCAL_TLDS: [&str; 6] = ["local", "localhost", "internal", "lan", "home", "localdomain"];
+
+/// `user@domain` (LUD-16): one `@`, a user part of letters, digits and
+/// `-_.` (what the SDK accepts), and a public DNS name — the SDK fetches
+/// `https://domain/.well-known/lnurlp/user`, so IP literals and local names
+/// are refused to keep the gateway from probing its own network. Everything
+/// else the SDK could parse (LNURL, invoices, on-chain addresses) is refused
+/// before reaching it.
 fn is_lightning_address(value: &str) -> bool {
     if value.len() > LN_ADDRESS_MAX_LEN {
         return false;
@@ -603,12 +609,21 @@ fn is_lightning_address(value: &str) -> bool {
     let user_ok = !user.is_empty()
         && user
             .chars()
-            .all(|c| c.is_ascii_alphanumeric() || "-_.+".contains(c));
-    let domain_ok = domain.contains('.')
-        && !domain.starts_with(['.', '-'])
-        && !domain.ends_with(['.', '-'])
-        && domain.chars().all(|c| c.is_ascii_alphanumeric() || "-.".contains(c));
-    user_ok && domain_ok
+            .all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c));
+    let labels: Vec<&str> = domain.split('.').collect();
+    let labels_ok = labels.len() >= 2
+        && labels.iter().all(|label| {
+            !label.is_empty()
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+        });
+    // A public TLD is alphabetic — this also rules out IPv4 literals.
+    let tld = labels.last().copied().unwrap_or_default().to_ascii_lowercase();
+    let tld_ok = tld.len() >= 2
+        && tld.chars().all(|c| c.is_ascii_alphabetic())
+        && !LOCAL_TLDS.contains(&tld.as_str());
+    user_ok && labels_ok && tld_ok
 }
 
 /// Payouts: a merchant key granted `can_send`, or ADMIN staff.
@@ -1120,6 +1135,16 @@ mod tests {
             "a b@example.com",
             "lnurl1dp68gurn8ghj7um9wfmxjcm99e3k7mf0v9cxj0m385ekvcenxc6r2c35xvukxefcv5mkvv34x5ekzd3ev56nyd3hxqurzepexejxxepnxscrvwfnv9nxzcn9xq6xyefhvgcxxcmyxymnserxfq5fns",
             "lnbc1500n1pjexample",
+            // The SDK only accepts [a-z0-9-_.] in the user part.
+            "alice+tips@example.com",
+            // No IP literals or local names: the SDK would fetch them
+            // (blind SSRF from the gateway host).
+            "alice@127.0.0.1",
+            "alice@10.0.0.5",
+            "alice@169.254.169.254",
+            "alice@printer.local",
+            "alice@db.internal",
+            "alice@example.localhost",
         ] {
             let err = validate_payout_request(
                 &payout(json!({ "ln_address": address, "amount_sats": "1000" })),

@@ -43,7 +43,7 @@ import type { LightningPayment } from "@/lib/types"
 const PAGE_SIZE = 25
 
 /** Mirrors the API check: `user@domain` with a dotted domain. */
-const LN_ADDRESS = /^[A-Za-z0-9._+-]+@[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)+$/
+const LN_ADDRESS = /^[A-Za-z0-9._-]+@([A-Za-z0-9-]+\.)+[A-Za-z]{2,}$/
 
 function PayoutDialog() {
   const [open, setOpen] = useState(false)
@@ -64,6 +64,15 @@ function PayoutDialog() {
     setSats("")
     setComment("")
     setIdempotencyKey(crypto.randomUUID())
+  }
+
+  // Editing the form makes it a different payment: a new key, so a retry
+  // after an error never gets the earlier attempt back instead.
+  function edit(setter: (value: string) => void) {
+    return (event: React.ChangeEvent<HTMLInputElement>) => {
+      setter(event.target.value)
+      setIdempotencyKey(crypto.randomUUID())
+    }
   }
 
   async function submit() {
@@ -111,7 +120,7 @@ function PayoutDialog() {
               id="ln-address"
               placeholder="alice@example.com"
               value={address}
-              onChange={(event) => setAddress(event.target.value)}
+              onChange={edit(setAddress)}
             />
             {address && !addressValid && (
               <p className="text-xs text-destructive">Expected user@domain</p>
@@ -124,7 +133,7 @@ function PayoutDialog() {
               placeholder="10000"
               inputMode="numeric"
               value={sats}
-              onChange={(event) => setSats(event.target.value)}
+              onChange={edit(setSats)}
             />
             {btcHint && <p className="text-xs text-muted-foreground">≈ {btcHint} BTC</p>}
             {sats && !satsValid && (
@@ -137,7 +146,7 @@ function PayoutDialog() {
               id="ln-comment"
               placeholder="Withdrawal"
               value={comment}
-              onChange={(event) => setComment(event.target.value)}
+              onChange={edit(setComment)}
             />
           </div>
           <div className="flex items-start gap-2 rounded-lg border border-amber-300 bg-amber-50 p-3 text-xs dark:border-amber-800 dark:bg-amber-950/40">

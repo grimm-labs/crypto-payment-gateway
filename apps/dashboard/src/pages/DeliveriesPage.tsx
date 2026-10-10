@@ -215,7 +215,7 @@ export function DeliveriesPage() {
                     </TableCell>
                     <TableCell>
                       <Badge variant="secondary" className="capitalize">
-                        {webhook.event.replace("_", " ")}
+                        {webhook.event.replace(/_/g, " ")}
                       </Badge>
                     </TableCell>
                     <TableCell>

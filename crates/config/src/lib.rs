@@ -51,9 +51,11 @@ const _: () = assert!(
 
 /// Payout webhooks catch-up: at boot, wallet sends that finished while the
 /// gateway was down are listed from the persisted watermark minus this margin
-/// (deliveries are deduplicated, so the overlap is harmless). The watermark
-/// is refreshed on this interval while the gateway runs.
-pub const LIGHTNING_PAYOUT_CATCH_UP_MARGIN_SECS: u64 = 60 * 60;
+/// (deliveries are deduplicated, so the overlap is harmless). The SDK lists
+/// by *creation* time, so the margin also covers sends that stayed pending
+/// for a long while. The watermark is refreshed on this interval while the
+/// gateway runs.
+pub const LIGHTNING_PAYOUT_CATCH_UP_MARGIN_SECS: u64 = 24 * 60 * 60;
 pub const LIGHTNING_PAYOUT_WATERMARK_INTERVAL_SECS: u64 = 5 * 60;
 
 pub const USDT_ETH: &str = "0xdAC17F958D2ee523a2206206994597C13D831ec7";

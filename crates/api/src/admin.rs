@@ -1260,14 +1260,10 @@ async fn list_webhooks(
                     (None, None) => "unknown",
                 },
                 // Deposit amount for paid events, expected amount for address
-                // events, the sent amount (from the last payload) for payouts.
+                // events, the sent amount for payouts.
                 "amount": w.amount.or(w.expected_amount)
                     .map(|a| a.normalize().to_string())
-                    .or_else(|| {
-                        w.last_payload.as_ref()
-                            .and_then(|p| p["data"]["amount"].as_str())
-                            .map(str::to_owned)
-                    }),
+                    .or_else(|| w.payout_amount.clone()),
                 "deposit_status": w.deposit_status.as_deref().map(|s| {
                     domain::DepositStatus::from_db(s).map(|s| s.as_api()).unwrap_or("detected")
                 }),

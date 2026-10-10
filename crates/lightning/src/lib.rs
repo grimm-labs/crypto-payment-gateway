@@ -396,6 +396,15 @@ impl LightningClient {
         comment: Option<String>,
         idempotency_key: Option<String>,
     ) -> Result<WalletPayment> {
+        // The SDK stores a keyed send under the key itself. Answer a replay
+        // from storage before resolving the address again: the recipient may
+        // be unreachable by now, and a failure here would invite the caller
+        // to retry with a fresh key — paying twice.
+        if let Some(key) = &idempotency_key {
+            if let Some(existing) = self.get_payment(key).await? {
+                return Ok(existing);
+            }
+        }
         let pay_request = match self
             .ops
             .parse(address)
@@ -1018,9 +1027,17 @@ mod tests {
         })
     }
 
+    fn unknown_payment() -> SdkError {
+        SdkError::StorageError("Underlying implementation error: Query returned no rows".into())
+    }
+
     #[tokio::test]
     async fn pays_a_lightning_address_with_fees_on_top() {
         let mut ops = MockLightningOps::new();
+        ops.expect_get_payment()
+            .withf(|request| request.payment_id == "6f1c7a8e-2f43-4d55-9a8b-1c2d3e4f5a6b")
+            .times(1)
+            .returning(|_| Err(unknown_payment()));
         ops.expect_parse()
             .withf(|input| input == "alice@example.com")
             .times(1)
@@ -1067,6 +1084,38 @@ mod tests {
         assert_eq!(sent.id, "sent-1");
         assert_eq!(sent.direction, PaymentDirection::Send);
         assert_eq!(sent.status, WalletPaymentStatus::Pending);
+    }
+
+    #[tokio::test]
+    async fn a_replayed_idempotency_key_returns_the_original_send_without_contacting_anyone() {
+        let mut ops = MockLightningOps::new();
+        // The SDK stores a keyed send under the key itself.
+        ops.expect_get_payment()
+            .withf(|request| request.payment_id == "6f1c7a8e-2f43-4d55-9a8b-1c2d3e4f5a6b")
+            .times(1)
+            .returning(|_| {
+                Ok(GetPaymentResponse {
+                    payment: payment(
+                        "6f1c7a8e-2f43-4d55-9a8b-1c2d3e4f5a6b",
+                        PaymentType::Send,
+                        Some(lightning_details("lnbc1original")),
+                    ),
+                })
+            });
+        // No parse / prepare / pay expectations: a replay must not resolve
+        // the address again (it may be down) nor send anything.
+        let client = LightningClient::new(Arc::new(ops));
+        let replayed = client
+            .pay_lightning_address(
+                "alice@example.com",
+                150_000,
+                None,
+                Some("6f1c7a8e-2f43-4d55-9a8b-1c2d3e4f5a6b".into()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(replayed.id, "6f1c7a8e-2f43-4d55-9a8b-1c2d3e4f5a6b");
+        assert_eq!(replayed.status, WalletPaymentStatus::Completed);
     }
 
     #[tokio::test]
