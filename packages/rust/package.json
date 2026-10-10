@@ -1,5 +1,5 @@
 {
-  "name": "@spg/rust",
+  "name": "@cpg/rust",
   "version": "0.0.0",
   "private": true,
   "description": "Rust library crates of the Cargo workspace (built and tested through the api app).",

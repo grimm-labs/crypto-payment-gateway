@@ -1,6 +1,6 @@
-# Stablecoin Payment Service
+# Crypto Payment Gateway
 
-[![CI](https://github.com/nejos97/stablecoin-payment-gateway/actions/workflows/ci.yml/badge.svg)](https://github.com/nejos97/stablecoin-payment-gateway/actions/workflows/ci.yml)
+[![CI](https://github.com/nejos97/crypto-payment-gateway/actions/workflows/ci.yml/badge.svg)](https://github.com/nejos97/crypto-payment-gateway/actions/workflows/ci.yml)
 
 Rust service for accepting USDT deposits on **Tron**, **Ethereum**, and **Solana**, and
 bitcoin payments **on-chain** and over **Lightning**.
@@ -348,7 +348,7 @@ kamal-proxy, with Let's Encrypt TLS:
 
 | Role | Host | Container | Health check |
 |---|---|---|---|
-| `api` | `API_HOST` | `/app/gateway`, port 3000, Breez volume `stablecoin-gateway-breez` | `/readyz` |
+| `api` | `API_HOST` | `/app/gateway`, port 3000, Breez volume `crypto-payment-gateway-breez` | `/readyz` |
 | `dashboard` | `DASHBOARD_HOST` | nginx (`/app/dashboard/start.sh`), port 8080, `/api` → `https://API_HOST` | `/up` |
 
 PostgreSQL and Redis are **external** services (`DATABASE_URL`, `REDIS_URL`). Migrations run
@@ -387,7 +387,7 @@ Treat production deployments accordingly:
 
 Scope today: inbound USDT / BTC / Lightning deposit detection and webhooks. This is not a multi-tenant or non-custodial vault. See the [custody note](#custody-note) for Lightning funds.
 
-To report a vulnerability, use [GitHub Security Advisories](https://github.com/nejos97/stablecoin-payment-gateway/security/advisories/new) rather than a public issue when possible.
+To report a vulnerability, use [GitHub Security Advisories](https://github.com/nejos97/crypto-payment-gateway/security/advisories/new) rather than a public issue when possible.
 
 ## Environment variables
 

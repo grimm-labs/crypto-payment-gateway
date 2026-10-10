@@ -167,7 +167,7 @@ function TrafficRetentionCard() {
   )
 }
 
-const DEFAULT_TOTP_ISSUER = "Stablecoin Payment Gateway"
+const DEFAULT_TOTP_ISSUER = "Crypto Payment Gateway"
 
 function TotpIssuerCard() {
   const settings = useSettings()

@@ -13,8 +13,8 @@
 # PostgreSQL and Redis are external services: DATABASE_URL and REDIS_URL point at
 # them. No Kamal accessory runs on the servers.
 
-service: stablecoin-gateway
-image: <%= ENV.fetch("KAMAL_IMAGE", "nejos97/stablecoin-payment-gateway") %>
+service: crypto-payment-gateway
+image: <%= ENV.fetch("KAMAL_IMAGE", "nejos97/crypto-payment-gateway") %>
 
 # Kamal expects a `web` role unless told otherwise.
 primary_role: api
@@ -54,7 +54,7 @@ servers:
     # (accepted: SQLite locks it, detection and webhooks are idempotent).
     # Role-level docker option: the dashboard role never mounts it.
     options:
-      volume: stablecoin-gateway-breez:/app/.breez-data
+      volume: crypto-payment-gateway-breez:/app/.breez-data
     env:
       clear:
         PORT: 3000

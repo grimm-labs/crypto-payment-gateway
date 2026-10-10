@@ -5,7 +5,11 @@ use anyhow::{Context, Result};
 use ipnet::IpNet;
 use serde::Deserialize;
 
-pub const APP_NAME: &str = "stablecoin-payment-service";
+/// Namespace of every Redis key (`{REDIS_NAMESPACE}-{APP_ENV}:{suffix}`).
+/// Historical value from the project's former name (stablecoin payment
+/// gateway) — never change it: the webhook queue, staff sessions, the payout
+/// watermark and the balance cache all live under this prefix.
+pub const REDIS_NAMESPACE: &str = "stablecoin-payment-service";
 pub const WEBHOOK_MAX_ATTEMPTS: u32 = 5;
 /// Gaps between webhook attempts, indexed by `attempts - 1` after a failed
 /// attempt. Geometric ratio 3; the gaps sum to 3600s so the 5th and final
@@ -25,7 +29,7 @@ pub const API_KEY_EXPIRY_ALLOWED_DAYS: [i64; 4] = [30, 90, 180, 365];
 pub const API_KEY_EXPIRY_SWEEP_INTERVAL_SECS: u64 = 300;
 /// Default issuer shown by authenticator apps for staff TOTP enrollments;
 /// admins can override it from the dashboard Settings (`app_settings`).
-pub const TOTP_ISSUER: &str = "Stablecoin Payment Gateway";
+pub const TOTP_ISSUER: &str = "Crypto Payment Gateway";
 
 // API traffic log (`api_requests`). Requests are recorded through a bounded
 // in-memory queue and batch-inserted by a background writer so the request
@@ -117,7 +121,7 @@ impl AppConfig {
         Ok(Self {
             port: vars.parse_or("PORT", 3000),
             log_level: vars.raw_or("LOG_LEVEL", "info"),
-            redis_prefix: format!("{APP_NAME}-{app_env}"),
+            redis_prefix: format!("{REDIS_NAMESPACE}-{app_env}"),
             app_env,
             wallet_mnemonic,
             database_url,
@@ -351,6 +355,23 @@ mod tests {
     fn invalid_trusted_proxy_fails_startup() {
         let err = config_with(&[("TRUSTED_PROXIES", "10.0.0.0/8,not-a-cidr")]).unwrap_err();
         assert!(format!("{err:#}").contains("not-a-cidr"));
+    }
+
+    #[test]
+    fn redis_namespace_survives_the_project_rename() {
+        // Frozen on purpose: the webhook queue, staff sessions, the payout
+        // watermark and the balance cache all live under this prefix.
+        let config = config_with(&[("APP_ENV", "development")]).unwrap();
+        assert_eq!(
+            config.redis_key("zset:webhook-delivery"),
+            "stablecoin-payment-service-development:zset:webhook-delivery"
+        );
+        assert_eq!(REDIS_NAMESPACE, "stablecoin-payment-service");
+    }
+
+    #[test]
+    fn totp_issuer_carries_the_product_name() {
+        assert_eq!(TOTP_ISSUER, "Crypto Payment Gateway");
     }
 
     #[test]

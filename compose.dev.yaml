@@ -3,29 +3,29 @@
 #   pnpm dev                                       (api + dashboard run on your machine with Nx)
 #
 # Same project name and volumes as compose.yaml: both files share one local database.
-name: stablecoin-payment-gateway
+name: crypto-payment-gateway
 
 services:
   postgres:
     image: postgres:16-alpine
-    container_name: stablecoin-payment-postgres
+    container_name: crypto-payment-postgres
     environment:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
-      POSTGRES_DB: stablecoin_payment
+      POSTGRES_DB: crypto_payment
     ports:
       - '5432:5432'
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
-      test: ['CMD-SHELL', 'pg_isready -U postgres -d stablecoin_payment']
+      test: ['CMD-SHELL', 'pg_isready -U postgres -d crypto_payment']
       interval: 5s
       timeout: 5s
       retries: 5
 
   redis:
     image: redis:7-alpine
-    container_name: stablecoin-payment-redis
+    container_name: crypto-payment-redis
     command: redis-server --appendonly yes
     ports:
       - '6379:6379'

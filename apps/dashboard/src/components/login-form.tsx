@@ -167,7 +167,7 @@ export function LoginForm({
               <Coins className="size-7" />
             </div>
             <div className="text-center leading-tight">
-              <p className="text-lg font-semibold">Stablecoin Payment Gateway</p>
+              <p className="text-lg font-semibold">Crypto Payment Gateway</p>
               <p className="mt-1 text-sm text-primary-foreground/70">
                 USDT on Tron, Ethereum &amp; Solana · Bitcoin &amp; Lightning
               </p>

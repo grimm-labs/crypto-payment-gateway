@@ -3,29 +3,29 @@
 #
 # For development with hot reload, run only the infrastructure (compose.dev.yaml)
 # and start the apps with Nx on your machine (pnpm dev).
-name: stablecoin-payment-gateway
+name: crypto-payment-gateway
 
 services:
   postgres:
     image: postgres:16-alpine
-    container_name: stablecoin-payment-postgres
+    container_name: crypto-payment-postgres
     environment:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
-      POSTGRES_DB: stablecoin_payment
+      POSTGRES_DB: crypto_payment
     ports:
       - '5432:5432'
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
-      test: ['CMD-SHELL', 'pg_isready -U postgres -d stablecoin_payment']
+      test: ['CMD-SHELL', 'pg_isready -U postgres -d crypto_payment']
       interval: 5s
       timeout: 5s
       retries: 5
 
   redis:
     image: redis:7-alpine
-    container_name: stablecoin-payment-redis
+    container_name: crypto-payment-redis
     command: redis-server --appendonly yes
     ports:
       - '6379:6379'
@@ -42,8 +42,8 @@ services:
       context: .
       dockerfile: docker/Dockerfile
       target: api
-    image: spg/api:local
-    container_name: stablecoin-payment-api
+    image: cpg/api:local
+    container_name: crypto-payment-api
     restart: unless-stopped
     # Secrets and provider keys (WALLET_MNEMONIC, JWT_SECRET, …) come from .env.
     env_file:
@@ -52,7 +52,7 @@ services:
     environment:
       APP_ENV: development
       PORT: 3000
-      DATABASE_URL: postgresql://postgres:postgres@postgres:5432/stablecoin_payment
+      DATABASE_URL: postgresql://postgres:postgres@postgres:5432/crypto_payment
       REDIS_URL: redis://redis:6379
       BREEZ_STORAGE_DIR: /app/.breez-data
     ports:
@@ -71,8 +71,8 @@ services:
       context: .
       dockerfile: docker/Dockerfile
       target: dashboard
-    image: spg/dashboard:local
-    container_name: stablecoin-payment-dashboard
+    image: cpg/dashboard:local
+    container_name: crypto-payment-dashboard
     restart: unless-stopped
     environment:
       # nginx proxies /api here (rendered at container start by docker/dashboard/start.sh).

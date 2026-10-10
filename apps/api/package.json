@@ -1,5 +1,5 @@
 {
-  "name": "@spg/api",
+  "name": "@cpg/api",
   "version": "0.0.0",
   "private": true,
   "description": "Rust gateway binary (Cargo package `gateway`); the shared crates live in packages/rust.",
