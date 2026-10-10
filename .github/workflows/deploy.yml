@@ -1,0 +1,74 @@
+name: Deploy
+# Title of each run in the Actions list; the job below carries the same name.
+run-name: Deployment - ${{ fromJSON('{"test":"Test","staging":"Staging","production":"Production"}')[inputs.environment] }}
+
+# Manual, environment-scoped deployments with Kamal (config/deploy.yml, one file for
+# every environment: everything that differs comes from the GitHub environment
+# selected below).
+# Variables (`vars.*`), required per environment: GATEWAY_HOST (the server, SSH
+# target), API_HOST, DASHBOARD_HOST. Optional: APP_ENV (defaults to the environment
+# name), BITCOIN_ESPLORA_BASE_URL (empty disables Bitcoin), TRUSTED_PROXIES.
+# Secrets (`secrets.*`, every one listed in .kamal/secrets), per environment:
+# SSH_PRIVATE_KEY, WALLET_MNEMONIC, DATABASE_URL, REDIS_URL, JWT_SECRET; optional
+# provider keys (empty disables the network): TRONGRID_API_KEY, ALCHEMY_API_KEY,
+# HELIUS_API_KEY, BREEZ_API_KEY. The image is pushed to ghcr.io with GITHUB_TOKEN.
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: GitHub environment to deploy
+        required: true
+        type: choice
+        # A new environment goes here AND in the JSON table of `run-name` and `jobs.deploy.name`.
+        options: [test, staging, production]
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: deploy-${{ inputs.environment }}
+
+jobs:
+  deploy:
+    name: Deployment - ${{ fromJSON('{"test":"Test","staging":"Staging","production":"Production"}')[inputs.environment] }}
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.3'
+      - run: gem install kamal -v '~> 2.11'
+
+      - uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.SSH_PRIVATE_KEY }}
+
+      - uses: docker/setup-buildx-action@v3
+
+      # Servers are already provisioned (Docker and kamal-proxy installed): always `kamal deploy`
+      # (`kamal setup` once by hand for a brand-new server).
+      - name: kamal deploy
+        run: kamal deploy
+        env:
+          # Kamal prefixes the image with registry.server (ghcr.io) itself.
+          KAMAL_IMAGE: ${{ github.repository }}
+          KAMAL_REGISTRY_USERNAME: ${{ github.actor }}
+          KAMAL_REGISTRY_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
+          GATEWAY_HOST: ${{ vars.GATEWAY_HOST }}
+          API_HOST: ${{ vars.API_HOST }}
+          DASHBOARD_HOST: ${{ vars.DASHBOARD_HOST }}
+          APP_ENV: ${{ vars.APP_ENV || inputs.environment }}
+          BITCOIN_ESPLORA_BASE_URL: ${{ vars.BITCOIN_ESPLORA_BASE_URL || '' }}
+          TRUSTED_PROXIES: ${{ vars.TRUSTED_PROXIES || '' }}
+          WALLET_MNEMONIC: ${{ secrets.WALLET_MNEMONIC }}
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          REDIS_URL: ${{ secrets.REDIS_URL }}
+          JWT_SECRET: ${{ secrets.JWT_SECRET }}
+          TRONGRID_API_KEY: ${{ secrets.TRONGRID_API_KEY || '' }}
+          ALCHEMY_API_KEY: ${{ secrets.ALCHEMY_API_KEY || '' }}
+          HELIUS_API_KEY: ${{ secrets.HELIUS_API_KEY || '' }}
+          BREEZ_API_KEY: ${{ secrets.BREEZ_API_KEY || '' }}

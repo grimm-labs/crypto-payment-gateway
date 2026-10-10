@@ -194,8 +194,8 @@ fn load_dotenv() {
         return;
     }
 
-    // crates/config → workspace root/.env (works even if cwd is elsewhere)
-    let workspace_env = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../.env");
+    // packages/rust/config → workspace root/.env (works even if cwd is elsewhere)
+    let workspace_env = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../.env");
     if dotenvy::from_path(&workspace_env).is_ok() {
         return;
     }

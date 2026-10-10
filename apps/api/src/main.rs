@@ -2,7 +2,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use anyhow::Context;
-use api::router;
+use http_api::router;
 use chain::ChainClients;
 use config::{AppConfig, API_TRAFFIC_QUEUE_CAPACITY};
 use db::Db;

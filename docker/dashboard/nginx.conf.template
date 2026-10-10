@@ -1,12 +1,20 @@
+# Dashboard server block, rendered at container start by docker/dashboard/start.sh
+# (envsubst on ${PORT} and ${API_URL} only — nginx's own $variables are kept).
 server {
-    listen 80;
+    listen ${PORT};
     server_name _;
 
-    root /usr/share/nginx/html;
+    root /app/dashboard/html;
     index index.html;
 
+    # Kamal / compose health check: answered by nginx itself, never by the API.
+    location = /up {
+        access_log off;
+        default_type text/plain;
+        return 200 "ok\n";
+    }
+
     # Same-origin proxy to the backend — the SPA never needs CORS.
-    # ${API_URL} is substituted by the nginx image's envsubst at startup.
     location /api/ {
         proxy_pass ${API_URL};
         proxy_http_version 1.1;

@@ -23,8 +23,10 @@ Thumbs.db
 *.log
 /coverage/
 
-# Dashboard (Node)
-apps/dashboard/node_modules/
-apps/dashboard/dist/
+# Node / Nx
+node_modules/
+dist/
+.nx/cache
+.nx/workspace-data
 # Breez SDK (Lightning) local wallet storage
 .breez-data/

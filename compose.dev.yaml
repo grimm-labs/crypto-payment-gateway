@@ -1,0 +1,42 @@
+# Infrastructure only, for day-to-day development:
+#   docker compose -f compose.dev.yaml up -d      (or: pnpm infra:up)
+#   pnpm dev                                       (api + dashboard run on your machine with Nx)
+#
+# Same project name and volumes as compose.yaml: both files share one local database.
+name: stablecoin-payment-gateway
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: stablecoin-payment-postgres
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: stablecoin_payment
+    ports:
+      - '5432:5432'
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U postgres -d stablecoin_payment']
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: stablecoin-payment-redis
+    command: redis-server --appendonly yes
+    ports:
+      - '6379:6379'
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+volumes:
+  postgres_data:
+  redis_data:

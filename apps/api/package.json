@@ -1,0 +1,41 @@
+{
+  "name": "@spg/api",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Rust gateway binary (Cargo package `gateway`); the shared crates live in packages/rust.",
+  "nx": {
+    "name": "api",
+    "tags": ["lang:rust", "type:app"],
+    "implicitDependencies": ["rust"],
+    "targets": {
+      "build": {
+        "executor": "nx:run-commands",
+        "cache": false,
+        "options": {
+          "command": "cargo build --release -p gateway"
+        }
+      },
+      "test": {
+        "executor": "nx:run-commands",
+        "inputs": ["default", "rust"],
+        "options": {
+          "command": "cargo test --workspace"
+        }
+      },
+      "lint": {
+        "executor": "nx:run-commands",
+        "inputs": ["default", "rust"],
+        "options": {
+          "command": "cargo clippy --workspace --all-targets"
+        }
+      },
+      "dev": {
+        "executor": "nx:run-commands",
+        "continuous": true,
+        "options": {
+          "command": "cargo run -p gateway"
+        }
+      }
+    }
+  }
+}

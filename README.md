@@ -20,17 +20,36 @@ bitcoin payments **on-chain** and over **Lightning**.
 - Merchant API protected by **API keys** (`x-api-key`) created from the dashboard;
   admin API (`/api/admin/v1`) protected by staff **JWT** (roles: admin / operator)
 
+## Repository layout
+
+An [Nx](https://nx.dev) monorepo (pnpm workspaces) with two apps:
+
+```
+apps/
+  api/              Rust gateway binary (Cargo package `gateway`)
+  dashboard/        admin SPA (Vite + React)
+packages/
+  rust/             Rust library crates: domain, config, wallet, auth, db, chain,
+                    lightning, jobs, http-api (one Cargo workspace, root Cargo.toml)
+docker/             single multi-stage Dockerfile (targets api, dashboard, all) + nginx config
+config/deploy.yml   Kamal deployment (with .kamal/secrets)
+compose.yaml        full stack from images · compose.dev.yaml: postgres + redis only
+```
+
 ## Quick start
+
+Requirements: Rust (stable), Node 24 (`.tool-versions` / `.nvmrc`), pnpm 11.25.0, Docker.
 
 ```bash
 cp .env.example .env
 # Edit .env with your secrets and API keys
 
-docker compose up -d postgres redis
-cargo run -p gateway
+pnpm install
+pnpm infra:up              # postgres + redis (docker compose -f compose.dev.yaml up -d)
+pnpm nx run api:dev        # cargo run -p gateway
 ```
 
-On first boot the binary applies SQL migrations (`crates/db/migrations`) via sqlx.
+On first boot the binary applies SQL migrations (`packages/rust/db/migrations`) via sqlx.
 
 API: `http://localhost:3000` — `GET /healthz` (liveness), `GET /readyz` (Postgres + Redis;
 also reports the Lightning SDK as `ok`/`disabled`/`error`, informational only)
@@ -42,9 +61,8 @@ Building needs `protoc` (the Breez SDK compiles gRPC protos): `brew install prot
 ### Dashboard (dev)
 
 ```bash
-cd apps/dashboard
-npm install
-npm run dev   # http://localhost:5173, proxies /api to localhost:3000
+pnpm nx run dashboard:dev   # http://localhost:5173, proxies /api to localhost:3000
+pnpm dev                    # api + dashboard together
 ```
 
 Set `JWT_SECRET` (min 32 chars) in `.env` first — without it the admin API is disabled.
@@ -60,13 +78,15 @@ docker compose up --build
 
 Starts postgres, redis, the API on `:3000` and the dashboard on `:8080`
 (nginx serving the built SPA, proxying `/api` to the api service — no CORS needed).
+Both images come from `docker/Dockerfile` (targets `api` and `dashboard`).
 
 ## Testing
 
-Unit tests live in the `domain`, `wallet`, `config`, `chain`, `lightning-client`, `jobs`, `auth` and `api` crates (BIP39 / BIP84 / HD address golden vectors, amount tolerance and per-token decimals, enum roundtrips, Esplora parsing and confirmation math, the Breez SDK wrapper against a mocked `LightningOps`, webhook retry schedule, request validation). None needs a database or network access. CI runs the same suite:
+Unit tests live in the `domain`, `wallet`, `config`, `chain`, `lightning-client`, `jobs`, `auth` and `http-api` crates (BIP39 / BIP84 / HD address golden vectors, amount tolerance and per-token decimals, enum roundtrips, Esplora parsing and confirmation math, the Breez SDK wrapper against a mocked `LightningOps`, webhook retry schedule, request validation). None needs a database or network access. CI runs the same suite:
 
 ```bash
-cargo test -p domain -p wallet -p config -p chain -p lightning-client -p jobs -p auth -p api
+pnpm nx affected -t lint test build   # what CI runs (only the affected apps)
+pnpm nx run api:test                  # cargo test --workspace
 ```
 
 There are no integration tests for the API or chain providers yet.
@@ -318,6 +338,40 @@ No secret configured → no header. The signature covers the body only (no times
 If no active webhook endpoint is configured, a warning is logged at startup and webhooks are disabled. Each delivery is tracked per (deposit, endpoint) pair for `paid` and per (address, event, endpoint) for `pending`/`expired`; `deposits[].webhooks[]` in the deposit-address detail exposes the per-endpoint state, while `deposits[].webhook` keeps the historical single-object shape (most recent delivery).
 
 Delivery is attempted up to 5 times with increasing gaps — 90s, 4m30, 13m30, 40m30 — so the 5th and final attempt starts ~1h after the first. After that the delivery is marked `failed` and can only be resent via the retry endpoint. Receivers must treat replays as the same event (idempotent on their side).
+
+## Deployment (Kamal)
+
+Deploys use [Kamal 2](https://kamal-deploy.org): `config/deploy.yml` is one file for the
+**test**, **staging** and **production** environments, filled from environment variables.
+One image (`docker/Dockerfile`, target `all`, pushed to `ghcr.io`) runs as two roles behind
+kamal-proxy, with Let's Encrypt TLS:
+
+| Role | Host | Container | Health check |
+|---|---|---|---|
+| `api` | `API_HOST` | `/app/gateway`, port 3000, Breez volume `stablecoin-gateway-breez` | `/readyz` |
+| `dashboard` | `DASHBOARD_HOST` | nginx (`/app/dashboard/start.sh`), port 8080, `/api` → `https://API_HOST` | `/up` |
+
+PostgreSQL and Redis are **external** services (`DATABASE_URL`, `REDIS_URL`). Migrations run
+when the api container boots.
+
+**GitHub Actions → Deploy** (manual, pick the environment) runs `kamal deploy`. Per GitHub
+environment:
+
+- Variables: `GATEWAY_HOST` (server, SSH target), `API_HOST`, `DASHBOARD_HOST` (required);
+  `APP_ENV` (defaults to the environment name), `BITCOIN_ESPLORA_BASE_URL`, `TRUSTED_PROXIES`
+  (defaults to the private docker ranges kamal-proxy lives in).
+- Secrets: `SSH_PRIVATE_KEY`, `WALLET_MNEMONIC`, `DATABASE_URL`, `REDIS_URL`, `JWT_SECRET`;
+  optional provider keys `TRONGRID_API_KEY`, `ALCHEMY_API_KEY`, `HELIUS_API_KEY`,
+  `BREEZ_API_KEY` (empty disables the network).
+
+A brand-new server needs `kamal setup` once (installs Docker and kamal-proxy); from a
+workstation, export the same variables and secrets first (`.kamal/secrets` only references
+them). Useful aliases: `kamal logs`, `kamal console`.
+
+⚠️ `WALLET_MNEMONIC` — the custodial seed — ends up in the GitHub environment secrets and in
+the env file Kamal writes on the server: restrict access to both accordingly. During a
+deploy, the old and new api containers overlap for a few seconds on the Breez volume
+(processing is idempotent).
 
 ## Security considerations
 

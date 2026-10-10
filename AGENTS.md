@@ -12,7 +12,9 @@ Scope today: **inbound deposit detection + webhooks + admin dashboard**, plus on
 
 ## Architecture
 
-Cargo workspace of 10 crates under `crates/` (version, edition, and all dependency versions are set in the root `Cargo.toml` via `[workspace.package]` / `[workspace.dependencies]` — never pin versions in a member crate), plus the dashboard SPA under `apps/dashboard`:
+**Nx monorepo** (Nx 23, pnpm 11, Node 24 — `.tool-versions`) with two apps: `apps/api` (the Rust gateway binary, Cargo package `gateway`) and `apps/dashboard` (the SPA). Each Nx project is declared in the `nx` field of its `package.json`; there is no Nx plugin for Rust — the api's targets run cargo through `nx:run-commands`, and `packages/rust` is one Nx project (`rust`, an implicit dependency of `api`) so a Rust change affects `api` and a dashboard change affects only `dashboard`.
+
+The Rust side is one Cargo workspace rooted at the repo root (version, edition, and all dependency versions are set in the root `Cargo.toml` via `[workspace.package]` / `[workspace.dependencies]` — never pin versions in a member crate): the binary in `apps/api`, the library crates in `packages/rust/<crate>`:
 
 | Crate | Role |
 |---|---|
@@ -20,41 +22,40 @@ Cargo workspace of 10 crates under `crates/` (version, edition, and all dependen
 | `domain` | Pure types: `Network`, `Token`, statuses, `StaffRole`, `DomainError`, amount conversion/tolerance helpers. No I/O, no async |
 | `wallet` | HD derivation from BIP39 mnemonic. ETH/Tron via BIP44 `m/44'/60'/0'/0/{index}` (secp256k1); Bitcoin via BIP84 `m/84'/0'/0'/0/{index}` (P2WPKH `bc1q…`); Solana via SLIP-0010 `m/44'/501'/{index}'/0'` (ed25519), returning the USDT **associated token account** address. Lightning has no derived address (error) |
 | `auth` | Pure auth primitives (no I/O, no async): argon2id password hashing, HS256 JWT issue/decode, refresh-token and API-key generation + SHA-256 hashing, constant-time comparison |
-| `db` | `Db` wrapper over a `PgPool`, row structs, all SQL queries, sqlx migrations (`crates/db/migrations/`). Split into `lib.rs` (payments/webhooks) + `staff.rs`, `api_keys.rs`, `admin_queries.rs`, `settings.rs`, `webhook_endpoints.rs`, `api_traffic.rs` (request log + aggregates) |
+| `db` | `Db` wrapper over a `PgPool`, row structs, all SQL queries, sqlx migrations (`packages/rust/db/migrations/`). Split into `lib.rs` (payments/webhooks) + `staff.rs`, `api_keys.rs`, `admin_queries.rs`, `settings.rs`, `webhook_endpoints.rs`, `api_traffic.rs` (request log + aggregates) |
 | `chain` | HTTP clients for TronGrid, Alchemy (Ethereum JSON-RPC), Helius (Solana), Esplora (Bitcoin, `esplora.rs`): transfer polling + balance fetches, Tron rate-limit backoff, `confirmations_between` (saturating) |
-| `lightning` | **Package `lightning-client`** (`lightning` clashes with LDK's crate in the graph — use `-p lightning-client`). Thin Breez SDK Spark wrapper: SDK calls go through the `LightningOps` trait (mocked with mockall in tests), `LightningClient` maps requests and filters received Lightning payments. `jobs`/`api` never touch SDK types |
+| `lightning` | **Package `lightning-client`** (dir `packages/rust/lightning`) (`lightning` clashes with LDK's crate in the graph — use `-p lightning-client`). Thin Breez SDK Spark wrapper: SDK calls go through the `LightningOps` trait (mocked with mockall in tests), `LightningClient` maps requests and filters received Lightning payments. `jobs`/`http-api` never touch SDK types |
 | `jobs` | `AppState` (shared by API + workers; `lightning: Option<LightningClient>`, `None` = disabled), background workers (`spawn_workers`): one monitor loop per network (Lightning's reconciles from the Breez payment list), the Lightning event loop, webhook delivery loop, hourly wallet-balance sync, API traffic writer + retention purge (`traffic.rs`, `TrafficRecorder`); deposit confirmation logic (`process_detected_transfer`); manual retriggers (`retrigger_webhook`, `retrigger_failed_webhooks`) |
-| `api` | Axum router: `/healthz`, `/readyz`, `/api/v1/*` (guarded by `x-api-key`), `/api/admin/v1/*` (guarded by staff JWT; admin-only sub-routes for staff/API keys); `middleware.rs` (guards) + `traffic.rs` (request-log middleware) + `admin.rs` (dashboard handlers); `ApiError` (`{"statusCode": ..., "message": ...}`) |
-| `gateway` | The binary. Wires config → wallet → db (+ migrations) → redis → chain → workers → HTTP server |
+| `http-api` | Axum router (`http` was taken by the external crate): `/healthz`, `/readyz`, `/api/v1/*` (guarded by `x-api-key`), `/api/admin/v1/*` (guarded by staff JWT; admin-only sub-routes for staff/API keys); `middleware.rs` (guards) + `traffic.rs` (request-log middleware) + `admin.rs` (dashboard handlers); `ApiError` (`{"statusCode": ..., "message": ...}`) |
+| `gateway` (`apps/api`) | The binary. Wires config → wallet → db (+ migrations) → redis → chain → workers → HTTP server |
 
 Auth model: staff accounts live in `staff_users` (roles `ADMIN` / `OPERATOR`, argon2id hashes, `firstName`/`lastName`); merchant keys in `api_keys` (clear `prefix` for lookup + SHA-256 `keyHash`, revocation via `revokedAt`). Refresh tokens are stored hashed in Redis (`auth:refresh:{sha256}`, TTL `REFRESH_TOKEN_TTL_DAYS`, rotated on every refresh). The first admin is created through the dashboard's `/setup` wizard (guarded insert — only while `staff_users` is empty); there is no env-var seeding. `JWT_SECRET` (≥ 32 chars) is required or `/api/admin/v1` is not mounted.
 
-Dependency direction: `domain` ← everything; `api` and `jobs` sit on top; only `gateway` produces a binary. Put logic in the right layer — e.g. queue/DB logic belongs in `jobs`/`db`, not in API handlers.
+Dependency direction: `domain` ← everything; `http-api` and `jobs` sit on top; only `gateway` produces a binary. Put logic in the right layer — e.g. queue/DB logic belongs in `jobs`/`db`, not in API handlers.
 
 ## Commands
 
 ```bash
+pnpm install                                  # Node 24 (asdf/.nvmrc), pnpm 11.25.0
+
 # Run locally (needs .env — copy from .env.example; set JWT_SECRET for the admin API)
-docker compose up -d postgres redis
-cargo run -p gateway
+pnpm infra:up                                 # postgres + redis (compose.dev.yaml)
+pnpm nx run api:dev                           # cargo run -p gateway
+pnpm nx run dashboard:dev                     # vite, proxies /api to localhost:3000
+pnpm dev                                      # both
 
-# Dashboard dev server (proxies /api to localhost:3000)
-cd apps/dashboard && npm install && npm run dev
-
-# Tests — this is exactly what CI runs; keep it green (building needs `protoc` for the Breez SDK)
-cargo test -p domain -p wallet -p config -p chain -p lightning-client -p jobs -p auth -p api
-
-# Type-check + build the dashboard
-cd apps/dashboard && npm run build
-
-# Release build (also done in CI)
-cargo build --release -p gateway
+# What CI runs — keep it green (building needs `protoc` + `libprotobuf-dev` for the Breez SDK)
+pnpm nx affected -t lint test build
+pnpm nx run api:test                          # cargo test --workspace (no DB, no network)
+pnpm nx run api:lint                          # cargo clippy --workspace --all-targets
+pnpm nx run api:build                         # cargo build --release -p gateway
+pnpm nx run-many -t build lint --projects=dashboard
 
 # Full stack in Docker: postgres + redis + api (:3000) + dashboard (:8080)
-docker compose up --build
+docker compose up --build                     # compose.yaml, docker/Dockerfile targets api / dashboard
 ```
 
-Migrations run automatically at boot via `sqlx::migrate!` (failure is logged as a warning, not fatal). There are **no DB integration tests** — unit tests live in `domain`, `wallet` (BIP39/BIP84/HD golden vectors), `config` (via `AppConfig::from_lookup`, never the process env), `chain` (Esplora parsing, confirmation math), `lightning-client` (mocked `LightningOps`), `auth`, `jobs` (traffic queue, Lightning matching, token totals) and `api` (request validation, traffic middleware via `tower::ServiceExt::oneshot`). If you change derivation logic, the golden-vector tests in `crates/wallet/src/lib.rs` must still pass byte-for-byte.
+Migrations run automatically at boot via `sqlx::migrate!` (failure is logged as a warning, not fatal). There are **no DB integration tests** — unit tests live in `domain`, `wallet` (BIP39/BIP84/HD golden vectors), `config` (via `AppConfig::from_lookup`, never the process env), `chain` (Esplora parsing, confirmation math), `lightning-client` (mocked `LightningOps`), `auth`, `jobs` (traffic queue, Lightning matching, token totals) and `http-api` (request validation, traffic middleware via `tower::ServiceExt::oneshot`). If you change derivation logic, the golden-vector tests in `packages/rust/wallet/src/lib.rs` must still pass byte-for-byte.
 
 ## Conventions
 
@@ -63,7 +64,7 @@ Migrations run automatically at boot via `sqlx::migrate!` (failure is logged as 
 - **Amounts**: `amount_raw` is the integer string in token base units (`Token::decimals()`: USDT 6, BTC 8 = sats); `amount` is a `Decimal` in `DECIMAL(24,8)` columns. Convert with `domain::raw_to_decimal*(raw, token)` / `decimal_to_raw` — never through floats — passing the token of the row. Deposit amounts in webhook payloads and the deposit-address detail go through `format_amount` (token-scale rendering, keeps USDT's historical `25.000000` now that columns are `DECIMAL(24,8)`). Matching against `expected_amount` uses `is_amount_within_tolerance` (`AMOUNT_TOLERANCE_PERCENT`, default 1%). Totals are per token: sats never enter `total_usdt` / `confirmed_volume` (USDT-only), BTC goes to `total_btc`.
 - **Network ↔ token**: each network receives one token (`Network::token()`, `domain::supports`). BTC networks take `expected_amount_sats` (integer string) and reject `expected_amount`; USDT networks the reverse.
 - **Redis keys** are always built via `config.redis_key(suffix)` → `stablecoin-payment-service-{APP_ENV}:{suffix}`. Never hardcode a full key.
-- **Config**: all tuning goes through env vars read in `crates/config/src/lib.rs` (with defaults) and documented in the README table. Missing provider API keys must *disable* the corresponding network with a startup warning, not crash — likewise an unset `BITCOIN_ESPLORA_BASE_URL` disables Bitcoin and an unset `BREEZ_API_KEY` (or a failed SDK connect) disables Lightning.
+- **Config**: all tuning goes through env vars read in `packages/rust/config/src/lib.rs` (with defaults) and documented in the README table. Missing provider API keys must *disable* the corresponding network with a startup warning, not crash — likewise an unset `BITCOIN_ESPLORA_BASE_URL` disables Bitcoin and an unset `BREEZ_API_KEY` (or a failed SDK connect) disables Lightning.
 - Errors: `anyhow` at boundaries, `thiserror` enums inside `domain`/`wallet`. API errors go through `ApiError` so the JSON shape stays `{"statusCode", "message"}`.
 - Logging via `tracing`. **Never log the mnemonic or provider API keys.**
 
@@ -98,6 +99,8 @@ This is a **custodial hot-wallet** service — treat everything key-related as s
 
 ## Git / CI / releases
 
-- CI (`.github/workflows/ci.yml`) runs on every push/PR: the test command above, then `cargo build --release -p gateway`. The shared `setup-rust` action installs `protoc`.
+- CI (`.github/workflows/ci.yml`) runs on every push/PR: `pnpm nx affected -t lint test build` (Rust toolchain + `protoc` from the shared `setup-rust` action), then a build of the `all` Docker image on pushes.
+- Docker: one multi-stage `docker/Dockerfile` (targets `api`, `dashboard`, `all`); the dashboard's nginx config lives in `docker/dashboard/` (non-root, port 8080, `/up` health check, `/api` proxied to `API_URL`). `compose.yaml` runs the whole stack from images, `compose.dev.yaml` only postgres + redis (same project name and volumes).
+- Deploys: **Kamal** (`config/deploy.yml`, one file for test/staging/production; `.kamal/secrets` holds env-var references only). One image (target `all`) runs as two roles — `api` (proxy `API_HOST`, port 3000, health `/readyz`, Breez volume via role `options.volume`) and `dashboard` (`/app/dashboard/start.sh`, proxy `DASHBOARD_HOST`, port 8080). Postgres and Redis are external. `.github/workflows/deploy.yml` (manual, per GitHub environment) runs `kamal deploy`; hosts come only from GitHub variables (`GATEWAY_HOST`, `API_HOST`, `DASHBOARD_HOST`). A deploy overlaps the old and new api containers for a few seconds on the Breez volume (accepted: idempotent processing). Never put a secret value in `config/deploy.yml` or `.kamal/secrets`.
 - Releases are **manual** via the "New App Version" workflow (`workflow_dispatch`): it bumps the workspace version with `cargo set-version`, commits `chore: release vX.Y.Z`, tags, and publishes the Docker image. Never bump the version or create tags by hand.
 - Do not commit or push unless the user asks. Keep PRs scoped to one concern; add tests when changing `domain` or `wallet` logic.

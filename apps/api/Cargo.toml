@@ -1,31 +1,25 @@
 [package]
-name = "api"
+name = "gateway"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[[bin]]
+name = "gateway"
+path = "src/main.rs"
+
 [dependencies]
 anyhow.workspace = true
-auth = { workspace = true }
+http-api = { workspace = true }
 axum.workspace = true
-chrono.workspace = true
+chain = { workspace = true }
 config = { workspace = true }
 db = { workspace = true }
-domain = { workspace = true }
-http.workspace = true
-ipnet.workspace = true
+dotenvy.workspace = true
 jobs = { workspace = true }
 lightning-client = { workspace = true }
 redis.workspace = true
-rust_decimal.workspace = true
-serde.workspace = true
-serde_json.workspace = true
 tokio.workspace = true
-tower.workspace = true
-tower-http.workspace = true
 tracing.workspace = true
-uuid.workspace = true
+tracing-subscriber.workspace = true
 wallet = { workspace = true }
-
-[dev-dependencies]
-rust_decimal_macros.workspace = true

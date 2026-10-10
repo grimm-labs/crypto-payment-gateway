@@ -1,16 +1,16 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/config",
-    "crates/domain",
-    "crates/wallet",
-    "crates/auth",
-    "crates/db",
-    "crates/chain",
-    "crates/lightning",
-    "crates/jobs",
-    "crates/api",
-    "crates/gateway",
+    "apps/api",
+    "packages/rust/config",
+    "packages/rust/domain",
+    "packages/rust/wallet",
+    "packages/rust/auth",
+    "packages/rust/db",
+    "packages/rust/chain",
+    "packages/rust/lightning",
+    "packages/rust/jobs",
+    "packages/rust/http-api",
 ]
 
 [workspace.package]
@@ -67,12 +67,12 @@ mockall = "0.13"
 # Pinned to a release tag on purpose — bump deliberately, never float it.
 breez-sdk-spark = { git = "https://github.com/breez/spark-sdk", tag = "0.26.1", features = ["sqlite"] }
 
-config = { path = "crates/config" }
-domain = { path = "crates/domain" }
-wallet = { path = "crates/wallet" }
-auth = { path = "crates/auth" }
-db = { path = "crates/db" }
-chain = { path = "crates/chain" }
-lightning-client = { path = "crates/lightning" }
-jobs = { path = "crates/jobs" }
-api = { path = "crates/api" }
+config = { path = "packages/rust/config" }
+domain = { path = "packages/rust/domain" }
+wallet = { path = "packages/rust/wallet" }
+auth = { path = "packages/rust/auth" }
+db = { path = "packages/rust/db" }
+chain = { path = "packages/rust/chain" }
+lightning-client = { path = "packages/rust/lightning" }
+jobs = { path = "packages/rust/jobs" }
+http-api = { path = "packages/rust/http-api" }

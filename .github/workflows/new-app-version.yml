@@ -1,5 +1,5 @@
-# Manually bump the workspace SemVer, commit, push a matching git tag,
-# then publish the Docker image (via reusable workflow).
+# Manually bump the workspace SemVer, commit and push a matching git tag.
+# Images are built and pushed by Kamal at deploy time (.github/workflows/deploy.yml).
 
 name: New App Version
 
@@ -65,14 +65,3 @@ jobs:
           git tag "v${VERSION}"
           git push origin HEAD
           git push origin "v${VERSION}"
-
-  docker:
-    name: Publish Docker image
-    needs: release
-    permissions:
-      contents: read
-      packages: write
-    uses: ./.github/workflows/docker-publish.yml
-    with:
-      tag: v${{ needs.release.outputs.version }}
-    secrets: inherit

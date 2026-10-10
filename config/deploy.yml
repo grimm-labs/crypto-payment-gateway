@@ -1,0 +1,104 @@
+# Kamal configuration: ONE file for every environment (test, staging, production).
+#
+# Everything that differs between environments comes from the environment
+# (ENV.fetch below): the Deploy workflow exports the selected GitHub environment's
+# variables and secrets; locally, export them yourself before any kamal command.
+# Secrets are resolved from .kamal/secrets (environment variables only).
+# Required: GATEWAY_HOST (the environment's server, SSH target), APP_ENV, API_HOST,
+# DASHBOARD_HOST. A missing one stops kamal with a KeyError naming it.
+#
+# One image (docker/Dockerfile target "all") runs as two roles: `api` (the Rust
+# gateway) and `dashboard` (nginx serving the SPA, /api proxied to the API host).
+# kamal-proxy routes each public host to its role, TLS by Let's Encrypt.
+# PostgreSQL and Redis are external services: DATABASE_URL and REDIS_URL point at
+# them. No Kamal accessory runs on the servers.
+
+service: stablecoin-gateway
+image: <%= ENV.fetch("KAMAL_IMAGE", "nejos97/stablecoin-payment-gateway") %>
+
+# Kamal expects a `web` role unless told otherwise.
+primary_role: api
+
+registry:
+  server: ghcr.io
+  username: <%= ENV.fetch("KAMAL_REGISTRY_USERNAME", "nejos97") %>
+  password:
+    - KAMAL_REGISTRY_PASSWORD
+
+builder:
+  arch: amd64
+  dockerfile: docker/Dockerfile
+  target: all
+  context: .
+
+ssh:
+  user: root
+
+servers:
+  api:
+    hosts:
+      - <%= ENV.fetch("GATEWAY_HOST") %>
+    # Migrations run at boot (sqlx), before the server listens: kamal-proxy only
+    # switches traffic once /readyz (Postgres + Redis) answers.
+    proxy:
+      host: <%= ENV.fetch("API_HOST") %>
+      app_port: 3000
+      ssl: true
+      forward_headers: true
+      healthcheck:
+        path: /readyz
+        interval: 3
+        timeout: 5
+    # Breez SDK (Lightning) wallet storage, persistent across deploys. During a
+    # deploy the old and new containers overlap for a few seconds on this volume
+    # (accepted: SQLite locks it, detection and webhooks are idempotent).
+    # Role-level docker option: the dashboard role never mounts it.
+    options:
+      volume: stablecoin-gateway-breez:/app/.breez-data
+    env:
+      clear:
+        PORT: 3000
+        BREEZ_STORAGE_DIR: /app/.breez-data
+        # The API port is only reachable from the docker network, where kamal-proxy
+        # lives: its X-Forwarded-For is trusted (traffic log client IP).
+        TRUSTED_PROXIES: '<%= ENV["TRUSTED_PROXIES"].to_s.empty? ? "172.16.0.0/12,192.168.0.0/16,10.0.0.0/8" : ENV["TRUSTED_PROXIES"] %>'
+        # Empty disables Bitcoin on-chain detection (e.g. https://mempool.space/api).
+        BITCOIN_ESPLORA_BASE_URL: '<%= ENV.fetch("BITCOIN_ESPLORA_BASE_URL", "") %>'
+      secret:
+        # The custodial HD seed: every deposit address and the Lightning wallet.
+        - WALLET_MNEMONIC
+        - DATABASE_URL
+        - REDIS_URL
+        - JWT_SECRET
+        # Empty provider keys disable the matching network (startup warning).
+        - TRONGRID_API_KEY
+        - ALCHEMY_API_KEY
+        - HELIUS_API_KEY
+        - BREEZ_API_KEY
+  dashboard:
+    hosts:
+      - <%= ENV.fetch("GATEWAY_HOST") %>
+    cmd: /app/dashboard/start.sh
+    proxy:
+      host: <%= ENV.fetch("DASHBOARD_HOST") %>
+      app_port: 8080
+      ssl: true
+      healthcheck:
+        path: /up
+        interval: 3
+        timeout: 5
+    env:
+      clear:
+        PORT: 8080
+        # nginx proxies /api (same origin for the SPA) to the public API host.
+        API_URL: https://<%= ENV.fetch("API_HOST") %>
+
+# Shared by every role. Everything else is declared on the role that reads it.
+env:
+  clear:
+    APP_ENV: <%= ENV.fetch("APP_ENV") %>
+    LOG_LEVEL: info
+
+aliases:
+  console: app exec --interactive --reuse -r api "sh"
+  logs: app logs -f
