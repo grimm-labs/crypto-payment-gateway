@@ -1,7 +1,8 @@
 FROM rust:bookworm AS builder
 # protoc: the Breez SDK (Lightning) compiles its gRPC protos at build time.
+# libprotobuf-dev ships the google/protobuf/*.proto well-known types they import.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends protobuf-compiler \
+    && apt-get install -y --no-install-recommends protobuf-compiler libprotobuf-dev \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 COPY Cargo.toml Cargo.lock ./

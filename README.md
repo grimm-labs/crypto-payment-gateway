@@ -36,7 +36,8 @@ API: `http://localhost:3000` — `GET /healthz` (liveness), `GET /readyz` (Postg
 also reports the Lightning SDK as `ok`/`disabled`/`error`, informational only)
 
 Building needs `protoc` (the Breez SDK compiles gRPC protos): `brew install protobuf` /
-`apt-get install protobuf-compiler`. The Docker image installs it.
+`apt-get install protobuf-compiler libprotobuf-dev` (the latter ships the
+`google/protobuf/*.proto` well-known types). The Docker image installs both.
 
 ### Dashboard (dev)
 

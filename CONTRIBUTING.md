@@ -5,7 +5,7 @@ Thanks for your interest in improving this project.
 ## Prerequisites
 
 - Rust stable toolchain
-- `protoc` (the Breez SDK compiles gRPC protos): `brew install protobuf` / `apt-get install protobuf-compiler`
+- `protoc` (the Breez SDK compiles gRPC protos): `brew install protobuf` / `apt-get install protobuf-compiler libprotobuf-dev`
 - Docker (for Postgres and Redis via `docker compose`)
 
 ## Setup
