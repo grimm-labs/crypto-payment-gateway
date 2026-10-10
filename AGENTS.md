@@ -55,6 +55,8 @@ pnpm nx run-many -t build lint --projects=dashboard
 docker compose up --build                     # compose.yaml, docker/Dockerfile targets api / dashboard
 ```
 
+Nx loads the root `.env` into every task (on top of the gateway's own dotenvy loading): a variable left **empty** in your shell is filled from `.env` — unset it or give it a value to override it for an `nx run`.
+
 Migrations run automatically at boot via `sqlx::migrate!` (failure is logged as a warning, not fatal). There are **no DB integration tests** — unit tests live in `domain`, `wallet` (BIP39/BIP84/HD golden vectors), `config` (via `AppConfig::from_lookup`, never the process env), `chain` (Esplora parsing, confirmation math), `lightning-client` (mocked `LightningOps`), `auth`, `jobs` (traffic queue, Lightning matching, token totals) and `http-api` (request validation, traffic middleware via `tower::ServiceExt::oneshot`). If you change derivation logic, the golden-vector tests in `packages/rust/wallet/src/lib.rs` must still pass byte-for-byte.
 
 ## Conventions
