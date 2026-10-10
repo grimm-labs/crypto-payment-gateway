@@ -20,7 +20,7 @@ jobs:
         uses: ./.github/actions/setup-rust
 
       - name: Run unit tests
-        run: cargo test -p domain -p wallet -p config -p jobs -p auth -p api
+        run: cargo test -p domain -p wallet -p config -p chain -p lightning-client -p jobs -p auth -p api
 
       - name: Build release binary
         run: cargo build --release -p gateway

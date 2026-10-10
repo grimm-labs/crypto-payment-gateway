@@ -50,7 +50,7 @@ import {
   useRetryWebhookDelivery,
   useWebhooks,
 } from "@/hooks/queries"
-import { formatAmount, formatDate, networkLabel, shortHash } from "@/lib/format"
+import { formatAmount, formatDate, networkLabel, networkToken, shortHash } from "@/lib/format"
 import type { WebhookDelivery } from "@/lib/types"
 
 const PAGE_SIZE = 20
@@ -223,7 +223,7 @@ export function DeliveriesPage() {
                       )}
                     </TableCell>
                     <TableCell className="tabular-nums">
-                      {formatAmount(webhook.amount)}
+                      {formatAmount(webhook.amount, networkToken(webhook.network))}
                     </TableCell>
                     <TableCell>
                       <StatusBadge status={webhook.status} />

@@ -7,6 +7,7 @@ use chain::ChainClients;
 use config::{AppConfig, API_TRAFFIC_QUEUE_CAPACITY};
 use db::Db;
 use jobs::{spawn_workers, AppState, TrafficRecorder};
+use lightning_client::{LightningClient, LightningConfig};
 use redis::aio::ConnectionManager;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
@@ -34,6 +35,9 @@ async fn main() -> anyhow::Result<()> {
     if config.helius_api_key.is_none() {
         tracing::warn!("HELIUS_API_KEY is not set — Solana monitoring disabled");
     }
+    if config.bitcoin_esplora_base_url.is_none() {
+        tracing::warn!("BITCOIN_ESPLORA_BASE_URL is not set — Bitcoin monitoring disabled");
+    }
 
     let wallet = WalletService::from_mnemonic(&config.wallet_mnemonic)
         .context("Invalid WALLET_MNEMONIC")?;
@@ -59,6 +63,7 @@ async fn main() -> anyhow::Result<()> {
         .context("Failed to connect to Redis")?;
 
     let chain = ChainClients::new(config.clone());
+    let lightning = connect_lightning(&config).await;
     let (traffic, traffic_rx) = TrafficRecorder::channel(API_TRAFFIC_QUEUE_CAPACITY);
     let state = AppState {
         config: config.clone(),
@@ -67,6 +72,7 @@ async fn main() -> anyhow::Result<()> {
         chain,
         redis,
         traffic,
+        lightning: lightning.clone(),
     };
 
     spawn_workers(state.clone(), traffic_rx);
@@ -81,6 +87,71 @@ async fn main() -> anyhow::Result<()> {
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
     )
+    .with_graceful_shutdown(shutdown_signal())
     .await?;
+
+    // Close the Breez SDK so its SQLite storage is left consistent.
+    if let Some(lightning) = lightning {
+        info!("Disconnecting Breez SDK");
+        if let Err(err) = lightning.disconnect().await {
+            tracing::error!("Breez SDK disconnect failed: {err:#}");
+        }
+    }
+    info!("Shutdown complete");
     Ok(())
+}
+
+/// `None` (Lightning disabled) when `BREEZ_API_KEY` is unset or the SDK
+/// cannot connect — never fatal: the other networks keep running.
+async fn connect_lightning(config: &AppConfig) -> Option<LightningClient> {
+    let Some(api_key) = config.breez_api_key.clone() else {
+        tracing::warn!("BREEZ_API_KEY is not set — Lightning disabled");
+        return None;
+    };
+    match LightningClient::connect(LightningConfig {
+        api_key,
+        mnemonic: config.wallet_mnemonic.clone(),
+        storage_dir: config.breez_storage_dir.clone(),
+    })
+    .await
+    {
+        Ok(client) => {
+            info!("Lightning enabled (Breez storage: {})", config.breez_storage_dir);
+            Some(client)
+        }
+        Err(err) => {
+            tracing::error!("Breez SDK connection failed — Lightning disabled: {err:#}");
+            None
+        }
+    }
+}
+
+/// Resolves on SIGINT (Ctrl-C) or SIGTERM (docker stop).
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        if let Err(err) = tokio::signal::ctrl_c().await {
+            tracing::error!("Failed to listen for Ctrl-C: {err}");
+            std::future::pending::<()>().await;
+        }
+    };
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut signal) => {
+                signal.recv().await;
+            }
+            Err(err) => {
+                tracing::error!("Failed to listen for SIGTERM: {err}");
+                std::future::pending::<()>().await;
+            }
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {},
+        _ = terminate => {},
+    }
+    info!("Shutdown signal received");
 }

@@ -39,7 +39,15 @@ import {
   TableRow,
 } from "@/components/ui/table"
 import { useCreatePayment, usePayments } from "@/hooks/queries"
-import { formatAmount, formatDate, networkLabel, shortHash } from "@/lib/format"
+import {
+  formatAmount,
+  formatDate,
+  isBtcNetwork,
+  networkLabel,
+  networkToken,
+  satsToBtc,
+  shortHash,
+} from "@/lib/format"
 import type { DepositAddress } from "@/lib/types"
 
 const PAGE_SIZE = 20
@@ -100,6 +108,8 @@ export function PaymentsPage() {
             <SelectItem value="tron">Tron</SelectItem>
             <SelectItem value="ethereum">Ethereum</SelectItem>
             <SelectItem value="solana">Solana</SelectItem>
+            <SelectItem value="bitcoin">Bitcoin</SelectItem>
+            <SelectItem value="lightning">Lightning</SelectItem>
           </SelectContent>
         </Select>
       </div>
@@ -172,13 +182,23 @@ export function PaymentsPage() {
   )
 }
 
-const createSchema = z.object({
-  network: z.enum(["tron", "ethereum", "solana"]),
-  expected_amount: z
-    .string()
-    .trim()
-    .regex(/^\d+(\.\d{1,6})?$/, "Positive amount, up to 6 decimals"),
-  expires_at: z.string().optional(),
+/** Total bitcoin supply, in sats. */
+const MAX_SATS = "2100000000000000"
+const DESCRIPTION_MAX_CHARS = 128
+
+function isValidSats(value: string): boolean {
+  if (!/^[1-9]\d*$/.test(value)) return false
+  // Integer strings without leading zeros compare by length, then lexically.
+  return value.length < MAX_SATS.length || (value.length === MAX_SATS.length && value <= MAX_SATS)
+}
+
+const createSchema = z
+  .object({
+    network: z.enum(["tron", "ethereum", "solana", "bitcoin", "lightning"]),
+    // USDT (decimal) on tron/ethereum/solana, sats (integer) on bitcoin/lightning.
+    expected_amount: z.string().trim(),
+    description: z.string().trim().optional(),
+    expires_at: z.string().optional(),
   metadata: z
     .string()
     .trim()
@@ -195,7 +215,31 @@ const createSchema = z.object({
       },
       { message: "Must be a valid JSON object" },
     ),
-})
+  })
+  .superRefine((values, ctx) => {
+    if (isBtcNetwork(values.network)) {
+      if (!isValidSats(values.expected_amount)) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ["expected_amount"],
+          message: "Whole number of sats, at least 1",
+        })
+      }
+    } else if (!/^\d+(\.\d{1,6})?$/.test(values.expected_amount)) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["expected_amount"],
+        message: "Positive amount, up to 6 decimals",
+      })
+    }
+    if ((values.description?.length ?? 0) > DESCRIPTION_MAX_CHARS) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["description"],
+        message: `At most ${DESCRIPTION_MAX_CHARS} characters`,
+      })
+    }
+  })
 
 type CreateValues = z.infer<typeof createSchema>
 
@@ -208,6 +252,9 @@ function CreatePaymentDialog() {
     resolver: zodResolver(createSchema),
     defaultValues: { network: "tron", expected_amount: "" },
   })
+  const selectedNetwork = form.watch("network")
+  const isBtc = isBtcNetwork(selectedNetwork)
+  const btcHint = isBtc ? satsToBtc(form.watch("expected_amount") ?? "") : null
 
   // The sidebar "New payment" button navigates to /payments?create=1.
   useEffect(() => {
@@ -216,10 +263,15 @@ function CreatePaymentDialog() {
 
   async function onSubmit(values: CreateValues) {
     try {
+      const btc = isBtcNetwork(values.network)
       const payment = await createPayment.mutateAsync({
         network: values.network,
-        token: "USDT",
-        expected_amount: values.expected_amount,
+        token: networkToken(values.network),
+        ...(btc
+          ? { expected_amount_sats: values.expected_amount }
+          : { expected_amount: values.expected_amount }),
+        description:
+          values.network === "lightning" && values.description ? values.description : undefined,
         expires_at: values.expires_at
           ? new Date(values.expires_at).toISOString()
           : undefined,
@@ -236,7 +288,13 @@ function CreatePaymentDialog() {
     setOpen(next)
     if (!next) {
       setCreated(null)
-      form.reset({ network: "tron", expected_amount: "", expires_at: "", metadata: "" })
+      form.reset({
+        network: "tron",
+        expected_amount: "",
+        description: "",
+        expires_at: "",
+        metadata: "",
+      })
       if (searchParams.has("create")) {
         const params = new URLSearchParams(searchParams)
         params.delete("create")
@@ -258,9 +316,13 @@ function CreatePaymentDialog() {
         {created ? (
           <>
             <DialogHeader>
-              <DialogTitle>Address ready</DialogTitle>
+              <DialogTitle>
+                {created.network === "lightning" ? "Invoice ready" : "Address ready"}
+              </DialogTitle>
               <DialogDescription>
-                Share this {networkLabel(created.network)} address with the payer.
+                {created.network === "lightning"
+                  ? "Share this Lightning payment request with the payer."
+                  : `Share this ${networkLabel(created.network)} address with the payer.`}
               </DialogDescription>
             </DialogHeader>
             <div className="space-y-3">
@@ -287,17 +349,21 @@ function CreatePaymentDialog() {
             <DialogHeader>
               <DialogTitle>New payment</DialogTitle>
               <DialogDescription>
-                Generates a unique USDT deposit address for the expected amount.
+                Generates a unique deposit address — or a Lightning invoice — for the
+                expected amount.
               </DialogDescription>
             </DialogHeader>
             <form onSubmit={form.handleSubmit(onSubmit)} className="space-y-4">
               <div className="space-y-2">
                 <Label>Network</Label>
                 <Select
-                  value={form.watch("network")}
-                  onValueChange={(value) =>
-                    form.setValue("network", value as CreateValues["network"])
-                  }
+                  value={selectedNetwork}
+                  onValueChange={(value) => {
+                    const next = value as CreateValues["network"]
+                    // The amount unit changes (USDT ↔ sats): don't carry it over.
+                    if (isBtcNetwork(next) !== isBtc) form.setValue("expected_amount", "")
+                    form.setValue("network", next)
+                  }}
                 >
                   <SelectTrigger className="w-full">
                     <SelectValue />
@@ -306,21 +372,45 @@ function CreatePaymentDialog() {
                     <SelectItem value="tron">Tron (TRC-20)</SelectItem>
                     <SelectItem value="ethereum">Ethereum (ERC-20)</SelectItem>
                     <SelectItem value="solana">Solana (SPL)</SelectItem>
+                    <SelectItem value="bitcoin">Bitcoin (on-chain)</SelectItem>
+                    <SelectItem value="lightning">Lightning (BOLT11)</SelectItem>
                   </SelectContent>
                 </Select>
+                {isBtc && (
+                  <p className="text-xs text-muted-foreground">Token: BTC</p>
+                )}
               </div>
               <div className="space-y-2">
-                <Label htmlFor="expected_amount">Expected amount (USDT)</Label>
+                <Label htmlFor="expected_amount">
+                  Expected amount ({isBtc ? "sats" : "USDT"})
+                </Label>
                 <Input
                   id="expected_amount"
-                  placeholder="25.00"
-                  inputMode="decimal"
+                  placeholder={isBtc ? "150000" : "25.00"}
+                  inputMode={isBtc ? "numeric" : "decimal"}
                   {...form.register("expected_amount")}
                 />
+                {btcHint && (
+                  <p className="text-xs text-muted-foreground">≈ {btcHint} BTC</p>
+                )}
                 {errors.expected_amount && (
                   <p className="text-xs text-destructive">{errors.expected_amount.message}</p>
                 )}
               </div>
+              {selectedNetwork === "lightning" && (
+                <div className="space-y-2">
+                  <Label htmlFor="description">Invoice description (optional)</Label>
+                  <Input
+                    id="description"
+                    placeholder="Order #1234"
+                    maxLength={DESCRIPTION_MAX_CHARS}
+                    {...form.register("description")}
+                  />
+                  {errors.description && (
+                    <p className="text-xs text-destructive">{errors.description.message}</p>
+                  )}
+                </div>
+              )}
               <div className="space-y-2">
                 <Label htmlFor="expires_at">Expires at (optional)</Label>
                 <Input id="expires_at" type="datetime-local" {...form.register("expires_at")} />

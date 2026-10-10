@@ -39,16 +39,19 @@ export interface Paginated<T> {
 export type DepositAddressStatus = "pending" | "paid" | "expired"
 export type DepositStatus = "detected" | "confirmed"
 export type WebhookStatus = "pending" | "delivered" | "failed"
-export type Network = "tron" | "ethereum" | "solana"
+export type Network = "tron" | "ethereum" | "solana" | "bitcoin" | "lightning"
 
 // All amounts are decimal strings — never parse them into floats.
 export interface DepositAddress {
   id: string
+  /** For lightning: the BOLT11 payment request. */
   address: string
   network: Network
   token: string
   status: DepositAddressStatus
   expected_amount: string
+  /** Base units: sats for BTC, 10^-6 for USDT. */
+  expected_amount_raw: string
   expires_at: string
   created_at: string
 }
@@ -161,6 +164,8 @@ export interface NetworkBalance {
 
 export interface WalletBalances {
   total_usdt: string
+  /** Bitcoin + Lightning — never folded into total_usdt. */
+  total_btc?: string
   networks: NetworkBalance[]
   updated_at?: string | null
 }

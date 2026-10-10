@@ -17,14 +17,14 @@ import {
 } from "@/components/ui/card"
 import { Skeleton } from "@/components/ui/skeleton"
 import { useStats, useWalletBalances } from "@/hooks/queries"
-import { formatDate } from "@/lib/format"
+import { formatAmount, formatDate } from "@/lib/format"
 
 export function SectionCards() {
   const stats = useStats()
   const balances = useWalletBalances()
 
-  const availableNetworks =
-    balances.data?.networks.filter((n) => n.available).length ?? 0
+  const networks = balances.data?.networks ?? []
+  const availableNetworks = networks.filter((n) => n.available).length
   const failed = stats.data?.webhooks.failed ?? 0
 
   return (
@@ -42,13 +42,15 @@ export function SectionCards() {
           <CardAction>
             <Badge variant="outline">
               <WalletIcon />
-              {availableNetworks}/3 networks
+              {availableNetworks}/{networks.length} networks
             </Badge>
           </CardAction>
         </CardHeader>
         <CardFooter className="flex-col items-start gap-1.5 text-sm">
           <div className="line-clamp-1 flex gap-2 font-medium">
-            Across all HD wallet addresses
+            {balances.data?.total_btc !== undefined
+              ? `+ ${formatAmount(balances.data.total_btc, "BTC")} (Bitcoin & Lightning)`
+              : "Across all HD wallet addresses"}
           </div>
           <div className="text-muted-foreground">
             {balances.data?.updated_at

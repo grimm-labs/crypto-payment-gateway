@@ -294,10 +294,32 @@ impl Db {
         Ok(rows.into_iter().map(|(a,)| a).collect())
     }
 
-    pub async fn find_deposit_by_tx(&self, tx_hash: &str) -> Result<Option<DepositRow>> {
-        let row = sqlx::query_as::<_, DepositRow>(&format!(
-            r#"SELECT {DEPOSIT_COLUMNS} FROM deposits WHERE "txHash" = $1"#
+    /// Map an address string back to its row — for Lightning, `address` is
+    /// the BOLT11 payment request (unique index on `address`).
+    pub async fn find_deposit_address_by_address(
+        &self,
+        address: &str,
+    ) -> Result<Option<DepositAddressRow>> {
+        let row = sqlx::query_as::<_, DepositAddressRow>(&format!(
+            "SELECT {DEPOSIT_ADDRESS_COLUMNS} FROM deposit_addresses WHERE address = $1"
         ))
+        .bind(address)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row)
+    }
+
+    /// A deposit is identified by (address, tx): one Bitcoin transaction can
+    /// pay several gateway addresses.
+    pub async fn find_deposit_by_address_and_tx(
+        &self,
+        deposit_address_id: &str,
+        tx_hash: &str,
+    ) -> Result<Option<DepositRow>> {
+        let row = sqlx::query_as::<_, DepositRow>(&format!(
+            r#"SELECT {DEPOSIT_COLUMNS} FROM deposits WHERE "depositAddressId" = $1 AND "txHash" = $2"#
+        ))
+        .bind(deposit_address_id)
         .bind(tx_hash)
         .fetch_optional(&self.pool)
         .await?;
@@ -327,8 +349,9 @@ impl Db {
         let mut tx = self.pool.begin().await?;
 
         let existing = sqlx::query_as::<_, DepositRow>(&format!(
-            r#"SELECT {DEPOSIT_COLUMNS} FROM deposits WHERE "txHash" = $1 FOR UPDATE"#
+            r#"SELECT {DEPOSIT_COLUMNS} FROM deposits WHERE "depositAddressId" = $1 AND "txHash" = $2 FOR UPDATE"#
         ))
+        .bind(deposit_address_id)
         .bind(tx_hash)
         .fetch_optional(&mut *tx)
         .await?;

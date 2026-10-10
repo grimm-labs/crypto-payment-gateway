@@ -1,8 +1,12 @@
-use rust_decimal::Decimal;
+use rust_decimal::{Decimal, RoundingStrategy};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 pub const USDT_DECIMALS: u32 = 6;
+/// 1 BTC = 100 000 000 sats.
+pub const BTC_DECIMALS: u32 = 8;
+/// Total bitcoin supply in sats — the upper bound of any BTC amount.
+pub const BTC_MAX_SATS: u64 = 2_100_000_000_000_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "UPPERCASE")]
@@ -10,14 +14,36 @@ pub enum Network {
     Tron,
     Solana,
     Ethereum,
+    Bitcoin,
+    /// BOLT11 invoices issued through the Breez SDK; the row's `address`
+    /// holds the payment request.
+    Lightning,
 }
 
 impl Network {
+    pub const ALL: [Self; 5] = [
+        Self::Tron,
+        Self::Ethereum,
+        Self::Solana,
+        Self::Bitcoin,
+        Self::Lightning,
+    ];
+
+    /// The one token received on this network (see `supports`).
+    pub fn token(&self) -> Token {
+        match self {
+            Self::Tron | Self::Ethereum | Self::Solana => Token::Usdt,
+            Self::Bitcoin | Self::Lightning => Token::Btc,
+        }
+    }
+
     pub fn as_db(&self) -> &'static str {
         match self {
             Self::Tron => "TRON",
             Self::Solana => "SOLANA",
             Self::Ethereum => "ETHEREUM",
+            Self::Bitcoin => "BITCOIN",
+            Self::Lightning => "LIGHTNING",
         }
     }
 
@@ -26,6 +52,8 @@ impl Network {
             Self::Tron => "tron",
             Self::Solana => "solana",
             Self::Ethereum => "ethereum",
+            Self::Bitcoin => "bitcoin",
+            Self::Lightning => "lightning",
         }
     }
 
@@ -34,6 +62,8 @@ impl Network {
             "tron" => Ok(Self::Tron),
             "solana" => Ok(Self::Solana),
             "ethereum" => Ok(Self::Ethereum),
+            "bitcoin" => Ok(Self::Bitcoin),
+            "lightning" => Ok(Self::Lightning),
             _ => Err(DomainError::UnsupportedNetwork(value.to_string())),
         }
     }
@@ -43,6 +73,8 @@ impl Network {
             "TRON" => Ok(Self::Tron),
             "SOLANA" => Ok(Self::Solana),
             "ETHEREUM" => Ok(Self::Ethereum),
+            "BITCOIN" => Ok(Self::Bitcoin),
+            "LIGHTNING" => Ok(Self::Lightning),
             _ => Err(DomainError::UnsupportedNetwork(value.to_string())),
         }
     }
@@ -51,20 +83,27 @@ impl Network {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Token {
     Usdt,
+    Btc,
 }
 
 impl Token {
     pub fn as_db(&self) -> &'static str {
-        "USDT"
+        match self {
+            Self::Usdt => "USDT",
+            Self::Btc => "BTC",
+        }
     }
 
+    /// Token strings are uppercase on the API surface too.
     pub fn as_api(&self) -> &'static str {
-        "USDT"
+        self.as_db()
     }
 
     pub fn parse_api(value: &str) -> Result<Self, DomainError> {
         if value.eq_ignore_ascii_case("USDT") {
             Ok(Self::Usdt)
+        } else if value.eq_ignore_ascii_case("BTC") {
+            Ok(Self::Btc)
         } else {
             Err(DomainError::UnsupportedToken(value.to_string()))
         }
@@ -73,6 +112,20 @@ impl Token {
     pub fn from_db(value: &str) -> Result<Self, DomainError> {
         Self::parse_api(value)
     }
+
+    /// Base-unit exponent: `amount_raw = amount * 10^decimals`.
+    pub fn decimals(&self) -> u32 {
+        match self {
+            Self::Usdt => USDT_DECIMALS,
+            Self::Btc => BTC_DECIMALS,
+        }
+    }
+}
+
+/// Whether `token` can be received on `network`: USDT on the three account
+/// networks, BTC on bitcoin and lightning.
+pub fn supports(network: Network, token: Token) -> bool {
+    network.token() == token
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -488,7 +541,7 @@ pub struct DetectedTransfer {
 pub enum DomainError {
     #[error("Unsupported network: {0}")]
     UnsupportedNetwork(String),
-    #[error("Unsupported token: {0}. Only USDT is supported.")]
+    #[error("Unsupported token: {0}. Supported tokens: USDT, BTC.")]
     UnsupportedToken(String),
     #[error("Invalid status: {0}")]
     InvalidStatus(String),
@@ -502,17 +555,54 @@ pub enum DomainError {
     InvalidWindow(String),
 }
 
-pub fn raw_to_decimal(raw: &str) -> Result<Decimal, DomainError> {
+/// Integer string in token base units → decimal amount (never via floats).
+pub fn raw_to_decimal(raw: &str, token: Token) -> Result<Decimal, DomainError> {
     let raw_int: i128 = raw
         .parse()
         .map_err(|_| DomainError::InvalidAmount(raw.to_string()))?;
-    Ok(Decimal::from_i128_with_scale(raw_int, USDT_DECIMALS))
+    Decimal::try_from_i128_with_scale(raw_int, token.decimals())
+        .map_err(|_| DomainError::InvalidAmount(raw.to_string()))
 }
 
-/// Format raw integer string (6 decimals) as decimal string without float.
-pub fn raw_to_decimal_string(raw: &str) -> Result<String, DomainError> {
-    let value = raw_to_decimal(raw)?;
+/// Format a raw base-unit integer string as a trimmed decimal string.
+pub fn raw_to_decimal_string(raw: &str, token: Token) -> Result<String, DomainError> {
+    let value = raw_to_decimal(raw, token)?;
     Ok(trim_decimal(value))
+}
+
+/// Decimal amount → integer string in token base units. Precision beyond the
+/// token's decimals is truncated (callers store amounts via `round_to_token`).
+pub fn decimal_to_raw(amount: Decimal, token: Token) -> String {
+    let scaled = amount * Decimal::from(10u64.pow(token.decimals()));
+    scaled.trunc().normalize().to_string()
+}
+
+/// Round to the token's decimals the way a Postgres `NUMERIC(_, decimals)`
+/// column would (half away from zero) — keeps USDT amounts identical to what
+/// the former DECIMAL(18,6) columns stored.
+pub fn round_to_token(amount: Decimal, token: Token) -> Decimal {
+    amount.round_dp_with_strategy(token.decimals(), RoundingStrategy::MidpointAwayFromZero)
+}
+
+/// Fixed-scale rendering at the token's decimals (`25.000000` USDT,
+/// `0.00150000` BTC) — what webhook receivers have always been sent.
+pub fn format_amount(amount: Decimal, token: Token) -> String {
+    let mut value = round_to_token(amount, token);
+    value.rescale(token.decimals());
+    value.to_string()
+}
+
+/// Parse a satoshi amount: plain ASCII digits only, 1 ≤ sats ≤ total supply.
+pub fn parse_sats(value: &str) -> Result<u64, DomainError> {
+    let invalid = || DomainError::InvalidAmount(value.to_string());
+    if value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(invalid());
+    }
+    let sats: u64 = value.parse().map_err(|_| invalid())?;
+    if sats == 0 || sats > BTC_MAX_SATS {
+        return Err(invalid());
+    }
+    Ok(sats)
 }
 
 pub fn is_amount_within_tolerance(
@@ -537,15 +627,14 @@ pub fn is_amount_within_tolerance(
     diff <= tolerance
 }
 
-pub fn required_confirmations(
-    network: Network,
-    tron: i32,
-    eth: i32,
-) -> i32 {
+pub fn required_confirmations(network: Network, tron: i32, eth: i32, btc: i32) -> i32 {
     match network {
         Network::Tron => tron,
         Network::Ethereum => eth,
+        Network::Bitcoin => btc,
         Network::Solana => 1,
+        // A settled Lightning payment is final — no notion of confirmations.
+        Network::Lightning => 1,
     }
 }
 
@@ -572,14 +661,135 @@ mod tests {
 
     #[test]
     fn raw_conversion() {
-        assert_eq!(raw_to_decimal("25000000").unwrap(), dec!(25));
-        assert_eq!(raw_to_decimal_string("25000000").unwrap(), "25");
+        assert_eq!(raw_to_decimal("25000000", Token::Usdt).unwrap(), dec!(25));
+        assert_eq!(raw_to_decimal_string("25000000", Token::Usdt).unwrap(), "25");
+    }
+
+    #[test]
+    fn raw_conversion_uses_token_decimals() {
+        assert_eq!(raw_to_decimal("150000", Token::Btc).unwrap(), dec!(0.0015));
+        assert_eq!(raw_to_decimal_string("150000", Token::Btc).unwrap(), "0.0015");
+        assert_eq!(raw_to_decimal("100000000", Token::Btc).unwrap(), dec!(1));
+        assert_eq!(raw_to_decimal("1", Token::Btc).unwrap(), dec!(0.00000001));
+        assert_eq!(raw_to_decimal("150000", Token::Usdt).unwrap(), dec!(0.15));
+    }
+
+    #[test]
+    fn raw_conversion_rejects_garbage_without_panicking() {
+        assert!(raw_to_decimal("12.5", Token::Usdt).is_err());
+        assert!(raw_to_decimal("", Token::Btc).is_err());
+        // Beyond rust_decimal's 96-bit mantissa: an error, never a panic.
+        assert!(raw_to_decimal("100000000000000000000000000000000", Token::Usdt).is_err());
+    }
+
+    #[test]
+    fn token_decimals() {
+        assert_eq!(Token::Usdt.decimals(), 6);
+        assert_eq!(Token::Btc.decimals(), 8);
+    }
+
+    #[test]
+    fn decimal_to_raw_is_inverse_of_raw_to_decimal() {
+        assert_eq!(decimal_to_raw(dec!(0.0015), Token::Btc), "150000");
+        assert_eq!(decimal_to_raw(dec!(25.5), Token::Usdt), "25500000");
+        assert_eq!(decimal_to_raw(dec!(25.000000), Token::Usdt), "25000000");
+        assert_eq!(decimal_to_raw(dec!(21000000), Token::Btc), "2100000000000000");
+    }
+
+    #[test]
+    fn format_amount_uses_token_scale() {
+        // USDT keeps the historical 6-decimal rendering even once read from
+        // the widened DECIMAL(24,8) column.
+        assert_eq!(format_amount(dec!(25.00000000), Token::Usdt), "25.000000");
+        assert_eq!(format_amount(dec!(25), Token::Usdt), "25.000000");
+        assert_eq!(format_amount(dec!(0.0015), Token::Btc), "0.00150000");
+    }
+
+    #[test]
+    fn round_to_token_matches_postgres_numeric_rounding() {
+        assert_eq!(round_to_token(dec!(1.0000005), Token::Usdt), dec!(1.000001));
+        assert_eq!(round_to_token(dec!(1.0000025), Token::Usdt), dec!(1.000003));
+        assert_eq!(round_to_token(dec!(1.00000049), Token::Usdt), dec!(1.000000));
+        assert_eq!(round_to_token(dec!(0.123456789), Token::Btc), dec!(0.12345679));
+    }
+
+    #[test]
+    fn parse_sats_accepts_integer_strings_within_supply() {
+        assert_eq!(parse_sats("150000").unwrap(), 150_000);
+        assert_eq!(parse_sats("1").unwrap(), 1);
+        assert_eq!(parse_sats("2100000000000000").unwrap(), 2_100_000_000_000_000);
+        assert!(parse_sats("0").is_err());
+        assert!(parse_sats("2100000000000001").is_err());
+        assert!(parse_sats("-5").is_err());
+        assert!(parse_sats("+5").is_err());
+        assert!(parse_sats("1.5").is_err());
+        assert!(parse_sats("1e3").is_err());
+        assert!(parse_sats(" 15").is_err());
+        assert!(parse_sats("").is_err());
+        assert!(parse_sats("99999999999999999999999").is_err());
     }
 
     #[test]
     fn network_roundtrip() {
         assert_eq!(Network::parse_api("tron").unwrap().as_db(), "TRON");
         assert_eq!(Network::from_db("ETHEREUM").unwrap().as_api(), "ethereum");
+    }
+
+    #[test]
+    fn bitcoin_and_lightning_casings_roundtrip() {
+        assert_eq!(Network::parse_api("bitcoin").unwrap(), Network::Bitcoin);
+        assert_eq!(Network::parse_api("lightning").unwrap(), Network::Lightning);
+        assert_eq!(Network::Bitcoin.as_db(), "BITCOIN");
+        assert_eq!(Network::Lightning.as_db(), "LIGHTNING");
+        assert_eq!(Network::from_db("BITCOIN").unwrap().as_api(), "bitcoin");
+        assert_eq!(Network::from_db("LIGHTNING").unwrap().as_api(), "lightning");
+        assert!(Network::from_db("bitcoin").is_err());
+    }
+
+    #[test]
+    fn btc_token_casings_roundtrip() {
+        assert_eq!(Token::parse_api("BTC").unwrap(), Token::Btc);
+        assert_eq!(Token::parse_api("btc").unwrap(), Token::Btc);
+        assert_eq!(Token::Btc.as_db(), "BTC");
+        assert_eq!(Token::Btc.as_api(), "BTC");
+        assert_eq!(Token::from_db("BTC").unwrap(), Token::Btc);
+        assert_eq!(Token::from_db("USDT").unwrap(), Token::Usdt);
+        assert!(Token::parse_api("ETH").is_err());
+    }
+
+    #[test]
+    fn supports_matrix() {
+        for network in [Network::Tron, Network::Ethereum, Network::Solana] {
+            assert!(supports(network, Token::Usdt), "{network:?} must accept USDT");
+            assert!(!supports(network, Token::Btc), "{network:?} must reject BTC");
+        }
+        for network in [Network::Bitcoin, Network::Lightning] {
+            assert!(supports(network, Token::Btc), "{network:?} must accept BTC");
+            assert!(!supports(network, Token::Usdt), "{network:?} must reject USDT");
+        }
+    }
+
+    #[test]
+    fn each_network_receives_its_own_token() {
+        assert_eq!(Network::Tron.token(), Token::Usdt);
+        assert_eq!(Network::Ethereum.token(), Token::Usdt);
+        assert_eq!(Network::Solana.token(), Token::Usdt);
+        assert_eq!(Network::Bitcoin.token(), Token::Btc);
+        assert_eq!(Network::Lightning.token(), Token::Btc);
+        for network in Network::ALL {
+            assert!(supports(network, network.token()));
+        }
+    }
+
+    #[test]
+    fn required_confirmations_per_network() {
+        assert_eq!(required_confirmations(Network::Tron, 19, 12, 3), 19);
+        assert_eq!(required_confirmations(Network::Ethereum, 19, 12, 3), 12);
+        assert_eq!(required_confirmations(Network::Solana, 19, 12, 3), 1);
+        assert_eq!(required_confirmations(Network::Bitcoin, 19, 12, 3), 3);
+        assert_eq!(required_confirmations(Network::Bitcoin, 19, 12, 6), 6);
+        // A settled Lightning payment is final.
+        assert_eq!(required_confirmations(Network::Lightning, 19, 12, 3), 1);
     }
 
     #[test]

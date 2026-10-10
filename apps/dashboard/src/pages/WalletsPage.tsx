@@ -38,7 +38,8 @@ export function WalletsPage() {
         <div>
           <h1 className="text-2xl font-semibold tracking-tight">Wallets</h1>
           <p className="text-sm text-muted-foreground">
-            USDT held on the HD wallet across all derived addresses.
+            USDT and BTC held on the HD wallet across all derived addresses, plus the
+            Lightning (Breez/Spark) wallet balance.
           </p>
         </div>
         <Button onClick={refreshLive} disabled={live.isFetching} variant="outline">
@@ -62,6 +63,11 @@ export function WalletsPage() {
               <p className="text-3xl font-semibold tabular-nums">
                 {source ? formatAmount(source.total_usdt) : "—"}
               </p>
+              {source?.total_btc !== undefined && (
+                <p className="mt-1 text-xl font-semibold tabular-nums text-muted-foreground">
+                  {formatAmount(source.total_btc, "BTC")}
+                </p>
+              )}
             </CardContent>
           </Card>
 
@@ -81,10 +87,12 @@ export function WalletsPage() {
                     {formatAmount(network.amount, network.token)}
                   </p>
                   <p className="mt-1 text-xs text-muted-foreground">
-                    {network.indices_scanned !== undefined &&
-                      `${network.indices_scanned} HD indices scanned`}
-                    {network.addresses_checked !== undefined &&
-                      `${network.addresses_checked} addresses checked`}
+                    {network.network === "lightning"
+                      ? "Breez/Spark wallet balance"
+                      : network.indices_scanned !== undefined
+                        ? `${network.indices_scanned} HD indices scanned`
+                        : network.addresses_checked !== undefined &&
+                          `${network.addresses_checked} addresses checked`}
                   </p>
                   {network.message && (
                     <p className="mt-1 text-xs text-muted-foreground">{network.message}</p>

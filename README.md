@@ -2,7 +2,8 @@
 
 [![CI](https://github.com/nejos97/stablecoin-payment-gateway/actions/workflows/ci.yml/badge.svg)](https://github.com/nejos97/stablecoin-payment-gateway/actions/workflows/ci.yml)
 
-Rust service for accepting USDT deposits on **Tron**, **Ethereum**, and **Solana**.
+Rust service for accepting USDT deposits on **Tron**, **Ethereum**, and **Solana**, and
+bitcoin payments **on-chain** and over **Lightning**.
 
 ## Features
 
@@ -12,7 +13,8 @@ Rust service for accepting USDT deposits on **Tron**, **Ethereum**, and **Solana
   (deposit confirmed), `expired` — to every active endpoint **subscribed to that event**;
   endpoints are managed from the dashboard (**Webhooks**, admin), with per-endpoint delivery state
 - HD wallet derivation from `WALLET_MNEMONIC`
-- Multi-network support: Tron (TRC-20), Ethereum (ERC-20), Solana (SPL)
+- Multi-network support: Tron (TRC-20), Ethereum (ERC-20), Solana (SPL), Bitcoin (BIP84
+  on-chain) and Lightning (BOLT11 via the Breez SDK) — see [Bitcoin & Lightning](#bitcoin--lightning)
 - **Admin dashboard** (`apps/dashboard`, React + shadcn/ui): wallet balances, payments,
   webhook monitoring/retry, API key and staff management — served on its own port
 - Merchant API protected by **API keys** (`x-api-key`) created from the dashboard;
@@ -30,7 +32,11 @@ cargo run -p gateway
 
 On first boot the binary applies SQL migrations (`crates/db/migrations`) via sqlx.
 
-API: `http://localhost:3000` — `GET /healthz` (liveness), `GET /readyz` (Postgres + Redis)
+API: `http://localhost:3000` — `GET /healthz` (liveness), `GET /readyz` (Postgres + Redis;
+also reports the Lightning SDK as `ok`/`disabled`/`error`, informational only)
+
+Building needs `protoc` (the Breez SDK compiles gRPC protos): `brew install protobuf` /
+`apt-get install protobuf-compiler`. The Docker image installs it.
 
 ### Dashboard (dev)
 
@@ -56,10 +62,10 @@ Starts postgres, redis, the API on `:3000` and the dashboard on `:8080`
 
 ## Testing
 
-Unit tests live in the `domain`, `wallet`, `config`, and `jobs` crates (BIP39 / HD address golden vectors, amount tolerance, enum roundtrips, webhook retry schedule). CI runs the same suite:
+Unit tests live in the `domain`, `wallet`, `config`, `chain`, `lightning-client`, `jobs`, `auth` and `api` crates (BIP39 / BIP84 / HD address golden vectors, amount tolerance and per-token decimals, enum roundtrips, Esplora parsing and confirmation math, the Breez SDK wrapper against a mocked `LightningOps`, webhook retry schedule, request validation). None needs a database or network access. CI runs the same suite:
 
 ```bash
-cargo test -p domain -p wallet -p config -p jobs -p auth
+cargo test -p domain -p wallet -p config -p chain -p lightning-client -p jobs -p auth -p api
 ```
 
 There are no integration tests for the API or chain providers yet.
@@ -86,6 +92,24 @@ curl -X POST http://localhost:3000/api/v1/deposit-addresses \
   }'
 ```
 
+Bitcoin and Lightning take the amount **in satoshis** through `expected_amount_sats`
+(integer string, 1 – 2 100 000 000 000 000); `expected_amount` is rejected on those networks
+so `1500` can never be ambiguous between sats and BTC. The token must match the network
+(`USDT` on tron/ethereum/solana, `BTC` on bitcoin/lightning) — otherwise `400 "Token not
+supported on this network"`.
+
+```bash
+# Lightning: returns a BOLT11 invoice in `address` (optional `description`, ≤ 128 chars)
+curl -X POST http://localhost:3000/api/v1/deposit-addresses \
+  -H "Content-Type: application/json" -H "x-api-key: $API_KEY" \
+  -d '{ "network": "lightning", "token": "BTC", "expected_amount_sats": "150000", "description": "order #123" }'
+```
+
+Lightning creation returns `503` when the Breez SDK is not configured/connected and a
+generic `500 "Failed to create invoice"` when the SDK fails (details are only logged). The
+invoice expiry equals the payment's `expires_at`. Every response carries
+`expected_amount_raw` (base units: sats for BTC, 10⁻⁶ for USDT) next to `expected_amount`.
+
 ### List deposit addresses
 
 ```bash
@@ -95,7 +119,7 @@ curl "http://localhost:3000/api/v1/deposit-addresses?status=pending&limit=20"
 Query params (optional):
 
 - `status`: `pending`, `paid`, `expired`
-- `network`: `tron`, `solana`, `ethereum`
+- `network`: `tron`, `solana`, `ethereum`, `bitcoin`, `lightning`
 - `limit`: default `50`, max `100`
 - `offset`: default `0`
 
@@ -115,11 +139,16 @@ curl -X POST http://localhost:3000/api/v1/deposits/<deposit_id>/webhooks/retry
 
 `<deposit_id>` is the `id` of an entry in `deposits[]` above. Retry resets the delivery attempts and re-queues the webhook towards **every active endpoint**; the payload is unchanged and the deposit status is unchanged. Errors: `404` unknown deposit, `400` deposit not confirmed, `503` no active webhook endpoints configured.
 
-### Get USDT balances (deposit addresses in database)
+### Get balances (deposit addresses in database)
 
 ```bash
 curl http://localhost:3000/api/v1/balances
 ```
+
+One entry per network. Bitcoin sums the confirmed balance of every issued address; Lightning
+reports the Breez/Spark wallet balance (`addresses_checked: 0`). BTC entries use
+`token: "BTC"` and are totalled in `total_btc` — never in `total_usdt`. The cached
+`/wallet-balances` payload has the same `total_btc` treatment.
 
 ### Get HD wallet balances (cached, synced hourly)
 
@@ -237,7 +266,7 @@ Treat production deployments accordingly:
 
 [`.env.example`](.env.example) uses only the well-known BIP39 test vector (`abandon … about`). Do not reuse it with real funds.
 
-Scope today: inbound USDT deposit detection and webhooks. This is not a multi-tenant or non-custodial vault.
+Scope today: inbound USDT / BTC / Lightning deposit detection and webhooks. This is not a multi-tenant or non-custodial vault. See the [custody note](#custody-note) for Lightning funds.
 
 To report a vulnerability, use [GitHub Security Advisories](https://github.com/nejos97/stablecoin-payment-gateway/security/advisories/new) rather than a public issue when possible.
 
@@ -264,6 +293,11 @@ To report a vulnerability, use [GitHub Security Advisories](https://github.com/n
 | `DASHBOARD_PORT` | No | `8080` | Host port of the dashboard container (docker compose) |
 | `CORS_ALLOWED_ORIGINS` | No | — | Comma-separated origins; only needed if the dashboard is not same-origin |
 | `API_TRAFFIC_ENABLED` | No | `true` | Record every `/api/*` request into the `api_requests` log shown on Dashboard → Traffic (retention is a dashboard setting, 2 years by default) |
+| `TRUSTED_PROXIES` | No | — | Comma-separated CIDRs of reverse proxies whose `X-Forwarded-For` is trusted for the traffic log's client IP (the **last** hop is used). Empty = trust none: the socket peer is recorded and forwarding headers are ignored. Behind the bundled dashboard nginx, set the docker network's subnet. An invalid CIDR fails startup |
+| `BITCOIN_ESPLORA_BASE_URL` | No* | — | Esplora-compatible REST base (`https://mempool.space/api`, `https://blockstream.info/api`, or self-hosted). Unset disables Bitcoin |
+| `BTC_CONFIRMATIONS` | No | `3` | Confirmations before a Bitcoin deposit is confirmed / paid |
+| `BREEZ_API_KEY` | No* | — | Breez SDK Spark API key ([breez.technology](https://breez.technology)). Unset disables Lightning |
+| `BREEZ_STORAGE_DIR` | No | `./.breez-data` | Breez SDK local storage (SQLite), resolved to an absolute path at startup. Must persist across restarts (docker compose mounts the `breez_data` volume) |
 
 \* Required for monitoring on the respective network.
 \** Required for the admin API and the dashboard.
@@ -271,6 +305,37 @@ To report a vulnerability, use [GitHub Security Advisories](https://github.com/n
 Advanced overrides (code defaults if unset): `POLLING_INTERVAL_SECONDS` (10), `ETH_CONFIRMATIONS` (12), `TRON_CONFIRMATIONS` (19), `AMOUNT_TOLERANCE_PERCENT` (1).
 
 Webhook endpoints (Dashboard → Webhooks) and the default payment expiry (60 min, max 24 h; Dashboard → Settings) are **not** environment variables — they are stored in the database and managed from the dashboard (admin only).
+
+## Bitcoin & Lightning
+
+**Bitcoin (on-chain, `bitcoin`).** Each payment gets a fresh BIP84 native-SegWit address
+(`bc1q…`, path `m/84'/0'/0'/0/{index}`) derived from `WALLET_MNEMONIC`. A monitor loop polls
+the Esplora API (tip height + the address's latest transactions: mempool and last 25
+confirmed); the amount of a transaction is the sum of its outputs to the address. Below
+`BTC_CONFIRMATIONS` (3) the deposit is `detected`; at 3 confirmations it is `confirmed`, the
+payment flips to `paid` and the `paid` webhook fires. One transaction paying several gateway
+addresses yields one deposit per address. No reorg rollback (3 confirmations is the
+mitigation) and no RBF tracking — a replaced mempool transaction never confirms and the
+payment expires normally.
+
+**Lightning (`lightning`).** Each payment is a fixed-amount BOLT11 invoice issued through the
+[Breez SDK Spark](https://sdk-doc-spark.breez.technology/) (seeded with `WALLET_MNEMONIC`);
+`address` holds the payment request. A settled invoice is final: the payment flips to `paid`
+immediately (`confirmations: 1`, `tx_hash` = the SDK payment id). Detection is pushed by SDK
+events, with a reconciliation poll as safety net for events missed across restarts. The SDK
+is disconnected cleanly on SIGINT/SIGTERM; a connection failure at boot only disables
+Lightning.
+
+Both reuse the existing `pending` / `paid` / `expired` webhooks unchanged (`network`:
+`bitcoin`/`lightning`, `token`: `BTC`, `amount` in BTC, `amount_raw` in sats).
+
+### Custody note
+
+On-chain BTC stays on addresses derived from `WALLET_MNEMONIC` — recoverable from the
+mnemonic alone, like USDT. Lightning funds live in the Breez/Spark wallet: recoverable from
+the same mnemonic **through the Spark SDK/protocol**, which is a different trust model
+(Spark L2). Enabling Lightning (`BREEZ_API_KEY`) must be an explicit, conscious operator
+choice.
 
 ## USDT contracts
 

@@ -26,3 +26,5 @@ Thumbs.db
 # Dashboard (Node)
 apps/dashboard/node_modules/
 apps/dashboard/dist/
+# Breez SDK (Lightning) local wallet storage
+.breez-data/

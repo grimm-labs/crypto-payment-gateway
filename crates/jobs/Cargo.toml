@@ -12,6 +12,7 @@ chrono.workspace = true
 config = { workspace = true }
 db = { workspace = true }
 domain = { workspace = true }
+lightning-client = { workspace = true }
 redis.workspace = true
 reqwest.workspace = true
 rust_decimal.workspace = true

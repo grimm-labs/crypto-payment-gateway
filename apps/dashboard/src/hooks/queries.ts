@@ -135,9 +135,14 @@ export function usePayment(id: string | undefined) {
 export interface CreatePaymentPayload {
   network: string
   token: string
-  expected_amount: string
+  /** Decimal string — USDT networks only. */
+  expected_amount?: string
+  /** Integer sats string — bitcoin/lightning only. */
+  expected_amount_sats?: string
   expires_at?: string
   metadata?: Record<string, unknown>
+  /** Lightning only: BOLT11 memo (≤ 128 chars). */
+  description?: string
 }
 
 export function useCreatePayment() {

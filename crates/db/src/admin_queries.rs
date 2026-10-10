@@ -97,6 +97,7 @@ pub struct AdminStats {
     pub addresses_expired: i64,
     pub deposits_detected: i64,
     pub deposits_confirmed: i64,
+    /// USDT only — BTC deposits are counted but never summed in.
     pub confirmed_volume: Decimal,
     pub webhooks_pending: i64,
     pub webhooks_delivered: i64,
@@ -165,15 +166,18 @@ impl Db {
     }
 
     /// Confirmed deposits per day over the trailing window (days with no
-    /// deposits are absent — callers fill the gaps).
+    /// deposits are absent — callers fill the gaps). `count` covers every
+    /// token; `volume` is USDT only (never mix sats into a USDT figure).
     pub async fn deposits_timeseries(&self, days: i32) -> Result<Vec<DailyDepositStat>> {
         let rows: Vec<(String, i64, Decimal)> = sqlx::query_as(
             r#"
-            SELECT to_char(date_trunc('day', "confirmedAt"), 'YYYY-MM-DD') AS date,
-                   COUNT(*), COALESCE(SUM(amount), 0)
-            FROM deposits
-            WHERE status = 'CONFIRMED'::"DepositStatus"
-              AND "confirmedAt" >= (NOW() AT TIME ZONE 'UTC') - make_interval(days => $1)
+            SELECT to_char(date_trunc('day', d."confirmedAt"), 'YYYY-MM-DD') AS date,
+                   COUNT(*),
+                   COALESCE(SUM(d.amount) FILTER (WHERE a.token = 'USDT'::"Token"), 0)
+            FROM deposits d
+            JOIN deposit_addresses a ON a.id = d."depositAddressId"
+            WHERE d.status = 'CONFIRMED'::"DepositStatus"
+              AND d."confirmedAt" >= (NOW() AT TIME ZONE 'UTC') - make_interval(days => $1)
             GROUP BY 1
             ORDER BY 1
             "#,
@@ -217,7 +221,11 @@ impl Db {
         }
 
         let (volume,): (Decimal,) = sqlx::query_as(
-            r#"SELECT COALESCE(SUM(amount), 0) FROM deposits WHERE status = 'CONFIRMED'::"DepositStatus""#,
+            r#"
+            SELECT COALESCE(SUM(d.amount), 0) FROM deposits d
+            JOIN deposit_addresses a ON a.id = d."depositAddressId"
+            WHERE d.status = 'CONFIRMED'::"DepositStatus" AND a.token = 'USDT'::"Token"
+            "#,
         )
         .fetch_one(&self.pool)
         .await?;

@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+bech32.workspace = true
 bip39.workspace = true
 bs58.workspace = true
 domain = { workspace = true }
@@ -14,6 +15,7 @@ hex.workspace = true
 hmac.workspace = true
 k256.workspace = true
 pbkdf2.workspace = true
+ripemd.workspace = true
 sha2.workspace = true
 sha3.workspace = true
 solana-sdk.workspace = true

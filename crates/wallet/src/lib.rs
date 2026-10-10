@@ -3,6 +3,7 @@ use domain::Network;
 use ed25519_dalek::SigningKey;
 use hmac::{Hmac, Mac};
 use k256::ecdsa::SigningKey as EthSigningKey;
+use ripemd::Ripemd160;
 use sha2::{Digest, Sha256, Sha512};
 use sha3::Keccak256;
 use solana_sdk::pubkey::Pubkey;
@@ -42,7 +43,17 @@ impl WalletService {
             Network::Ethereum => self.derive_ethereum(index),
             Network::Tron => self.derive_tron(index),
             Network::Solana => self.derive_solana_ata(index),
+            Network::Bitcoin => self.derive_bitcoin(index),
+            Network::Lightning => Err(WalletError::Derivation(
+                "lightning has no derived address".into(),
+            )),
         }
+    }
+
+    /// BIP84 native SegWit: P2WPKH bech32 (`bc1q…`) at `m/84'/0'/0'/0/{index}`.
+    fn derive_bitcoin(&self, index: u32) -> Result<String, WalletError> {
+        let sk = self.derive_secp256k1_key(&format!("m/84'/0'/0'/0/{index}"))?;
+        p2wpkh_address(&sk)
     }
 
     fn derive_ethereum(&self, index: u32) -> Result<String, WalletError> {
@@ -74,12 +85,16 @@ impl WalletService {
     }
 
     fn derive_eth_signing_key(&self, index: u32) -> Result<EthSigningKey, WalletError> {
+        self.derive_secp256k1_key(&format!("m/44'/60'/0'/0/{index}"))
+    }
+
+    /// Generic BIP32 secp256k1 derivation (shared by ETH/Tron and Bitcoin).
+    fn derive_secp256k1_key(&self, path: &str) -> Result<EthSigningKey, WalletError> {
         let seed = Mnemonic::parse_in_normalized(Language::English, &self.mnemonic)
             .map_err(|_| WalletError::InvalidMnemonic)?
             .to_seed("");
 
-        let path = format!("m/44'/60'/0'/0/{index}");
-        let xprv = ExtendedPrivKey::derive(&seed, path.as_str())
+        let xprv = ExtendedPrivKey::derive(&seed, path)
             .map_err(|e| WalletError::Derivation(format!("{e:?}")))?;
         EthSigningKey::from_slice(&xprv.secret())
             .map_err(|e| WalletError::Derivation(e.to_string()))
@@ -132,6 +147,14 @@ fn tron_address_from_key(sk: &EthSigningKey) -> String {
     let checksum = Sha256::digest(Sha256::digest(&payload));
     payload.extend_from_slice(&checksum[..4]);
     bs58::encode(payload).into_string()
+}
+
+/// `bech32(hrp="bc", witness v0, hash160(compressed pubkey))`.
+fn p2wpkh_address(sk: &EthSigningKey) -> Result<String, WalletError> {
+    let compressed = sk.verifying_key().to_encoded_point(true);
+    let hash160 = Ripemd160::digest(Sha256::digest(compressed.as_bytes()));
+    bech32::segwit::encode(bech32::hrp::BC, bech32::segwit::VERSION_0, &hash160)
+        .map_err(|e| WalletError::Derivation(e.to_string()))
 }
 
 /// SLIP-0010 ed25519 derivation matching `ed25519-hd-key`.
@@ -213,6 +236,31 @@ mod tests {
             wallet.derive_address(Network::Tron, 1).unwrap(),
             "TL9gR3f4FgNa9VZAsPt6xuKXPrfWAUJ5MW"
         );
+    }
+
+    #[test]
+    fn derives_bitcoin_bip84_golden() {
+        // BIP84 reference vectors for the standard test mnemonic.
+        let wallet = WalletService::from_mnemonic(TEST_MNEMONIC).unwrap();
+        assert_eq!(
+            wallet.derive_address(Network::Bitcoin, 0).unwrap(),
+            "bc1qcr8te4kr609gcawutmrza0j4xv80jy8z306fyu"
+        );
+        assert_eq!(
+            wallet.derive_address(Network::Bitcoin, 1).unwrap(),
+            "bc1qnjg0jd8228aq7egyzacy8cys3knf9xvrerkf9g"
+        );
+    }
+
+    #[test]
+    fn lightning_has_no_derived_address() {
+        let wallet = WalletService::from_mnemonic(TEST_MNEMONIC).unwrap();
+        match wallet.derive_address(Network::Lightning, 0) {
+            Err(WalletError::Derivation(msg)) => {
+                assert_eq!(msg, "lightning has no derived address")
+            }
+            other => panic!("expected a derivation error, got {other:?}"),
+        }
     }
 
     #[test]

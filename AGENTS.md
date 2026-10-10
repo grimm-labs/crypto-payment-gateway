@@ -4,7 +4,7 @@ Guidance for AI coding agents working in this repository.
 
 ## What this project is
 
-A Rust service that accepts **USDT deposits** on **Tron (TRC-20)**, **Ethereum (ERC-20)**, and **Solana (SPL)**. It derives a unique deposit address per payment from a single custodial HD wallet (`WALLET_MNEMONIC`), polls the blockchains for incoming transfers, confirms deposits, and sends payment-lifecycle webhooks — `PENDING` (address created), `PAID` (deposit confirmed), `EXPIRED` — to every active endpoint **subscribed to that event** (managed in the dashboard, stored in `webhook_endpoints` with an `events` array — no env var). Storage is PostgreSQL (sqlx); Redis backs the webhook queue, cached wallet balances, and staff refresh tokens.
+A Rust service that accepts **USDT deposits** on **Tron (TRC-20)**, **Ethereum (ERC-20)**, and **Solana (SPL)**, plus **BTC** on **Bitcoin** (on-chain, BIP84) and **Lightning** (BOLT11 invoices via the Breez SDK Spark). It derives a unique deposit address per payment from a single custodial HD wallet (`WALLET_MNEMONIC`) — or, for Lightning, issues an invoice — polls the blockchains for incoming transfers, confirms deposits, and sends payment-lifecycle webhooks — `PENDING` (address created), `PAID` (deposit confirmed), `EXPIRED` — to every active endpoint **subscribed to that event** (managed in the dashboard, stored in `webhook_endpoints` with an `events` array — no env var). Storage is PostgreSQL (sqlx); Redis backs the webhook queue, cached wallet balances, and staff refresh tokens.
 
 An **admin dashboard** lives in `apps/dashboard` (Vite + React 19 + TypeScript + Tailwind v4 + shadcn/ui): wallet balances, payment/webhook monitoring and retry, API key and staff management. It talks exclusively to `/api/admin/v1` with the acting staff member's JWT (`Authorization: Bearer`). Merchant endpoints under `/api/v1` require an `x-api-key` created from the dashboard.
 
@@ -12,17 +12,18 @@ Scope today: **inbound deposit detection + webhooks + admin dashboard**. No outb
 
 ## Architecture
 
-Cargo workspace of 9 crates under `crates/` (version, edition, and all dependency versions are set in the root `Cargo.toml` via `[workspace.package]` / `[workspace.dependencies]` — never pin versions in a member crate), plus the dashboard SPA under `apps/dashboard`:
+Cargo workspace of 10 crates under `crates/` (version, edition, and all dependency versions are set in the root `Cargo.toml` via `[workspace.package]` / `[workspace.dependencies]` — never pin versions in a member crate), plus the dashboard SPA under `apps/dashboard`:
 
 | Crate | Role |
 |---|---|
 | `config` | `AppConfig::from_env()`, shared constants (USDT contracts, `WEBHOOK_MAX_ATTEMPTS = 5`, decimals), RPC URL builders, Redis key prefixing |
 | `domain` | Pure types: `Network`, `Token`, statuses, `StaffRole`, `DomainError`, amount conversion/tolerance helpers. No I/O, no async |
-| `wallet` | HD derivation from BIP39 mnemonic. ETH/Tron via BIP44 `m/44'/60'/0'/0/{index}` (secp256k1); Solana via SLIP-0010 `m/44'/501'/{index}'/0'` (ed25519), returning the USDT **associated token account** address |
+| `wallet` | HD derivation from BIP39 mnemonic. ETH/Tron via BIP44 `m/44'/60'/0'/0/{index}` (secp256k1); Bitcoin via BIP84 `m/84'/0'/0'/0/{index}` (P2WPKH `bc1q…`); Solana via SLIP-0010 `m/44'/501'/{index}'/0'` (ed25519), returning the USDT **associated token account** address. Lightning has no derived address (error) |
 | `auth` | Pure auth primitives (no I/O, no async): argon2id password hashing, HS256 JWT issue/decode, refresh-token and API-key generation + SHA-256 hashing, constant-time comparison |
 | `db` | `Db` wrapper over a `PgPool`, row structs, all SQL queries, sqlx migrations (`crates/db/migrations/`). Split into `lib.rs` (payments/webhooks) + `staff.rs`, `api_keys.rs`, `admin_queries.rs`, `settings.rs`, `webhook_endpoints.rs`, `api_traffic.rs` (request log + aggregates) |
-| `chain` | HTTP clients for TronGrid, Alchemy (Ethereum JSON-RPC), Helius (Solana): transfer polling + USDT balance fetches, Tron rate-limit backoff |
-| `jobs` | `AppState` (shared by API + workers), background workers (`spawn_workers`): one monitor loop per network, webhook delivery loop, hourly wallet-balance sync, API traffic writer + retention purge (`traffic.rs`, `TrafficRecorder`); deposit confirmation logic (`process_detected_transfer`); manual retriggers (`retrigger_webhook`, `retrigger_failed_webhooks`) |
+| `chain` | HTTP clients for TronGrid, Alchemy (Ethereum JSON-RPC), Helius (Solana), Esplora (Bitcoin, `esplora.rs`): transfer polling + balance fetches, Tron rate-limit backoff, `confirmations_between` (saturating) |
+| `lightning` | **Package `lightning-client`** (`lightning` clashes with LDK's crate in the graph — use `-p lightning-client`). Thin Breez SDK Spark wrapper: SDK calls go through the `LightningOps` trait (mocked with mockall in tests), `LightningClient` maps requests and filters received Lightning payments. `jobs`/`api` never touch SDK types |
+| `jobs` | `AppState` (shared by API + workers; `lightning: Option<LightningClient>`, `None` = disabled), background workers (`spawn_workers`): one monitor loop per network (Lightning's reconciles from the Breez payment list), the Lightning event loop, webhook delivery loop, hourly wallet-balance sync, API traffic writer + retention purge (`traffic.rs`, `TrafficRecorder`); deposit confirmation logic (`process_detected_transfer`); manual retriggers (`retrigger_webhook`, `retrigger_failed_webhooks`) |
 | `api` | Axum router: `/healthz`, `/readyz`, `/api/v1/*` (guarded by `x-api-key`), `/api/admin/v1/*` (guarded by staff JWT; admin-only sub-routes for staff/API keys); `middleware.rs` (guards) + `traffic.rs` (request-log middleware) + `admin.rs` (dashboard handlers); `ApiError` (`{"statusCode": ..., "message": ...}`) |
 | `gateway` | The binary. Wires config → wallet → db (+ migrations) → redis → chain → workers → HTTP server |
 
@@ -40,8 +41,8 @@ cargo run -p gateway
 # Dashboard dev server (proxies /api to localhost:3000)
 cd apps/dashboard && npm install && npm run dev
 
-# Tests — this is exactly what CI runs; keep it green
-cargo test -p domain -p wallet -p config -p jobs -p auth -p api
+# Tests — this is exactly what CI runs; keep it green (building needs `protoc` for the Breez SDK)
+cargo test -p domain -p wallet -p config -p chain -p lightning-client -p jobs -p auth -p api
 
 # Type-check + build the dashboard
 cd apps/dashboard && npm run build
@@ -53,15 +54,16 @@ cargo build --release -p gateway
 docker compose up --build
 ```
 
-Migrations run automatically at boot via `sqlx::migrate!` (failure is logged as a warning, not fatal). There are **no DB integration tests** — unit tests live in `domain`, `wallet` (BIP39/HD golden vectors, amount tolerance, enum roundtrips), `config`, `auth`, `jobs` (traffic queue) and `api` (traffic middleware via `tower::ServiceExt::oneshot`). If you change derivation logic, the golden-vector tests in `crates/wallet/src/lib.rs` must still pass byte-for-byte.
+Migrations run automatically at boot via `sqlx::migrate!` (failure is logged as a warning, not fatal). There are **no DB integration tests** — unit tests live in `domain`, `wallet` (BIP39/BIP84/HD golden vectors), `config` (via `AppConfig::from_lookup`, never the process env), `chain` (Esplora parsing, confirmation math), `lightning-client` (mocked `LightningOps`), `auth`, `jobs` (traffic queue, Lightning matching, token totals) and `api` (request validation, traffic middleware via `tower::ServiceExt::oneshot`). If you change derivation logic, the golden-vector tests in `crates/wallet/src/lib.rs` must still pass byte-for-byte.
 
 ## Conventions
 
 - **DB naming is Prisma-style**: tables snake_case, columns **camelCase** and quoted (`"derivationIndex"`, `"expiresAt"`), Postgres enums PascalCase (`"Network"`). Rust row structs map them with `#[sqlx(rename = "...")]`. New SQL must follow this style, and enum values must be cast (`$1::"Network"`).
 - **Three casings for enums** — keep them straight: DB values are UPPERCASE (`TRON`, `PENDING`), API strings are lowercase (`tron`, `pending`). Always convert through the `as_db` / `as_api` / `from_db` / `parse_api` methods in `domain`; never hand-write status strings.
-- **Amounts**: `amount_raw` is the integer string in token base units (USDT = 6 decimals); `amount` is a `Decimal`. Convert with `domain::raw_to_decimal*` — never through floats. Matching against `expected_amount` uses `is_amount_within_tolerance` (`AMOUNT_TOLERANCE_PERCENT`, default 1%).
+- **Amounts**: `amount_raw` is the integer string in token base units (`Token::decimals()`: USDT 6, BTC 8 = sats); `amount` is a `Decimal` in `DECIMAL(24,8)` columns. Convert with `domain::raw_to_decimal*(raw, token)` / `decimal_to_raw` — never through floats — passing the token of the row. Outward-facing deposit amounts go through `format_amount` (token-scale rendering, keeps USDT's historical `25.000000`). Matching against `expected_amount` uses `is_amount_within_tolerance` (`AMOUNT_TOLERANCE_PERCENT`, default 1%). Totals are per token: sats never enter `total_usdt` / `confirmed_volume` (USDT-only), BTC goes to `total_btc`.
+- **Network ↔ token**: each network receives one token (`Network::token()`, `domain::supports`). BTC networks take `expected_amount_sats` (integer string) and reject `expected_amount`; USDT networks the reverse.
 - **Redis keys** are always built via `config.redis_key(suffix)` → `stablecoin-payment-service-{APP_ENV}:{suffix}`. Never hardcode a full key.
-- **Config**: all tuning goes through env vars read in `crates/config/src/lib.rs` (with defaults) and documented in the README table. Missing provider API keys must *disable* the corresponding network with a startup warning, not crash.
+- **Config**: all tuning goes through env vars read in `crates/config/src/lib.rs` (with defaults) and documented in the README table. Missing provider API keys must *disable* the corresponding network with a startup warning, not crash — likewise an unset `BITCOIN_ESPLORA_BASE_URL` disables Bitcoin and an unset `BREEZ_API_KEY` (or a failed SDK connect) disables Lightning.
 - Errors: `anyhow` at boundaries, `thiserror` enums inside `domain`/`wallet`. API errors go through `ApiError` so the JSON shape stays `{"statusCode", "message"}`.
 - Logging via `tracing`. **Never log the mnemonic or provider API keys.**
 
@@ -71,14 +73,15 @@ Migrations run automatically at boot via `sqlx::migrate!` (failure is logged as 
 - **Event subscriptions**: `webhook_endpoints.events` (TEXT[], DB values `PENDING`/`PAID`/`EXPIRED`) gates every fan-out AND every delivery attempt (`deliver_webhook` re-checks it, like `isActive`). Payload `event_type` values are `payment_pending`, `deposit_confirmed` (historical name — never rename), `payment_expired`. PENDING fires on address creation (API handler), EXPIRED from `expire_addresses_and_notify` (called by monitor loops and the list endpoint), PAID at deposit confirmation.
 - **Per-endpoint deliveries**: PAID deliveries are tracked per (deposit, endpoint) pair; PENDING/EXPIRED per (address, event, endpoint) with `depositId` NULL. The authoritative row is the newest per key (`DISTINCT ON ("depositAddressId", "eventType", "depositId", "webhookEndpointId")`). Rows with a NULL `webhookEndpointId` are pre-multi-endpoint history. Redis ZSET members are `"{deposit_id}|{endpoint_id}"` for PAID and `"{EVENT}|{address_id}|{endpoint_id}"` for address events; a bare member (no `|`) is legacy and gets fanned out to all active PAID endpoints by `webhook_loop`. No active endpoints = webhooks silently disabled (503 only on manual retry).
 - **Admin-managed settings**: default payment expiry is `app_settings.depositExpiryMinutes` (default 60, max 1440), not an env var. Likewise the traffic-log retention is `app_settings.apiTrafficRetentionDays` (default 730; `0` = keep forever, surfaced as `null` in the API), re-read by the purge loop on every hourly tick.
-- **API traffic log** (`api_requests`, Dashboard → Traffic): the `record_traffic` middleware must stay *outside* the auth guards in `router()` (added after both `nest`s, via `.layer` not `.route_layer`) so it sees rejected requests and the identity the guards copy into the **response** extensions (`CurrentApiKey` / `CurrentStaff`). It stores the matched route template, never the raw path or bodies, and **never the raw `x-api-key`** — only `apiKeyId`. Recording is a non-blocking `try_send` into a bounded channel; drops are counted and exposed as `dropped_events`. `/api/v1` is the `MERCHANT` surface, `/api/admin/v1` is `ADMIN` (the dashboard's own polling — hidden by default in the UI); health checks are not recorded.
+- **API traffic log** (`api_requests`, Dashboard → Traffic): the `record_traffic` middleware must stay *outside* the auth guards in `router()` (added after both `nest`s, via `.layer` not `.route_layer`) so it sees rejected requests and the identity the guards copy into the **response** extensions (`CurrentApiKey` / `CurrentStaff`). It stores the matched route template, never the raw path or bodies, and **never the raw `x-api-key`** — only `apiKeyId`. The client IP honours forwarding headers only when the TCP peer is in `TRUSTED_PROXIES` (then the **last** `X-Forwarded-For` hop); otherwise it is the socket address. Recording is a non-blocking `try_send` into a bounded channel; drops are counted and exposed as `dropped_events`. `/api/v1` is the `MERCHANT` surface, `/api/admin/v1` is `ADMIN` (the dashboard's own polling — hidden by default in the UI); health checks are not recorded.
 - **API key format**: `[{tag}_]{8 alnum}_{40 alnum}`. The tag is `app_settings.apiKeyPrefix` (≤ 5 alphanumeric chars, empty = no tag) and only affects newly generated keys. `auth::parse_api_key_prefix` is deliberately tag-agnostic (splits on the last `_`) so keys issued under any past tag — including the historic `spg` — keep validating after the setting changes. Never re-tighten it to a specific tag.
 - **API key expiry**: `api_keys.expiresAt` (NULL = never) with status machine `ACTIVE`/`REVOKED`/`EXPIRED`. Enforcement is two-level: `find_api_key_by_prefix` rejects past-deadline keys immediately (the security boundary), while `api_key_expiry_loop` (5 min, first run at boot) only materializes `EXPIRED` for listings/stats. List handlers derive the displayed status so a key can never show `active` after its deadline, even between sweeps.
-- **Confirmation thresholds**: Tron 19, Ethereum 12 (env-overridable), Solana hardcoded to 1 (`domain::required_confirmations`).
+- **Confirmation thresholds**: Tron 19, Ethereum 12, Bitcoin 3 (env-overridable: `BTC_CONFIRMATIONS`), Solana hardcoded to 1, Lightning 1 (a settled payment is final) — `domain::required_confirmations`.
+- **Lightning rows**: `deposit_addresses.address` holds the BOLT11 payment request (matched by exact string) and `deposits.txHash` holds the SDK `Payment.id` — no dedicated payment-hash column. Two detection paths (SDK `PaymentSucceeded` events + a reconciliation poll from the oldest pending invoice) both converge on `process_detected_transfer`, made idempotent by the (address, txHash) upsert. SDK error strings are logged, never returned to clients. Merchant webhooks stay on the gateway's own queue — SDK events only feed detection.
 - **Webhook delivery**: max 5 attempts (`WEBHOOK_MAX_ATTEMPTS`), ~2s loop, 10s HTTP timeout, only the *last* response/error is stored. Each event's delivery is enqueued once when it fires; already-`DELIVERED` keys are skipped.
 - **Webhook signing**: `webhook_endpoints.secret` is stored in clear (HMAC needs it) but is **write-only through the API** — responses only carry `has_secret`; never serialize `WebhookEndpointRow.secret` into a handler response. The `X-Webhook-Signature` header (`sha256=<hex>`, `auth::webhook_signature`) is computed over the exact body bytes sent — the payload is serialized once with `serde_json::to_vec` and that same buffer is signed and sent; never re-serialize separately.
 - Two independent status machines: deposit (`DETECTED` → `CONFIRMED`) tracks on-chain state; webhook (`PENDING`/`DELIVERED`/`FAILED`) tracks HTTP notification state. Never let one mutate the other.
-- `deposits.txHash` is globally unique; derivation indices are allocated per network as `max + 1`.
+- A deposit is unique per `("depositAddressId", "txHash")` (one Bitcoin tx can pay several gateway addresses) — look deposits up by both; derivation indices are allocated per network as `max + 1` (Lightning too, though no key depends on it).
 - Polling loops sleep `ADDRESS_REQUEST_DELAY_MS` (300ms) between addresses to respect provider rate limits; TronGrid additionally has an explicit backoff on 429s in `chain`.
 
 ## Specs in `docs/`
@@ -91,9 +94,10 @@ This is a **custodial hot-wallet** service — treat everything key-related as s
 
 - Never commit `.env`, real mnemonics, API keys, or production credentials. `.env.example` only uses the well-known BIP39 test vector (`abandon … about`).
 - Address derivation must remain deterministic — changing paths or hashing breaks recovery of funds on already-issued addresses.
+- The Breez SDK is seeded with the same `WALLET_MNEMONIC` (Spark paths do not collide with BIP44/84). Lightning funds sit in the Spark L2 wallet, a different custody model (README → Custody note); its storage (`BREEZ_STORAGE_DIR`, absolute) must persist, and `gateway` disconnects the SDK on SIGINT/SIGTERM.
 
 ## Git / CI / releases
 
-- CI (`.github/workflows/ci.yml`) runs on every push/PR: `cargo test -p domain -p wallet` then `cargo build --release -p gateway`.
+- CI (`.github/workflows/ci.yml`) runs on every push/PR: the test command above, then `cargo build --release -p gateway`. The shared `setup-rust` action installs `protoc`.
 - Releases are **manual** via the "New App Version" workflow (`workflow_dispatch`): it bumps the workspace version with `cargo set-version`, commits `chore: release vX.Y.Z`, tags, and publishes the Docker image. Never bump the version or create tags by hand.
 - Do not commit or push unless the user asks. Keep PRs scoped to one concern; add tests when changing `domain` or `wallet` logic.

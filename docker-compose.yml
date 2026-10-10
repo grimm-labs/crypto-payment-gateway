@@ -44,8 +44,12 @@ services:
       APP_ENV: development
       DATABASE_URL: postgresql://postgres:postgres@postgres:5432/stablecoin_payment
       REDIS_URL: redis://redis:6379
+      BREEZ_STORAGE_DIR: /app/.breez-data
     ports:
       - "${PORT:-3000}:${PORT:-3000}"
+    volumes:
+      # Breez SDK (Lightning) wallet storage — must survive restarts.
+      - breez_data:/app/.breez-data
     depends_on:
       postgres:
         condition: service_healthy
@@ -68,3 +72,4 @@ services:
 volumes:
   postgres_data:
   redis_data:
+  breez_data:

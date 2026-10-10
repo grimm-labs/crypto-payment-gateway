@@ -35,7 +35,21 @@ import {
 import { usePayment, useRetryWebhook } from "@/hooks/queries"
 import { formatAmount, formatDate, networkLabel, shortHash } from "@/lib/format"
 
-function AddressQrDialog({ address, label }: { address: string; label: string }) {
+/** BOLT11 QRs encode the uppercased invoice behind a `lightning:` URI —
+ *  uppercase fits QR alphanumeric mode (denser, easier to scan). */
+function qrValue(address: string, isLightning: boolean): string {
+  return isLightning ? `lightning:${address.toUpperCase()}` : address
+}
+
+function AddressQrDialog({
+  address,
+  label,
+  isLightning,
+}: {
+  address: string
+  label: string
+  isLightning: boolean
+}) {
   return (
     <Dialog>
       <DialogTrigger asChild>
@@ -45,13 +59,13 @@ function AddressQrDialog({ address, label }: { address: string; label: string })
       </DialogTrigger>
       <DialogContent className="sm:max-w-sm">
         <DialogHeader>
-          <DialogTitle>Deposit address</DialogTitle>
+          <DialogTitle>{isLightning ? "Payment request" : "Deposit address"}</DialogTitle>
           <DialogDescription>{label}</DialogDescription>
         </DialogHeader>
         <div className="flex justify-center py-2">
           {/* White backing so the QR scans in dark mode too. */}
           <div className="rounded-lg bg-white p-3">
-            <QRCodeSVG value={address} size={224} />
+            <QRCodeSVG value={qrValue(address, isLightning)} size={224} />
           </div>
         </div>
         <code className="break-all text-center text-xs text-muted-foreground">
@@ -101,6 +115,7 @@ export function PaymentDetailPage() {
 
   const data = payment.data
   const metadata = JSON.stringify(data.metadata ?? {}, null, 2)
+  const isLightning = data.network === "lightning"
 
   return (
     <div className="space-y-6 p-4 lg:p-6">
@@ -117,7 +132,7 @@ export function PaymentDetailPage() {
       <div className="grid gap-6 lg:grid-cols-2">
         <Card>
           <CardHeader>
-            <CardTitle>Deposit address</CardTitle>
+            <CardTitle>{isLightning ? "Payment request" : "Deposit address"}</CardTitle>
             <CardDescription>
               {networkLabel(data.network)} · {data.token}
             </CardDescription>
@@ -130,6 +145,7 @@ export function PaymentDetailPage() {
             <AddressQrDialog
               address={data.address}
               label={`${networkLabel(data.network)} · ${data.token}`}
+              isLightning={isLightning}
             />
             <dl className="grid grid-cols-2 gap-x-4 gap-y-2 text-sm">
               <dt className="text-muted-foreground">Expected amount</dt>
@@ -160,7 +176,9 @@ export function PaymentDetailPage() {
         <CardHeader>
           <CardTitle>Deposits</CardTitle>
           <CardDescription>
-            On-chain transfers detected for this address, with their webhook state.
+            {isLightning
+              ? "Lightning payments settling this invoice, with their webhook state."
+              : "On-chain transfers detected for this address, with their webhook state."}
           </CardDescription>
         </CardHeader>
         <CardContent>
@@ -172,7 +190,7 @@ export function PaymentDetailPage() {
             <Table>
               <TableHeader>
                 <TableRow>
-                  <TableHead>Tx hash</TableHead>
+                  <TableHead>{isLightning ? "Payment id" : "Tx hash"}</TableHead>
                   <TableHead>Amount</TableHead>
                   <TableHead>Confirmations</TableHead>
                   <TableHead>Status</TableHead>

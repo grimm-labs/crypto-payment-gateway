@@ -3,10 +3,14 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use config::{AppConfig, USDT_ETH, USDT_SOLANA, USDT_TRON};
-use domain::Network;
+use domain::{Network, Token};
 use serde::Deserialize;
 use solana_sdk::pubkey::Pubkey;
 use tracing::{debug, warn};
+
+mod esplora;
+
+use esplora::{confirmed_balance_sats, esplora_transfers, EsploraAddress, EsploraTx};
 
 /// keccak256("Transfer(address,address,uint256)")
 const TRANSFER_TOPIC: &str =
@@ -38,18 +42,22 @@ impl ChainClients {
         }
     }
 
+    /// Lightning is never available here: it is served by the Breez SDK
+    /// client held in `AppState`, not by a chain provider.
     pub fn is_network_available(&self, network: Network) -> bool {
         match network {
             Network::Tron => self.config.trongrid_api_key.is_some(),
             Network::Ethereum => self.config.alchemy_api_key.is_some(),
             Network::Solana => self.config.helius_api_key.is_some(),
+            Network::Bitcoin => self.config.bitcoin_esplora_base_url.is_some(),
+            Network::Lightning => false,
         }
     }
 
     pub fn has_any_network_available(&self) -> bool {
-        self.is_network_available(Network::Tron)
-            || self.is_network_available(Network::Ethereum)
-            || self.is_network_available(Network::Solana)
+        [Network::Tron, Network::Ethereum, Network::Solana, Network::Bitcoin]
+            .into_iter()
+            .any(|network| self.is_network_available(network))
     }
 
     pub fn missing_key_message(&self, network: Network) -> &'static str {
@@ -57,6 +65,8 @@ impl ChainClients {
             Network::Tron => "TRONGRID_API_KEY not configured",
             Network::Ethereum => "ALCHEMY_API_KEY not configured",
             Network::Solana => "HELIUS_API_KEY not configured",
+            Network::Bitcoin => "BITCOIN_ESPLORA_BASE_URL not configured",
+            Network::Lightning => "BREEZ_API_KEY not configured",
         }
     }
 
@@ -65,7 +75,62 @@ impl ChainClients {
             Network::Tron => self.fetch_tron_balance(address).await,
             Network::Ethereum => self.fetch_eth_balance(address).await,
             Network::Solana => self.fetch_sol_balance(address).await,
+            Network::Bitcoin | Network::Lightning => {
+                anyhow::bail!("{} is not a USDT network", network.as_api())
+            }
         }
+    }
+
+    /// Confirmed on-chain balance of a Bitcoin address, in sats.
+    pub async fn fetch_btc_balance(&self, address: &str) -> Result<u128> {
+        let Some(url) = self.config.esplora_url(&format!("address/{address}")) else {
+            return Ok(0);
+        };
+        let account: EsploraAddress = self
+            .http
+            .get(url)
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        Ok(confirmed_balance_sats(&account))
+    }
+
+    /// Transfers to `address` among its most recent page of transactions
+    /// (mempool + last 25 confirmed — no pagination, see the spec).
+    pub async fn poll_bitcoin_address(
+        &self,
+        address: &str,
+    ) -> Result<Vec<DetectedOnChainTransfer>> {
+        let (Some(tip_url), Some(txs_url)) = (
+            self.config.esplora_url("blocks/tip/height"),
+            self.config.esplora_url(&format!("address/{address}/txs")),
+        ) else {
+            debug!("Skipping Bitcoin monitor — BITCOIN_ESPLORA_BASE_URL not set");
+            return Ok(vec![]);
+        };
+
+        let tip: u64 = self
+            .http
+            .get(tip_url)
+            .send()
+            .await?
+            .error_for_status()?
+            .text()
+            .await?
+            .trim()
+            .parse()
+            .context("Esplora returned an invalid tip height")?;
+        let txs: Vec<EsploraTx> = self
+            .http
+            .get(txs_url)
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        Ok(esplora_transfers(txs, address, tip))
     }
 
     pub async fn poll_tron_address(&self, address: &str) -> Result<Vec<DetectedOnChainTransfer>> {
@@ -110,7 +175,7 @@ impl ChainClients {
                 continue;
             }
             let tx_block = tx.block_number.unwrap_or(current_block);
-            let confirmations = (current_block - tx_block + 1).max(1) as i32;
+            let confirmations = confirmations_between(current_block, tx_block);
             out.push(DetectedOnChainTransfer {
                 tx_hash: tx.transaction_id,
                 amount_raw: tx.value,
@@ -156,7 +221,7 @@ impl ChainClients {
             };
             let block_number = parse_hex_u64(&block_hex)?;
             let value = parse_hex_u128(&log.data)?;
-            let confirmations = (current_block - block_number + 1) as i32;
+            let confirmations = confirmations_between(current_block, block_number);
             out.push(DetectedOnChainTransfer {
                 tx_hash,
                 amount_raw: value.to_string(),
@@ -216,8 +281,8 @@ impl ChainClients {
                     .raw_token_amount
                     .and_then(|r| r.token_amount)
                     .unwrap_or_else(|| {
-                        ((transfer.token_amount.unwrap_or(0.0) * 1_000_000.0).round() as i64)
-                            .to_string()
+                        let unit = 10f64.powi(Token::Usdt.decimals() as i32);
+                        ((transfer.token_amount.unwrap_or(0.0) * unit).round() as i64).to_string()
                     });
                 out.push(DetectedOnChainTransfer {
                     tx_hash: parsed.signature.clone(),
@@ -360,6 +425,14 @@ impl ChainClients {
     }
 }
 
+/// Confirmations of a tx included at `tx_block` when the chain tip is
+/// `current_block`, counting the inclusion block itself. Never underflows
+/// (the tip may be read before a fresher tx list) and clamps to `i32::MAX`.
+pub fn confirmations_between(current_block: u64, tx_block: u64) -> i32 {
+    let confirmations = current_block.saturating_sub(tx_block).saturating_add(1);
+    i32::try_from(confirmations).unwrap_or(i32::MAX)
+}
+
 async fn eth_block_number(http: &reqwest::Client, rpc: &str) -> Result<u64> {
     let hex: String = eth_rpc(http, rpc, "eth_blockNumber", serde_json::json!([])).await?;
     parse_hex_u64(&hex)
@@ -482,4 +555,27 @@ struct HeliusTokenTransfer {
 struct HeliusRawAmount {
     #[serde(rename = "tokenAmount")]
     token_amount: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn confirmations_count_the_inclusion_block() {
+        assert_eq!(confirmations_between(100, 100), 1);
+        assert_eq!(confirmations_between(100, 98), 3);
+    }
+
+    #[test]
+    fn confirmations_never_underflow_when_tip_lags_the_tx_block() {
+        assert_eq!(confirmations_between(98, 100), 1);
+        assert_eq!(confirmations_between(0, u64::MAX), 1);
+    }
+
+    #[test]
+    fn confirmations_clamp_to_i32_max() {
+        assert_eq!(confirmations_between(u64::MAX, 0), i32::MAX);
+        assert_eq!(confirmations_between(i32::MAX as u64 + 10, 0), i32::MAX);
+    }
 }

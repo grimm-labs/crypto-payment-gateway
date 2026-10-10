@@ -1,9 +1,14 @@
 # Composite action shared by CI and release workflows.
 name: 'Setup Rust'
-description: 'Install Rust toolchain and enable cargo cache'
+description: 'Install Rust toolchain, protoc and enable cargo cache'
 runs:
   using: 'composite'
   steps:
+    # The Breez SDK (Lightning) compiles its gRPC protos with tonic-build.
+    - name: Install protoc
+      shell: bash
+      run: sudo apt-get update && sudo apt-get install -y --no-install-recommends protobuf-compiler
+
     - name: Install Rust toolchain
       uses: dtolnay/rust-toolchain@stable
 

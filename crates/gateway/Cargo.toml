@@ -17,6 +17,7 @@ config = { workspace = true }
 db = { workspace = true }
 dotenvy.workspace = true
 jobs = { workspace = true }
+lightning-client = { workspace = true }
 redis.workspace = true
 tokio.workspace = true
 tracing.workspace = true

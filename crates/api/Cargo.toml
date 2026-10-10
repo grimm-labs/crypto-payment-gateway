@@ -13,7 +13,9 @@ config = { workspace = true }
 db = { workspace = true }
 domain = { workspace = true }
 http.workspace = true
+ipnet.workspace = true
 jobs = { workspace = true }
+lightning-client = { workspace = true }
 redis.workspace = true
 rust_decimal.workspace = true
 serde.workspace = true
@@ -24,3 +26,6 @@ tower-http.workspace = true
 tracing.workspace = true
 uuid.workspace = true
 wallet = { workspace = true }
+
+[dev-dependencies]
+rust_decimal_macros.workspace = true
