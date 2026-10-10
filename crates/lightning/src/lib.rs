@@ -1,6 +1,7 @@
 //! Thin wrapper over the Breez SDK Spark so `jobs`/`api` never touch SDK
 //! types. Receive-only: per-payment BOLT11 invoices, the "payment received"
-//! event stream, a reconciliation listing and the wallet balance.
+//! event stream, a reconciliation listing, the wallet balance and its
+//! payment history.
 //!
 //! The SDK calls go through [`LightningOps`] (implemented for `BreezSdk`,
 //! mocked in tests); [`LightningClient`] holds the request mapping and the
@@ -12,7 +13,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use breez_sdk_spark::{
-    connect, default_config, BreezSdk, ConnectRequest, EventListener, GetInfoRequest,
+    connect, default_config, AssetFilter, BreezSdk, ConnectRequest, EventListener, GetInfoRequest,
     GetInfoResponse, ListPaymentsRequest, ListPaymentsResponse, Network, Payment,
     PaymentDetails, PaymentStatus, PaymentType, ReceivePaymentMethod, ReceivePaymentRequest,
     ReceivePaymentResponse, SdkError, SdkEvent, Seed,
@@ -92,6 +93,102 @@ pub struct ReceivedPayment {
     /// SDK `Payment.id`: stable, resolvable later through `get_payment`.
     pub payment_id: String,
     pub amount_sats: u128,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PaymentDirection {
+    Send,
+    Receive,
+}
+
+impl PaymentDirection {
+    pub fn as_api(&self) -> &'static str {
+        match self {
+            Self::Send => "send",
+            Self::Receive => "receive",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WalletPaymentStatus {
+    Completed,
+    Pending,
+    Failed,
+}
+
+impl WalletPaymentStatus {
+    pub fn as_api(&self) -> &'static str {
+        match self {
+            Self::Completed => "completed",
+            Self::Pending => "pending",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+/// One entry of the wallet's payment history (any direction, any status).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WalletPayment {
+    /// SDK `Payment.id` — `deposits.txHash` for gateway invoices.
+    pub id: String,
+    pub direction: PaymentDirection,
+    pub status: WalletPaymentStatus,
+    pub amount_sats: u128,
+    pub fees_sats: u128,
+    /// Unix seconds.
+    pub timestamp: u64,
+    /// `lightning`, `spark`, `token`, `deposit`, `withdraw` or `unknown`.
+    pub method: String,
+    /// BOLT11, for Lightning payments.
+    pub invoice: Option<String>,
+    /// BOLT11 memo, for Lightning payments.
+    pub description: Option<String>,
+    /// On-chain txid, for deposits into / withdrawals from the wallet.
+    pub tx_id: Option<String>,
+}
+
+impl From<Payment> for WalletPayment {
+    fn from(payment: Payment) -> Self {
+        let (invoice, description, tx_id) = match payment.details {
+            Some(PaymentDetails::Lightning {
+                invoice,
+                description,
+                ..
+            }) => (Some(invoice), description, None),
+            Some(PaymentDetails::Deposit { tx_id, .. } | PaymentDetails::Withdraw { tx_id }) => {
+                (None, None, Some(tx_id))
+            }
+            _ => (None, None, None),
+        };
+        Self {
+            id: payment.id,
+            direction: match payment.payment_type {
+                PaymentType::Send => PaymentDirection::Send,
+                PaymentType::Receive => PaymentDirection::Receive,
+            },
+            status: match payment.status {
+                PaymentStatus::Completed => WalletPaymentStatus::Completed,
+                PaymentStatus::Pending => WalletPaymentStatus::Pending,
+                PaymentStatus::Failed => WalletPaymentStatus::Failed,
+            },
+            amount_sats: payment.amount,
+            fees_sats: payment.fees,
+            timestamp: payment.timestamp,
+            method: payment.method.to_string(),
+            invoice,
+            description,
+            tx_id,
+        }
+    }
+}
+
+/// A page of the wallet history, newest first. The SDK reports no total, so
+/// paging is driven by `has_more`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WalletPaymentsPage {
+    pub payments: Vec<WalletPayment>,
+    pub has_more: bool,
 }
 
 #[derive(Clone)]
@@ -196,6 +293,35 @@ impl LightningClient {
             }
             offset += LIST_PAGE_SIZE;
         }
+    }
+
+    /// The wallet's bitcoin payment history (every direction and status —
+    /// including funds unrelated to gateway invoices), newest first. Token
+    /// payments are excluded: their amounts are not sats.
+    pub async fn list_payments(&self, offset: u32, limit: u32) -> Result<WalletPaymentsPage> {
+        let mut payments = self
+            .ops
+            .list_payments(ListPaymentsRequest {
+                type_filter: None,
+                status_filter: None,
+                asset_filter: Some(AssetFilter::Bitcoin),
+                payment_details_filter: None,
+                from_timestamp: None,
+                to_timestamp: None,
+                offset: Some(offset),
+                // One extra row tells whether another page exists.
+                limit: Some(limit.saturating_add(1)),
+                sort_ascending: Some(false),
+            })
+            .await
+            .context("Breez list_payments failed")?
+            .payments;
+        let has_more = payments.len() > limit as usize;
+        payments.truncate(limit as usize);
+        Ok(WalletPaymentsPage {
+            payments: payments.into_iter().map(WalletPayment::from).collect(),
+            has_more,
+        })
     }
 
     /// Wallet balance. Pass `ensure_synced = false` on hot paths.
@@ -499,6 +625,113 @@ mod tests {
         let payments = client.list_received_since(42).await.unwrap();
         assert_eq!(payments.len(), LIST_PAGE_SIZE as usize + 1);
         assert_eq!(payments.last().unwrap().payment_id, "last");
+    }
+
+    fn with_status(mut payment: Payment, status: PaymentStatus) -> Payment {
+        payment.status = status;
+        payment
+    }
+
+    #[tokio::test]
+    async fn history_lists_bitcoin_payments_newest_first_with_paging() {
+        let mut ops = MockLightningOps::new();
+        ops.expect_list_payments()
+            .withf(|request| {
+                request.offset == Some(40)
+                    // One extra row tells whether another page exists.
+                    && request.limit == Some(21)
+                    && request.sort_ascending == Some(false)
+                    && matches!(request.asset_filter, Some(AssetFilter::Bitcoin))
+                    // The whole wallet: every direction and status.
+                    && request.type_filter.is_none()
+                    && request.status_filter.is_none()
+                    && request.from_timestamp.is_none()
+            })
+            .times(1)
+            .returning(|_| {
+                Ok(ListPaymentsResponse {
+                    payments: (0..21).map(|i| received(&format!("p{i}"), "lnbc1")).collect(),
+                })
+            });
+        let client = LightningClient::new(Arc::new(ops));
+        let page = client.list_payments(40, 20).await.unwrap();
+        assert_eq!(page.payments.len(), 20);
+        assert!(page.has_more);
+        assert_eq!(page.payments[0].id, "p0");
+    }
+
+    #[tokio::test]
+    async fn history_last_page_has_no_more() {
+        let mut ops = MockLightningOps::new();
+        ops.expect_list_payments()
+            .returning(|_| Ok(ListPaymentsResponse { payments: vec![received("only", "lnbc1")] }));
+        let client = LightningClient::new(Arc::new(ops));
+        let page = client.list_payments(0, 20).await.unwrap();
+        assert_eq!(page.payments.len(), 1);
+        assert!(!page.has_more);
+    }
+
+    #[test]
+    fn history_entry_keeps_direction_status_amounts_and_references() {
+        let mut lightning = received("pay-1", "lnbc1500u1invoice");
+        lightning.fees = 3;
+        lightning.details = match lightning.details {
+            Some(PaymentDetails::Lightning { invoice, destination_pubkey, htlc_details, .. }) => {
+                Some(PaymentDetails::Lightning {
+                    description: Some("order #123".into()),
+                    invoice,
+                    destination_pubkey,
+                    htlc_details,
+                    lnurl_pay_info: None,
+                    lnurl_withdraw_info: None,
+                    lnurl_receive_metadata: None,
+                    conversion_info: None,
+                })
+            }
+            other => other,
+        };
+        assert_eq!(
+            WalletPayment::from(lightning),
+            WalletPayment {
+                id: "pay-1".into(),
+                direction: PaymentDirection::Receive,
+                status: WalletPaymentStatus::Completed,
+                amount_sats: 150_000,
+                fees_sats: 3,
+                timestamp: 1_700_000_000,
+                method: "lightning".into(),
+                invoice: Some("lnbc1500u1invoice".into()),
+                description: Some("order #123".into()),
+                tx_id: None,
+            }
+        );
+
+        let sent = with_status(
+            payment("pay-2", PaymentType::Send, Some(lightning_details("lnbc1out"))),
+            PaymentStatus::Failed,
+        );
+        let sent = WalletPayment::from(sent);
+        assert_eq!(sent.direction, PaymentDirection::Send);
+        assert_eq!(sent.status, WalletPaymentStatus::Failed);
+        assert_eq!(sent.invoice.as_deref(), Some("lnbc1out"));
+
+        let mut deposit = with_status(
+            payment(
+                "pay-3",
+                PaymentType::Receive,
+                Some(PaymentDetails::Deposit { tx_id: "btc-tx".into(), vout: 1 }),
+            ),
+            PaymentStatus::Pending,
+        );
+        deposit.method = PaymentMethod::Deposit;
+        let deposit = WalletPayment::from(deposit);
+        assert_eq!(deposit.status, WalletPaymentStatus::Pending);
+        assert_eq!(deposit.method, "deposit");
+        assert_eq!(deposit.tx_id.as_deref(), Some("btc-tx"));
+        assert_eq!(deposit.invoice, None);
+
+        let bare = WalletPayment::from(payment("pay-4", PaymentType::Receive, None));
+        assert_eq!((bare.invoice, bare.description, bare.tx_id), (None, None, None));
     }
 
     #[tokio::test]

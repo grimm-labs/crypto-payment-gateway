@@ -170,6 +170,38 @@ export interface WalletBalances {
   updated_at?: string | null
 }
 
+export type LightningDirection = "send" | "receive"
+export type LightningPaymentStatus = "completed" | "pending" | "failed"
+
+/** One entry of the Breez/Spark wallet history (any direction, any status). */
+export interface LightningPayment {
+  id: string
+  direction: LightningDirection
+  status: LightningPaymentStatus
+  /** BTC decimal string. */
+  amount: string
+  amount_sats: string
+  fees_sats: string
+  /** lightning | spark | token | deposit | withdraw | unknown */
+  method: string
+  /** BOLT11, for Lightning payments. */
+  invoice: string | null
+  description: string | null
+  /** On-chain txid, for deposits into / withdrawals from the wallet. */
+  tx_id: string | null
+  created_at: string | null
+  /** Gateway payment (deposit_addresses.id) this settled — null otherwise. */
+  deposit_address_id: string | null
+}
+
+/** No total from the SDK: paging is driven by `has_more`. */
+export interface LightningPaymentsPage {
+  data: LightningPayment[]
+  limit: number
+  offset: number
+  has_more: boolean
+}
+
 export interface AppSettings {
   deposit_expiry_minutes: number
   api_key_prefix: string | null

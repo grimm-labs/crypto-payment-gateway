@@ -5,6 +5,7 @@ import { RequireAdmin, RequireAuth } from "@/lib/auth"
 import { AccountSecurityPage } from "@/pages/AccountSecurityPage"
 import { ApiKeysPage } from "@/pages/ApiKeysPage"
 import { DeliveriesPage } from "@/pages/DeliveriesPage"
+import { LightningPage } from "@/pages/LightningPage"
 import { LoginPage } from "@/pages/LoginPage"
 import { OverviewPage } from "@/pages/OverviewPage"
 import { PaymentDetailPage } from "@/pages/PaymentDetailPage"
@@ -29,6 +30,7 @@ export default function App() {
           <Route path="/deliveries" element={<DeliveriesPage />} />
           <Route path="/traffic" element={<TrafficPage />} />
           <Route path="/wallets" element={<WalletsPage />} />
+          <Route path="/lightning" element={<LightningPage />} />
           <Route path="/account/2fa" element={<AccountSecurityPage />} />
           <Route element={<RequireAdmin />}>
             <Route path="/api-keys" element={<ApiKeysPage />} />

@@ -15,7 +15,7 @@ use serde_json::{json, Value};
 use crate::middleware::{require_admin, require_jwt, CurrentStaff};
 use crate::{
     create_deposit_address, get_balances, get_deposit_address, get_wallet_balances,
-    list_deposit_addresses, retry_deposit_webhook, ApiError, ListQuery,
+    list_deposit_addresses, list_lightning_payments, retry_deposit_webhook, ApiError, ListQuery,
 };
 
 const MIN_PASSWORD_LEN: usize = 8;
@@ -74,6 +74,7 @@ pub fn admin_router(state: &AppState) -> Router<AppState> {
         )
         .route("/balances", get(get_balances))
         .route("/wallet-balances", get(get_wallet_balances))
+        .route("/lightning/payments", get(list_lightning_payments))
         .merge(admin_only)
         .route_layer(axum::middleware::from_fn_with_state(
             state.clone(),

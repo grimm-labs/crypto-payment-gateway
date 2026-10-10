@@ -9,12 +9,14 @@ use axum::{Json, Router};
 use chrono::{DateTime, Duration, Utc};
 use db::{DepositAddressRow, WebhookDeliveryRow};
 use domain::{
-    decimal_to_raw, format_amount, parse_sats, raw_to_decimal, round_to_token, supports,
+    decimal_to_raw, format_amount, parse_sats, raw_to_decimal, raw_to_decimal_string,
+    round_to_token, supports,
     DepositAddressStatus, Network, Token, WebhookDeliveryStatus, WebhookEventType, BTC_MAX_SATS,
 };
 use jobs::{
     expire_addresses_and_notify, get_cached_wallet_balances, get_live_balances,
-    notify_address_event, retrigger_webhook, AppState, RetriggerError,
+    lightning_payment_history, notify_address_event, retrigger_webhook, AppState,
+    LightningHistoryEntry, RetriggerError,
 };
 use rust_decimal::Decimal;
 use axum::http::HeaderValue;
@@ -44,6 +46,7 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/balances", get(get_balances))
         .route("/wallet-balances", get(get_wallet_balances))
+        .route("/lightning/payments", get(list_lightning_payments))
         .route_layer(axum::middleware::from_fn_with_state(
             state.clone(),
             middleware::require_api_key,
@@ -504,6 +507,63 @@ async fn get_balances(State(state): State<AppState>) -> Result<Json<Value>, ApiE
     Ok(Json(serde_json::to_value(resp)?))
 }
 
+/// The whole Lightning wallet history (every direction and status, funds
+/// unrelated to gateway invoices included), newest first. Paged by
+/// `has_more`: the SDK reports no total.
+async fn list_lightning_payments(
+    State(state): State<AppState>,
+    Query(query): Query<PageQuery>,
+) -> Result<Json<Value>, ApiError> {
+    let (limit, offset) = history_paging(&query);
+    match lightning_payment_history(&state, offset, limit).await {
+        Ok(Some(page)) => Ok(Json(json!({
+            "data": page.entries.iter().map(lightning_history_json).collect::<Vec<_>>(),
+            "limit": limit,
+            "offset": offset,
+            "has_more": page.has_more,
+        }))),
+        Ok(None) => Err(ApiError::service_unavailable(
+            "Lightning is not configured".into(),
+        )),
+        Err(err) => {
+            // The SDK detail stays server-side.
+            tracing::error!("Lightning history listing failed: {err:#}");
+            Err(ApiError::internal("Failed to list Lightning payments".into()))
+        }
+    }
+}
+
+/// `(limit, offset)`: limit defaults to 50, clamped to 1–100.
+fn history_paging(query: &PageQuery) -> (u32, u32) {
+    let limit = query.limit.unwrap_or(50).clamp(1, 100) as u32;
+    let offset = u32::try_from(query.offset.unwrap_or(0).max(0)).unwrap_or(u32::MAX);
+    (limit, offset)
+}
+
+fn lightning_history_json(entry: &LightningHistoryEntry) -> Value {
+    let payment = &entry.payment;
+    let sats = |value: u128| value.to_string();
+    json!({
+        "id": payment.id,
+        "direction": payment.direction.as_api(),
+        "status": payment.status.as_api(),
+        "amount": raw_to_decimal_string(&sats(payment.amount_sats), Token::Btc)
+            .unwrap_or_else(|_| "0".into()),
+        "amount_sats": sats(payment.amount_sats),
+        "fees_sats": sats(payment.fees_sats),
+        "method": payment.method,
+        "invoice": payment.invoice,
+        "description": payment.description,
+        "tx_id": payment.tx_id,
+        "created_at": i64::try_from(payment.timestamp)
+            .ok()
+            .and_then(|ts| DateTime::from_timestamp(ts, 0))
+            .map(|dt| dt.to_rfc3339()),
+        // deposit_addresses.id of the gateway payment this settled, if any.
+        "deposit_address_id": entry.deposit_address_id,
+    })
+}
+
 async fn get_wallet_balances(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
     let resp = get_cached_wallet_balances(&state).await?;
     Ok(Json(serde_json::to_value(resp)?))
@@ -538,6 +598,12 @@ struct CreateDepositAddressRequest {
     metadata: Option<Value>,
     /// Lightning only: BOLT11 memo (≤ 128 chars).
     description: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PageQuery {
+    limit: Option<i64>,
+    offset: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -795,6 +861,54 @@ mod tests {
             let err = invoice_expiry_secs(past, now).unwrap_err();
             assert_eq!(err.status, StatusCode::BAD_REQUEST);
         }
+    }
+
+    #[test]
+    fn lightning_history_entry_renders_btc_amounts_and_link() {
+        use lightning_client::{PaymentDirection, WalletPayment, WalletPaymentStatus};
+        let entry = jobs::LightningHistoryEntry {
+            payment: WalletPayment {
+                id: "pay-1".into(),
+                direction: PaymentDirection::Receive,
+                status: WalletPaymentStatus::Completed,
+                amount_sats: 150_000,
+                fees_sats: 2,
+                timestamp: 1_700_000_000,
+                method: "lightning".into(),
+                invoice: Some("lnbc1500u1invoice".into()),
+                description: Some("order #123".into()),
+                tx_id: None,
+            },
+            deposit_address_id: Some("addr-1".into()),
+        };
+        assert_eq!(
+            lightning_history_json(&entry),
+            json!({
+                "id": "pay-1",
+                "direction": "receive",
+                "status": "completed",
+                "amount": "0.0015",
+                "amount_sats": "150000",
+                "fees_sats": "2",
+                "method": "lightning",
+                "invoice": "lnbc1500u1invoice",
+                "description": "order #123",
+                "tx_id": null,
+                "created_at": "2023-11-14T22:13:20+00:00",
+                "deposit_address_id": "addr-1",
+            })
+        );
+    }
+
+    #[test]
+    fn history_paging_defaults_and_bounds() {
+        let page = |limit: Option<i64>, offset: Option<i64>| {
+            history_paging(&PageQuery { limit, offset })
+        };
+        assert_eq!(page(None, None), (50, 0));
+        assert_eq!(page(Some(500), Some(-3)), (100, 0));
+        assert_eq!(page(Some(0), Some(40)), (1, 40));
+        assert_eq!(page(Some(20), Some(i64::MAX)), (20, u32::MAX));
     }
 
     #[test]

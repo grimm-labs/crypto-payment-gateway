@@ -325,6 +325,21 @@ impl Db {
         Ok(row)
     }
 
+    /// `(invoice, deposit_addresses.id)` for the given BOLT11 strings that
+    /// are gateway Lightning invoices.
+    pub async fn lightning_invoice_ids(&self, invoices: &[String]) -> Result<Vec<(String, String)>> {
+        if invoices.is_empty() {
+            return Ok(Vec::new());
+        }
+        let rows: Vec<(String, String)> = sqlx::query_as(
+            r#"SELECT address, id FROM deposit_addresses WHERE network = 'LIGHTNING'::"Network" AND address = ANY($1)"#,
+        )
+        .bind(invoices)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
     /// A deposit is identified by (address, tx): one Bitcoin transaction can
     /// pay several gateway addresses.
     pub async fn find_deposit_by_address_and_tx(

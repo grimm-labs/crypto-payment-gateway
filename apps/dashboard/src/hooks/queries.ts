@@ -14,6 +14,7 @@ import type {
   CreatedApiKey,
   DepositAddress,
   DepositAddressDetail,
+  LightningPaymentsPage,
   Paginated,
   Staff,
   TotpSetup,
@@ -106,6 +107,15 @@ export function useLiveBalances() {
     queryFn: () => api<WalletBalances>("/balances"),
     enabled: false,
     gcTime: 0,
+  })
+}
+
+/** The whole Lightning wallet history, newest first. */
+export function useLightningPayments(page: { limit: number; offset: number }) {
+  return useQuery({
+    queryKey: ["lightning-payments", page],
+    queryFn: () => api<LightningPaymentsPage>(`/lightning/payments${listParams(page)}`),
+    placeholderData: (previous) => previous,
   })
 }
 

@@ -15,7 +15,7 @@ use domain::{
     DetectedTransfer, DepositAddressStatus, DepositStatus, Network, Token, WebhookDeliveryStatus,
     WebhookEventType, is_amount_within_tolerance,
 };
-use lightning_client::{LightningClient, ReceivedPayment};
+use lightning_client::{LightningClient, ReceivedPayment, WalletPayment};
 use redis::aio::ConnectionManager;
 use redis::AsyncCommands;
 use serde::{Deserialize, Serialize};
@@ -248,6 +248,70 @@ pub async fn reconcile_lightning_backlog(state: &AppState) -> Result<()> {
     }
     let unsettled = state.db.unsettled_addresses(Network::Lightning).await?;
     reconcile_lightning(state, &unsettled).await
+}
+
+/// A wallet history entry, linked to the gateway payment (deposit address)
+/// whose invoice it settled — `None` for funds unrelated to the gateway.
+#[derive(Debug, Clone)]
+pub struct LightningHistoryEntry {
+    pub payment: WalletPayment,
+    pub deposit_address_id: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct LightningHistoryPage {
+    pub entries: Vec<LightningHistoryEntry>,
+    pub has_more: bool,
+}
+
+/// Link each payment to its gateway invoice (`invoices`: BOLT11 → address
+/// id), keeping the history order.
+pub fn link_history(
+    payments: Vec<WalletPayment>,
+    invoices: &HashMap<String, String>,
+) -> Vec<LightningHistoryEntry> {
+    payments
+        .into_iter()
+        .map(|payment| {
+            let deposit_address_id = payment
+                .invoice
+                .as_ref()
+                .and_then(|invoice| invoices.get(invoice))
+                .cloned();
+            LightningHistoryEntry {
+                payment,
+                deposit_address_id,
+            }
+        })
+        .collect()
+}
+
+/// A page of the whole Lightning wallet history, newest first. `None` when
+/// Lightning is disabled.
+pub async fn lightning_payment_history(
+    state: &AppState,
+    offset: u32,
+    limit: u32,
+) -> Result<Option<LightningHistoryPage>> {
+    let Some(lightning) = &state.lightning else {
+        return Ok(None);
+    };
+    let page = lightning.list_payments(offset, limit).await?;
+    let invoices: Vec<String> = page
+        .payments
+        .iter()
+        .filter_map(|p| p.invoice.clone())
+        .collect();
+    let links: HashMap<String, String> = state
+        .db
+        .lightning_invoice_ids(&invoices)
+        .await?
+        .into_iter()
+        .collect();
+    Ok(Some(LightningHistoryPage {
+        entries: link_history(page.payments, &links),
+        has_more: page.has_more,
+    }))
 }
 
 /// Fan an address lifecycle event (PENDING at creation, EXPIRED at expiry)
@@ -1272,7 +1336,7 @@ pub struct NetworkBalance {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use lightning_client::ReceivedPayment;
+    use lightning_client::{PaymentDirection, ReceivedPayment, WalletPaymentStatus};
 
     fn invoice_row(network: Network, status: DepositAddressStatus) -> DepositAddressRow {
         let now = chrono::Utc::now();
@@ -1380,6 +1444,41 @@ mod tests {
                 (&from_event.deposit_address_id, &from_event.tx_hash, &from_event.amount_raw)
             );
         }
+    }
+
+    fn history_payment(id: &str, invoice: Option<&str>) -> WalletPayment {
+        WalletPayment {
+            id: id.into(),
+            direction: PaymentDirection::Receive,
+            status: WalletPaymentStatus::Completed,
+            amount_sats: 1_000,
+            fees_sats: 0,
+            timestamp: 1_700_000_000,
+            method: "lightning".into(),
+            invoice: invoice.map(Into::into),
+            description: None,
+            tx_id: None,
+        }
+    }
+
+    #[test]
+    fn history_links_gateway_invoices_to_their_payment() {
+        let invoices: HashMap<String, String> =
+            [("lnbc1gateway".to_string(), "addr-1".to_string())].into();
+        let entries = link_history(
+            vec![
+                history_payment("p1", Some("lnbc1gateway")),
+                history_payment("p2", Some("lnbc1elsewhere")),
+                history_payment("p3", None),
+            ],
+            &invoices,
+        );
+        let linked: Vec<(&str, Option<&str>)> = entries
+            .iter()
+            .map(|e| (e.payment.id.as_str(), e.deposit_address_id.as_deref()))
+            .collect();
+        // Order (newest first) is preserved; only gateway invoices link.
+        assert_eq!(linked, vec![("p1", Some("addr-1")), ("p2", None), ("p3", None)]);
     }
 
     #[test]

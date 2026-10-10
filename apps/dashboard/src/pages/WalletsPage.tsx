@@ -1,4 +1,5 @@
 import { RefreshCw } from "lucide-react"
+import { Link } from "react-router-dom"
 import { toast } from "sonner"
 
 import { StatusBadge } from "@/components/shared/StatusBadge"
@@ -96,6 +97,14 @@ export function WalletsPage() {
                   </p>
                   {network.message && (
                     <p className="mt-1 text-xs text-muted-foreground">{network.message}</p>
+                  )}
+                  {network.network === "lightning" && network.available && (
+                    <Link
+                      to="/lightning"
+                      className="mt-2 inline-block text-xs underline-offset-4 hover:underline"
+                    >
+                      View transaction history →
+                    </Link>
                   )}
                 </CardContent>
               </Card>

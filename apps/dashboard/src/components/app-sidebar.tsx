@@ -11,6 +11,7 @@ import {
   UsersIcon,
   WalletIcon,
   WebhookIcon,
+  ZapIcon,
 } from "lucide-react"
 import { Link, useLocation } from "react-router-dom"
 
@@ -36,6 +37,7 @@ const NAV_MAIN: NavItem[] = [
   { title: "Deliveries", url: "/deliveries", icon: <SendIcon /> },
   { title: "Traffic", url: "/traffic", icon: <ActivityIcon /> },
   { title: "Wallets", url: "/wallets", icon: <WalletIcon /> },
+  { title: "Lightning", url: "/lightning", icon: <ZapIcon /> },
 ]
 
 const NAV_ADMIN: NavItem[] = [

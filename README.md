@@ -151,6 +151,21 @@ reports the Breez/Spark wallet balance (`addresses_checked: 0`). BTC entries use
 `token: "BTC"` and are totalled in `total_btc` — never in `total_usdt`. The cached
 `/wallet-balances` payload has the same `total_btc` treatment.
 
+### Lightning wallet history
+
+```bash
+curl "http://localhost:3000/api/v1/lightning/payments?limit=50&offset=0" -H "x-api-key: $API_KEY"
+```
+
+Every payment of the Breez/Spark wallet, newest first — received and sent, completed,
+pending or failed, **including funds unrelated to gateway invoices** (anything else using
+the same seed shows up too). Each entry carries `direction`, `status`, `amount` (BTC) /
+`amount_sats`, `fees_sats`, `method`, the `invoice` (Lightning) or `tx_id` (on-chain
+deposit/withdrawal), `created_at`, and `deposit_address_id` when it settled a gateway
+invoice. The SDK reports no total: page with `limit` (1–100, default 50) / `offset` and the
+returned `has_more`. `503` when Lightning is not configured. The dashboard shows it under
+**Lightning**.
+
 ### Get HD wallet balances (cached, synced hourly)
 
 ```bash
@@ -179,7 +194,7 @@ the acting staff member's `Authorization: Bearer <access_token>`. Requires `JWT_
 | GET | `/stats` | JWT | Counters (addresses/deposits/webhooks by status) + confirmed volume |
 | GET | `/traffic/overview?surface=merchant\|admin\|all&window=15m\|1h\|24h` | JWT | API traffic aggregates: req/min, error rate, p50/p95 latency, per-bucket time series, top routes, top API keys |
 | GET | `/traffic/requests?surface=&status=2xx..5xx&route=&method=&api_key_id=&limit=&offset=` | JWT | Paginated request log (method, matched route, status, duration, key/staff identity, IP — no bodies, never the raw key) |
-| — | `/deposit-addresses*`, `/deposits/{id}/webhooks/retry`, `/balances`, `/wallet-balances` | JWT | Same handlers as `/api/v1`, JWT-authenticated for the dashboard |
+| — | `/deposit-addresses*`, `/deposits/{id}/webhooks/retry`, `/balances`, `/wallet-balances`, `/lightning/payments` | JWT | Same handlers as `/api/v1`, JWT-authenticated for the dashboard |
 
 ## Webhook events & payloads
 

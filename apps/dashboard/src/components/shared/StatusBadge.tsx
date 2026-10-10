@@ -9,6 +9,8 @@ const STYLES: Record<string, string> = {
   // deposits
   detected: "bg-sky-100 text-sky-900 dark:bg-sky-900/40 dark:text-sky-200",
   confirmed: "bg-emerald-100 text-emerald-900 dark:bg-emerald-900/40 dark:text-emerald-200",
+  // lightning wallet history
+  completed: "bg-emerald-100 text-emerald-900 dark:bg-emerald-900/40 dark:text-emerald-200",
   // webhooks
   delivered: "bg-emerald-100 text-emerald-900 dark:bg-emerald-900/40 dark:text-emerald-200",
   failed: "bg-red-100 text-red-900 dark:bg-red-900/40 dark:text-red-200",
