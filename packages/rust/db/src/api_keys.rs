@@ -126,6 +126,16 @@ impl Db {
         Ok(row)
     }
 
+    pub async fn find_api_key(&self, id: &str) -> Result<Option<ApiKeyRow>> {
+        let row = sqlx::query_as::<_, ApiKeyRow>(&format!(
+            "SELECT {API_KEY_COLUMNS} FROM api_keys WHERE id = $1"
+        ))
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row)
+    }
+
     /// Grant or withdraw the payout permission. `false` when the key does
     /// not exist.
     pub async fn set_api_key_can_send(&self, id: &str, can_send: bool) -> Result<bool> {

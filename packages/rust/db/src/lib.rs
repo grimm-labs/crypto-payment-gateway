@@ -11,6 +11,8 @@ use uuid::Uuid;
 mod admin_queries;
 mod api_keys;
 mod api_traffic;
+mod audit;
+mod payouts;
 mod settings;
 mod staff;
 mod webhook_endpoints;
@@ -21,11 +23,13 @@ pub use api_traffic::{
     ApiRequestFilter, ApiRequestRow, ApiTrafficEvent, TrafficApiKeyStat, TrafficBucket,
     TrafficRouteStat, TrafficSummary,
 };
+pub use audit::{AuditActor, AuditLogRow, NewAuditEntry};
+pub use payouts::{NewPayoutRequest, PayoutRequestRow, PayoutReservation};
 pub use settings::{
     API_KEY_PREFIX_SETTING, API_TRAFFIC_RETENTION_FOREVER, API_TRAFFIC_RETENTION_SETTING,
-    DEPOSIT_EXPIRY_SETTING, TOTP_ISSUER_SETTING,
+    DEPOSIT_EXPIRY_SETTING, PAYOUT_DAILY_MAX_SETTING, PAYOUT_MAX_SETTING, TOTP_ISSUER_SETTING,
 };
-pub use staff::StaffUserRow;
+pub use staff::{StaffUpdate, StaffUserRow};
 pub use webhook_endpoints::{WebhookEndpointListRow, WebhookEndpointRow};
 
 #[derive(Clone)]
@@ -37,7 +41,7 @@ pub struct Db {
 // TIMESTAMP(3) column into DateTime<Utc>, so every query that materializes a
 // row must cast enums to text and timestamps to timestamptz (stored values
 // are UTC instants) instead of using SELECT * / RETURNING *.
-const DEPOSIT_ADDRESS_COLUMNS: &str = r#"id, network::text AS network, token::text AS token, address, "derivationIndex", "expectedAmount", status::text AS status, "expiresAt" AT TIME ZONE 'UTC' AS "expiresAt", metadata, "createdAt" AT TIME ZONE 'UTC' AS "createdAt", "updatedAt" AT TIME ZONE 'UTC' AS "updatedAt""#;
+const DEPOSIT_ADDRESS_COLUMNS: &str = r#"id, network::text AS network, token::text AS token, address, "derivationIndex", "expectedAmount", status::text AS status, "expiresAt" AT TIME ZONE 'UTC' AS "expiresAt", metadata, "apiKeyId", "createdAt" AT TIME ZONE 'UTC' AS "createdAt", "updatedAt" AT TIME ZONE 'UTC' AS "updatedAt""#;
 const DEPOSIT_COLUMNS: &str = r#"id, "depositAddressId", "txHash", amount, "amountRaw", confirmations, status::text AS status, "detectedAt" AT TIME ZONE 'UTC' AS "detectedAt", "confirmedAt" AT TIME ZONE 'UTC' AS "confirmedAt""#;
 const WEBHOOK_DELIVERY_COLUMNS: &str = r#"id, "depositId", "depositAddressId", "lightningPaymentId", "eventType", "webhookEndpointId", status::text AS status, attempts, "lastResponse", "lastError", "createdAt" AT TIME ZONE 'UTC' AS "createdAt", "updatedAt" AT TIME ZONE 'UTC' AS "updatedAt""#;
 
@@ -55,6 +59,10 @@ pub struct DepositAddressRow {
     #[sqlx(rename = "expiresAt")]
     pub expires_at: DateTime<Utc>,
     pub metadata: Value,
+    /// Merchant key that opened the payment; NULL when created from the
+    /// dashboard (or before this column existed).
+    #[sqlx(rename = "apiKeyId")]
+    pub api_key_id: Option<String>,
     #[sqlx(rename = "createdAt")]
     pub created_at: DateTime<Utc>,
     #[sqlx(rename = "updatedAt")]
@@ -139,14 +147,25 @@ impl Db {
         Ok(())
     }
 
+    /// Allocate the next derivation index of `network` atomically: two
+    /// concurrent creations never get the same index. An index whose
+    /// creation then fails is simply skipped (gaps are harmless).
     pub async fn next_derivation_index(&self, network: Network) -> Result<i32> {
-        let row: Option<(i32,)> = sqlx::query_as(
-            r#"SELECT "derivationIndex" FROM deposit_addresses WHERE network = $1::"Network" ORDER BY "derivationIndex" DESC LIMIT 1"#,
+        let (index,): (i32,) = sqlx::query_as(
+            r#"
+            INSERT INTO derivation_counters (network, "nextIndex")
+            VALUES (
+                $1::"Network",
+                COALESCE((SELECT MAX("derivationIndex") + 1 FROM deposit_addresses WHERE network = $1::"Network"), 0) + 1
+            )
+            ON CONFLICT (network) DO UPDATE SET "nextIndex" = derivation_counters."nextIndex" + 1
+            RETURNING "nextIndex" - 1
+            "#,
         )
         .bind(network.as_db())
-        .fetch_optional(&self.pool)
+        .fetch_one(&self.pool)
         .await?;
-        Ok(row.map(|(i,)| i + 1).unwrap_or(0))
+        Ok(index)
     }
 
     pub async fn max_derivation_index(&self, network: Network) -> Result<i32> {
@@ -159,6 +178,7 @@ impl Db {
         Ok(row.map(|(i,)| i).unwrap_or(0))
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn create_deposit_address(
         &self,
         network: Network,
@@ -168,15 +188,16 @@ impl Db {
         expected_amount: Decimal,
         expires_at: DateTime<Utc>,
         metadata: Value,
+        api_key_id: Option<&str>,
     ) -> Result<DepositAddressRow> {
         let id = Uuid::new_v4().to_string();
         let now = Utc::now();
         let row = sqlx::query_as::<_, DepositAddressRow>(&format!(
             r#"
             INSERT INTO deposit_addresses
-              (id, network, token, address, "derivationIndex", "expectedAmount", status, "expiresAt", metadata, "createdAt", "updatedAt")
+              (id, network, token, address, "derivationIndex", "expectedAmount", status, "expiresAt", metadata, "createdAt", "updatedAt", "apiKeyId")
             VALUES
-              ($1, $2::"Network", $3::"Token", $4, $5, $6, 'PENDING'::"DepositAddressStatus", $7, $8, $9, $9)
+              ($1, $2::"Network", $3::"Token", $4, $5, $6, 'PENDING'::"DepositAddressStatus", $7, $8, $9, $9, $10)
             RETURNING {DEPOSIT_ADDRESS_COLUMNS}
             "#
         ))
@@ -189,9 +210,21 @@ impl Db {
         .bind(expires_at)
         .bind(metadata)
         .bind(now)
+        .bind(api_key_id)
         .fetch_one(&self.pool)
         .await?;
         Ok(row)
+    }
+
+    /// Open (PENDING) payments created with this merchant key.
+    pub async fn count_pending_addresses_for_api_key(&self, api_key_id: &str) -> Result<i64> {
+        let (count,): (i64,) = sqlx::query_as(
+            r#"SELECT COUNT(*) FROM deposit_addresses WHERE "apiKeyId" = $1 AND status = 'PENDING'::"DepositAddressStatus""#,
+        )
+        .bind(api_key_id)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(count)
     }
 
     pub async fn list_deposit_addresses(
@@ -255,47 +288,63 @@ impl Db {
         Ok(rows)
     }
 
-    /// Transition past-deadline PENDING addresses to EXPIRED. Returns the ids
-    /// of the addresses expired by THIS call (the UPDATE is atomic, so a
-    /// concurrent caller gets an empty set) — callers fire EXPIRED webhooks
-    /// for them exactly once.
-    pub async fn expire_stale_addresses(&self) -> Result<Vec<String>> {
+    /// Transition `network`'s PENDING addresses to EXPIRED once their
+    /// deadline is more than `grace_secs` old — unless a DETECTED deposit is
+    /// still waiting for its confirmations (then they are held until
+    /// `hold_secs` past the deadline). Returns the ids expired by THIS call
+    /// (the UPDATE is atomic, so a concurrent caller gets an empty set) —
+    /// callers fire EXPIRED webhooks for them exactly once.
+    ///
+    /// `polled` lists the addresses the caller just polled successfully
+    /// (`None` = all of them): an address whose last poll failed is not
+    /// expired on the grace rule — only once `hold_secs` have passed, the
+    /// hard stop that also bounds a provider outage.
+    pub async fn expire_stale_addresses(
+        &self,
+        network: Network,
+        grace_secs: i64,
+        hold_secs: i64,
+        polled: Option<&[String]>,
+    ) -> Result<Vec<String>> {
         let rows: Vec<(String,)> = sqlx::query_as(
             r#"
-            UPDATE deposit_addresses
+            UPDATE deposit_addresses a
             SET status = 'EXPIRED'::"DepositAddressStatus", "updatedAt" = NOW()
-            WHERE status = 'PENDING'::"DepositAddressStatus" AND "expiresAt" < NOW()
-            RETURNING id
+            WHERE a.network = $1::"Network"
+              AND a.status = 'PENDING'::"DepositAddressStatus"
+              AND a."expiresAt" < (NOW() AT TIME ZONE 'UTC') - make_interval(secs => $2)
+              AND (
+                a."expiresAt" < (NOW() AT TIME ZONE 'UTC') - make_interval(secs => $3)
+                OR (
+                  ($4::text[] IS NULL OR a.id = ANY($4))
+                  AND NOT EXISTS (
+                    SELECT 1 FROM deposits d
+                    WHERE d."depositAddressId" = a.id AND d.status = 'DETECTED'::"DepositStatus"
+                  )
+                )
+              )
+            RETURNING a.id
             "#,
         )
+        .bind(network.as_db())
+        .bind(grace_secs as f64)
+        .bind(hold_secs as f64)
+        .bind(polled)
         .fetch_all(&self.pool)
         .await?;
         Ok(rows.into_iter().map(|(id,)| id).collect())
     }
 
+    /// Every PENDING address of `network`, oldest first — deadline passed or
+    /// not: an address is polled until the expiry sweep (which runs right
+    /// after the poll, see `expire_stale_addresses`) has expired it.
     pub async fn pending_addresses(&self, network: Network) -> Result<Vec<DepositAddressRow>> {
         let rows = sqlx::query_as::<_, DepositAddressRow>(&format!(
             r#"
             SELECT {DEPOSIT_ADDRESS_COLUMNS} FROM deposit_addresses
             WHERE network = $1::"Network"
               AND status = 'PENDING'::"DepositAddressStatus"
-              AND "expiresAt" > NOW()
-            "#
-        ))
-        .bind(network.as_db())
-        .fetch_all(&self.pool)
-        .await?;
-        Ok(rows)
-    }
-
-    /// PENDING addresses whatever their deadline — includes rows the expiry
-    /// sweep has not reached yet (boot-time Lightning reconciliation).
-    pub async fn unsettled_addresses(&self, network: Network) -> Result<Vec<DepositAddressRow>> {
-        let rows = sqlx::query_as::<_, DepositAddressRow>(&format!(
-            r#"
-            SELECT {DEPOSIT_ADDRESS_COLUMNS} FROM deposit_addresses
-            WHERE network = $1::"Network"
-              AND status = 'PENDING'::"DepositAddressStatus"
+            ORDER BY "createdAt" ASC
             "#
         ))
         .bind(network.as_db())
@@ -371,6 +420,7 @@ impl Db {
         Ok(row)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn upsert_deposit_and_maybe_pay(
         &self,
         deposit_address_id: &str,
@@ -486,6 +536,8 @@ impl Db {
     }
 
     /// New PAID delivery row; `depositAddressId` is resolved from the deposit.
+    /// A concurrent insert of the same key (unique index) yields the row
+    /// that won instead of a duplicate.
     async fn insert_paid_webhook_delivery(
         &self,
         deposit_id: &str,
@@ -493,12 +545,13 @@ impl Db {
     ) -> Result<WebhookDeliveryRow> {
         let id = Uuid::new_v4().to_string();
         let now = Utc::now();
-        let row = sqlx::query_as::<_, WebhookDeliveryRow>(&format!(
+        let inserted = sqlx::query_as::<_, WebhookDeliveryRow>(&format!(
             r#"
             INSERT INTO webhook_deliveries
               (id, "depositId", "depositAddressId", "eventType", "webhookEndpointId", status, attempts, "createdAt", "updatedAt")
             SELECT $1, d.id, d."depositAddressId", 'PAID', $3, 'PENDING'::"WebhookDeliveryStatus", 0, $4, $4
             FROM deposits d WHERE d.id = $2
+            ON CONFLICT DO NOTHING
             RETURNING {WEBHOOK_DELIVERY_COLUMNS}
             "#
         ))
@@ -506,9 +559,15 @@ impl Db {
         .bind(deposit_id)
         .bind(endpoint_id)
         .bind(now)
-        .fetch_one(&self.pool)
+        .fetch_optional(&self.pool)
         .await?;
-        Ok(row)
+        match inserted {
+            Some(row) => Ok(row),
+            None => self
+                .find_webhook_delivery(deposit_id, endpoint_id)
+                .await?
+                .with_context(|| format!("No delivery row for deposit {deposit_id}")),
+        }
     }
 
     /// Get-or-create for an address-scoped event delivery (PENDING/EXPIRED —
@@ -528,12 +587,13 @@ impl Db {
 
         let id = Uuid::new_v4().to_string();
         let now = Utc::now();
-        let row = sqlx::query_as::<_, WebhookDeliveryRow>(&format!(
+        let inserted = sqlx::query_as::<_, WebhookDeliveryRow>(&format!(
             r#"
             INSERT INTO webhook_deliveries
               (id, "depositAddressId", "eventType", "webhookEndpointId", status, attempts, "createdAt", "updatedAt")
             VALUES
               ($1, $2, $3, $4, 'PENDING'::"WebhookDeliveryStatus", 0, $5, $5)
+            ON CONFLICT DO NOTHING
             RETURNING {WEBHOOK_DELIVERY_COLUMNS}
             "#
         ))
@@ -542,9 +602,15 @@ impl Db {
         .bind(event.as_db())
         .bind(endpoint_id)
         .bind(now)
-        .fetch_one(&self.pool)
+        .fetch_optional(&self.pool)
         .await?;
-        Ok(row)
+        match inserted {
+            Some(row) => Ok(row),
+            None => self
+                .find_address_webhook_delivery(address_id, event, endpoint_id)
+                .await?
+                .with_context(|| format!("No delivery row for address {address_id}")),
+        }
     }
 
     /// Most recent delivery row for an (address, event, endpoint) triple.
@@ -586,12 +652,13 @@ impl Db {
 
         let id = Uuid::new_v4().to_string();
         let now = Utc::now();
-        let row = sqlx::query_as::<_, WebhookDeliveryRow>(&format!(
+        let inserted = sqlx::query_as::<_, WebhookDeliveryRow>(&format!(
             r#"
             INSERT INTO webhook_deliveries
               (id, "lightningPaymentId", "eventType", "webhookEndpointId", status, attempts, "createdAt", "updatedAt")
             VALUES
               ($1, $2, $3, $4, 'PENDING'::"WebhookDeliveryStatus", 0, $5, $5)
+            ON CONFLICT DO NOTHING
             RETURNING {WEBHOOK_DELIVERY_COLUMNS}
             "#
         ))
@@ -600,9 +667,15 @@ impl Db {
         .bind(event.as_db())
         .bind(endpoint_id)
         .bind(now)
-        .fetch_one(&self.pool)
+        .fetch_optional(&self.pool)
         .await?;
-        Ok(row)
+        match inserted {
+            Some(row) => Ok(row),
+            None => self
+                .find_payout_webhook_delivery(payment_id, event, endpoint_id)
+                .await?
+                .with_context(|| format!("No delivery row for payment {payment_id}")),
+        }
     }
 
     /// Most recent delivery row for a (Lightning payment, event, endpoint).
@@ -724,6 +797,44 @@ impl Db {
         }
 
         self.insert_paid_webhook_delivery(deposit_id, endpoint_id).await
+    }
+
+    /// Authoritative PAID deliveries of `deposit_id` (newest per endpoint)
+    /// that ended FAILED — what a merchant may re-queue.
+    pub async fn failed_paid_deliveries(&self, deposit_id: &str) -> Result<Vec<WebhookDeliveryRow>> {
+        let rows = sqlx::query_as::<_, WebhookDeliveryRow>(&format!(
+            r#"
+            SELECT * FROM (
+                SELECT DISTINCT ON ("webhookEndpointId") {WEBHOOK_DELIVERY_COLUMNS}
+                FROM webhook_deliveries
+                WHERE "depositId" = $1 AND "webhookEndpointId" IS NOT NULL
+                ORDER BY "webhookEndpointId", "createdAt" DESC
+            ) t
+            WHERE t.status = 'FAILED'
+            "#
+        ))
+        .bind(deposit_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
+    /// Close a PENDING delivery that will never be attempted (endpoint
+    /// deactivated, unsubscribed or deleted, subject gone) so it does not
+    /// stay PENDING forever; a manual retry can still reopen it.
+    pub async fn fail_pending_webhook_delivery(&self, id: &str, error: &str) -> Result<()> {
+        sqlx::query(
+            r#"
+            UPDATE webhook_deliveries
+            SET status = 'FAILED'::"WebhookDeliveryStatus", "lastError" = $2, "updatedAt" = NOW()
+            WHERE id = $1 AND status = 'PENDING'::"WebhookDeliveryStatus"
+            "#,
+        )
+        .bind(id)
+        .bind(error)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
     }
 
     pub async fn update_webhook_delivery(

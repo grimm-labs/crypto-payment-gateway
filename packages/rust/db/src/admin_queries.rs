@@ -156,7 +156,8 @@ impl Db {
 
     /// Delivery keys whose authoritative delivery is FAILED — the set
     /// eligible for a bulk manual retry. PAID targets require a CONFIRMED
-    /// deposit; inactive endpoints are excluded.
+    /// deposit; inactive endpoints, and endpoints no longer subscribed to the
+    /// event, are excluded.
     pub async fn failed_webhook_targets(&self) -> Result<Vec<FailedWebhookTarget>> {
         let rows = sqlx::query_as::<_, FailedWebhookTarget>(
             r#"
@@ -171,7 +172,7 @@ impl Db {
             ) t
             LEFT JOIN webhook_endpoints e ON e.id = t."webhookEndpointId"
             WHERE t.status = 'FAILED'
-              AND (t."webhookEndpointId" IS NULL OR e."isActive" = true)
+              AND (t."webhookEndpointId" IS NULL OR (e."isActive" = true AND t."eventType" = ANY(e.events)))
             "#,
         )
         .fetch_all(&self.pool)

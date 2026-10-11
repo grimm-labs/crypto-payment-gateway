@@ -8,7 +8,7 @@ use crate::Db;
 
 const WEBHOOK_ENDPOINT_COLUMNS: &str = r#"id, url, "isActive", events, secret, "createdById", "createdAt" AT TIME ZONE 'UTC' AS "createdAt", "updatedAt" AT TIME ZONE 'UTC' AS "updatedAt""#;
 
-#[derive(Debug, Clone, FromRow)]
+#[derive(Clone, FromRow)]
 pub struct WebhookEndpointRow {
     pub id: String,
     pub url: String,
@@ -25,6 +25,22 @@ pub struct WebhookEndpointRow {
     pub created_at: DateTime<Utc>,
     #[sqlx(rename = "updatedAt")]
     pub updated_at: DateTime<Utc>,
+}
+
+/// Manual: the signing secret must never reach a log line.
+impl std::fmt::Debug for WebhookEndpointRow {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WebhookEndpointRow")
+            .field("id", &self.id)
+            .field("url", &self.url)
+            .field("is_active", &self.is_active)
+            .field("events", &self.events)
+            .field("secret", &self.secret.as_ref().map(|_| "<redacted>"))
+            .field("created_by_id", &self.created_by_id)
+            .field("created_at", &self.created_at)
+            .field("updated_at", &self.updated_at)
+            .finish()
+    }
 }
 
 impl WebhookEndpointRow {

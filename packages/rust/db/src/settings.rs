@@ -1,5 +1,8 @@
 use anyhow::Result;
-use config::{API_TRAFFIC_RETENTION_DEFAULT_DAYS, DEPOSIT_EXPIRY_DEFAULT_MINUTES, TOTP_ISSUER};
+use config::{
+    API_TRAFFIC_RETENTION_DEFAULT_DAYS, DEPOSIT_EXPIRY_DEFAULT_MINUTES, PAYOUT_DAILY_MAX_SATS_DEFAULT,
+    PAYOUT_MAX_SATS_DEFAULT, TOTP_ISSUER,
+};
 
 use crate::Db;
 
@@ -7,6 +10,8 @@ pub const DEPOSIT_EXPIRY_SETTING: &str = "depositExpiryMinutes";
 pub const API_KEY_PREFIX_SETTING: &str = "apiKeyPrefix";
 pub const TOTP_ISSUER_SETTING: &str = "totpIssuer";
 pub const API_TRAFFIC_RETENTION_SETTING: &str = "apiTrafficRetentionDays";
+pub const PAYOUT_MAX_SETTING: &str = "payoutMaxSats";
+pub const PAYOUT_DAILY_MAX_SETTING: &str = "payoutDailyMaxSats";
 /// Stored value meaning "never purge the traffic log".
 pub const API_TRAFFIC_RETENTION_FOREVER: &str = "0";
 
@@ -75,5 +80,28 @@ impl Db {
             Some(days) if days > 0 => Some(days),
             _ => Some(API_TRAFFIC_RETENTION_DEFAULT_DAYS),
         })
+    }
+
+    /// Largest single Lightning payout, in sats (`0` = payouts disabled).
+    pub async fn payout_max_sats(&self) -> Result<u64> {
+        self.sats_setting(PAYOUT_MAX_SETTING, PAYOUT_MAX_SATS_DEFAULT).await
+    }
+
+    /// Lightning payouts allowed over a rolling 24 h, in sats (`0` =
+    /// payouts disabled).
+    pub async fn payout_daily_max_sats(&self) -> Result<u64> {
+        self.sats_setting(PAYOUT_DAILY_MAX_SETTING, PAYOUT_DAILY_MAX_SATS_DEFAULT).await
+    }
+
+    /// A missing row means the code default; an unreadable one is an error
+    /// rather than a silently raised limit.
+    async fn sats_setting(&self, key: &str, default: u64) -> Result<u64> {
+        match self.get_setting(key).await? {
+            None => Ok(default),
+            Some(value) => value
+                .trim()
+                .parse::<u64>()
+                .map_err(|_| anyhow::anyhow!("app_settings.{key} is not a valid sats amount")),
+        }
     }
 }
