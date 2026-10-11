@@ -1,0 +1,16 @@
+# Applies to the `chain` crate only (clippy reads the nearest clippy.toml
+# from the crate's manifest directory upward).
+#
+# Provider URLs carry API keys (Alchemy in the path, Helius in the query) and
+# reqwest copies the URL into its errors. Every request must go through
+# `src/request.rs`, which strips it (`without_url`).
+disallowed-methods = [
+    { path = "reqwest::RequestBuilder::send", reason = "use request::send* — reqwest errors embed the URL, which carries provider API keys" },
+    { path = "reqwest::Response::json", reason = "use request::send_json — reqwest errors embed the URL, which carries provider API keys" },
+    { path = "reqwest::Response::text", reason = "use request::send_text — reqwest errors embed the URL, which carries provider API keys" },
+    { path = "reqwest::Response::bytes", reason = "add a helper in request.rs — reqwest errors embed the URL, which carries provider API keys" },
+    { path = "reqwest::Response::chunk", reason = "add a helper in request.rs — reqwest errors embed the URL, which carries provider API keys" },
+    { path = "reqwest::Response::error_for_status", reason = "use request::send — reqwest errors embed the URL, which carries provider API keys" },
+    { path = "reqwest::Response::error_for_status_ref", reason = "use request::send — reqwest errors embed the URL, which carries provider API keys" },
+    { path = "reqwest::get", reason = "use request::send* on a shared client — reqwest errors embed the URL, which carries provider API keys" },
+]
