@@ -2,6 +2,7 @@ import { RefreshCw } from "lucide-react"
 import { Link } from "react-router-dom"
 import { toast } from "sonner"
 
+import { BalanceSplit, OtherTotals } from "@/components/shared/BalanceSplit"
 import { StatusBadge } from "@/components/shared/StatusBadge"
 import { Button } from "@/components/ui/button"
 import {
@@ -15,6 +16,7 @@ import { Skeleton } from "@/components/ui/skeleton"
 import { useLiveBalances, useWalletBalances } from "@/hooks/queries"
 import { useIsAdmin } from "@/lib/auth"
 import { formatAmount, formatDate, networkLabel } from "@/lib/format"
+import { assetKey, isGasOnlyToken } from "@/lib/networks"
 import type { WalletBalances } from "@/lib/types"
 
 export function WalletsPage() {
@@ -42,8 +44,9 @@ export function WalletsPage() {
         <div>
           <h1 className="text-2xl font-semibold tracking-tight">Wallets</h1>
           <p className="text-sm text-muted-foreground">
-            USDT and BTC held on the HD wallet across all derived addresses, plus the
-            Lightning (Breez/Spark) wallet balance.
+            Per network and token: the treasury plus deposit addresses not swept yet,
+            and the Lightning (Breez/Spark) wallet balance. TRX and SOL are gas
+            reserves.
           </p>
         </div>
         <Button onClick={refreshLive} disabled={live.isFetching} variant="outline">
@@ -65,23 +68,29 @@ export function WalletsPage() {
             </CardHeader>
             <CardContent>
               <p className="text-3xl font-semibold tabular-nums">
-                {source ? formatAmount(source.total_usdt) : "—"}
+                {source ? formatAmount(source.total_usdt, "USDT") : "—"}
               </p>
               {source?.total_btc !== undefined && (
                 <p className="mt-1 text-xl font-semibold tabular-nums text-muted-foreground">
                   {formatAmount(source.total_btc, "BTC")}
                 </p>
               )}
+              {source && <OtherTotals balances={source} />}
             </CardContent>
           </Card>
 
-          <div className="grid gap-4 sm:grid-cols-3">
+          <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
             {source?.networks.map((network) => (
-              <Card key={network.network}>
+              <Card key={assetKey(network)}>
                 <CardHeader className="pb-2">
                   <div className="flex items-center justify-between">
                     <CardTitle className="text-base">
-                      {networkLabel(network.network)}
+                      {networkLabel(network.network)} · {network.token}
+                      {isGasOnlyToken(network.token) && (
+                        <span className="ml-1 text-xs font-normal text-muted-foreground">
+                          gas reserve
+                        </span>
+                      )}
                     </CardTitle>
                     {!network.available && <StatusBadge status="inactive" />}
                   </div>
@@ -90,6 +99,7 @@ export function WalletsPage() {
                   <p className="text-2xl font-semibold tabular-nums">
                     {formatAmount(network.amount, network.token)}
                   </p>
+                  <BalanceSplit balance={network} />
                   <p className="mt-1 text-xs text-muted-foreground">
                     {network.network === "lightning"
                       ? "Breez/Spark wallet balance"

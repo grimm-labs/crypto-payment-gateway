@@ -1,8 +1,11 @@
 import * as React from "react"
 import {
   ActivityIcon,
+  ArrowUpFromLineIcon,
+  BookUserIcon,
   CoinsIcon,
   KeyRoundIcon,
+  LandmarkIcon,
   LayoutDashboardIcon,
   ReceiptTextIcon,
   ScrollTextIcon,
@@ -18,6 +21,7 @@ import { Link, useLocation } from "react-router-dom"
 
 import { NavMain, type NavItem } from "@/components/nav-main"
 import { NavUser } from "@/components/nav-user"
+import { Badge } from "@/components/ui/badge"
 import {
   Sidebar,
   SidebarContent,
@@ -30,6 +34,7 @@ import {
   SidebarMenuButton,
   SidebarMenuItem,
 } from "@/components/ui/sidebar"
+import { usePendingApprovalCount } from "@/hooks/withdrawals"
 import { useAuth } from "@/lib/auth"
 import { ACCOUNT_SECURITY_PATH } from "@/lib/errors"
 
@@ -39,6 +44,10 @@ const NAV_MAIN: Array<NavItem & { adminOnly?: boolean }> = [
   { title: "Deliveries", url: "/deliveries", icon: <SendIcon /> },
   { title: "Traffic", url: "/traffic", icon: <ActivityIcon /> },
   { title: "Wallets", url: "/wallets", icon: <WalletIcon /> },
+  // Read-only for operators (they may only freeze outflows).
+  { title: "Withdrawals", url: "/withdrawals", icon: <ArrowUpFromLineIcon /> },
+  { title: "Treasury", url: "/treasury", icon: <LandmarkIcon /> },
+  { title: "Address book", url: "/address-book", icon: <BookUserIcon /> },
   // The wallet history is admin-only on the API.
   { title: "Lightning", url: "/lightning", icon: <ZapIcon />, adminOnly: true },
 ]
@@ -60,7 +69,22 @@ export function AppSidebar({ ...props }: React.ComponentProps<typeof Sidebar>) {
   const { staff } = useAuth()
   const location = useLocation()
   const isAdmin = staff?.role === "admin"
-  const mainItems = NAV_MAIN.filter((item) => isAdmin || !item.adminOnly)
+  const pendingApprovals = usePendingApprovalCount()
+  const mainItems = NAV_MAIN.filter((item) => isAdmin || !item.adminOnly).map((item) =>
+    item.url === "/withdrawals" && pendingApprovals.data
+      ? {
+          ...item,
+          badge: (
+            <Badge
+              className="h-5 min-w-5 bg-amber-500 px-1.5 text-white"
+              title={`${pendingApprovals.data} withdrawal(s) awaiting approval`}
+            >
+              {pendingApprovals.data}
+            </Badge>
+          ),
+        }
+      : item,
+  )
 
   return (
     <Sidebar collapsible="offcanvas" {...props}>

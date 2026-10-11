@@ -1,11 +1,12 @@
 use anyhow::Result;
 use chrono::{DateTime, Utc};
+use domain::{Network, Token, WithdrawalPolicy};
 use sqlx::FromRow;
 use uuid::Uuid;
 
-use crate::Db;
+use crate::{Db, RawAmount};
 
-const API_KEY_COLUMNS: &str = r#"id, name, prefix, "keyHash", status::text AS status, "createdById", "lastUsedAt" AT TIME ZONE 'UTC' AS "lastUsedAt", "revokedAt" AT TIME ZONE 'UTC' AS "revokedAt", "expiresAt" AT TIME ZONE 'UTC' AS "expiresAt", "canSend", "createdAt" AT TIME ZONE 'UTC' AS "createdAt""#;
+const API_KEY_COLUMNS: &str = r#"id, name, prefix, "keyHash", status::text AS status, "createdById", "lastUsedAt" AT TIME ZONE 'UTC' AS "lastUsedAt", "revokedAt" AT TIME ZONE 'UTC' AS "revokedAt", "expiresAt" AT TIME ZONE 'UTC' AS "expiresAt", "withdrawalPolicy"::text AS "withdrawalPolicy", "withdrawalTokens", "withdrawalNetworks", "createdAt" AT TIME ZONE 'UTC' AS "createdAt""#;
 
 #[derive(Debug, Clone, FromRow)]
 pub struct ApiKeyRow {
@@ -24,11 +25,35 @@ pub struct ApiKeyRow {
     /// NULL = never expires (revocable only).
     #[sqlx(rename = "expiresAt")]
     pub expires_at: Option<DateTime<Utc>>,
-    /// May send Lightning payouts (granted by an admin; off by default).
-    #[sqlx(rename = "canSend")]
-    pub can_send: bool,
+    /// What the key may withdraw to (`NONE` by default; granting needs an
+    /// expiring key and a TOTP step-up).
+    #[sqlx(rename = "withdrawalPolicy")]
+    pub withdrawal_policy: String,
+    /// DB token values the key may withdraw.
+    #[sqlx(rename = "withdrawalTokens")]
+    pub withdrawal_tokens: Vec<String>,
+    /// DB network values; `None` = every network of the allowed tokens.
+    #[sqlx(rename = "withdrawalNetworks")]
+    pub withdrawal_networks: Option<Vec<String>>,
     #[sqlx(rename = "createdAt")]
     pub created_at: DateTime<Utc>,
+}
+
+impl ApiKeyRow {
+    pub fn withdrawal_policy(&self) -> WithdrawalPolicy {
+        WithdrawalPolicy::from_db(&self.withdrawal_policy).unwrap_or(WithdrawalPolicy::None)
+    }
+}
+
+/// A key's withdrawal permission, with its per-token limits.
+#[derive(Debug, Clone)]
+pub struct WithdrawalGrant {
+    pub policy: WithdrawalPolicy,
+    pub tokens: Vec<Token>,
+    pub networks: Option<Vec<Network>>,
+    /// (token, max per withdrawal, rolling 24 h) in base units. Mandatory
+    /// for every token of an `OPEN` key, optional for `BOOK`.
+    pub limits: Vec<(Token, u128, u128)>,
 }
 
 /// List row: `ApiKeyRow` plus the creator's display name.
@@ -48,8 +73,16 @@ pub struct ApiKeyListRow {
     pub revoked_at: Option<DateTime<Utc>>,
     #[sqlx(rename = "expiresAt")]
     pub expires_at: Option<DateTime<Utc>>,
-    #[sqlx(rename = "canSend")]
-    pub can_send: bool,
+    #[sqlx(rename = "withdrawalPolicy")]
+    pub withdrawal_policy: String,
+    #[sqlx(rename = "withdrawalTokens")]
+    pub withdrawal_tokens: Vec<String>,
+    #[sqlx(rename = "withdrawalNetworks")]
+    pub withdrawal_networks: Option<Vec<String>>,
+    /// `[{token, max_per_withdrawal_raw, daily_max_raw}]` (amounts as
+    /// strings).
+    #[sqlx(rename = "withdrawalLimits")]
+    pub withdrawal_limits: serde_json::Value,
     #[sqlx(rename = "createdAt")]
     pub created_at: DateTime<Utc>,
 }
@@ -62,16 +95,15 @@ impl Db {
         key_hash: &str,
         created_by_id: &str,
         expires_at: Option<DateTime<Utc>>,
-        can_send: bool,
     ) -> Result<ApiKeyRow> {
         let id = Uuid::new_v4().to_string();
         let now = Utc::now();
         let row = sqlx::query_as::<_, ApiKeyRow>(&format!(
             r#"
             INSERT INTO api_keys
-              (id, name, prefix, "keyHash", status, "createdById", "expiresAt", "canSend", "createdAt")
+              (id, name, prefix, "keyHash", status, "createdById", "expiresAt", "createdAt")
             VALUES
-              ($1, $2, $3, $4, 'ACTIVE'::"ApiKeyStatus", $5, $6, $7, $8)
+              ($1, $2, $3, $4, 'ACTIVE'::"ApiKeyStatus", $5, $6, $7)
             RETURNING {API_KEY_COLUMNS}
             "#
         ))
@@ -81,7 +113,6 @@ impl Db {
         .bind(key_hash)
         .bind(created_by_id)
         .bind(expires_at)
-        .bind(can_send)
         .bind(now)
         .fetch_one(&self.pool)
         .await?;
@@ -96,7 +127,14 @@ impl Db {
                    k."lastUsedAt" AT TIME ZONE 'UTC' AS "lastUsedAt",
                    k."revokedAt" AT TIME ZONE 'UTC' AS "revokedAt",
                    k."expiresAt" AT TIME ZONE 'UTC' AS "expiresAt",
-                   k."canSend",
+                   k."withdrawalPolicy"::text AS "withdrawalPolicy", k."withdrawalTokens", k."withdrawalNetworks",
+                   COALESCE((
+                     SELECT json_agg(json_build_object(
+                       'token', l.token::text,
+                       'max_per_withdrawal_raw', l."maxPerWithdrawalRaw"::text,
+                       'daily_max_raw', l."dailyMaxRaw"::text) ORDER BY l.token)
+                     FROM api_key_withdrawal_limits l WHERE l."apiKeyId" = k.id
+                   ), '[]'::json) AS "withdrawalLimits",
                    k."createdAt" AT TIME ZONE 'UTC' AS "createdAt"
             FROM api_keys k
             LEFT JOIN staff_users s ON s.id = k."createdById"
@@ -136,15 +174,47 @@ impl Db {
         Ok(row)
     }
 
-    /// Grant or withdraw the payout permission. `false` when the key does
-    /// not exist.
-    pub async fn set_api_key_can_send(&self, id: &str, can_send: bool) -> Result<bool> {
-        let result = sqlx::query(r#"UPDATE api_keys SET "canSend" = $2 WHERE id = $1"#)
+    /// Replace a key's withdrawal permission and its per-token limits,
+    /// atomically. `false` when the key does not exist. The DB refuses a
+    /// policy other than `NONE` on a key without expiry.
+    pub async fn set_api_key_withdrawal_grant(&self, id: &str, grant: &WithdrawalGrant) -> Result<bool> {
+        let mut tx = self.pool.begin().await?;
+        let tokens: Vec<&str> = grant.tokens.iter().map(|t| t.as_db()).collect();
+        let networks: Option<Vec<&str>> = grant
+            .networks
+            .as_ref()
+            .map(|networks| networks.iter().map(|n| n.as_db()).collect());
+        let result = sqlx::query(
+            r#"UPDATE api_keys SET "withdrawalPolicy" = $2::"WithdrawalPolicy", "withdrawalTokens" = $3,
+                   "withdrawalNetworks" = $4 WHERE id = $1"#,
+        )
+        .bind(id)
+        .bind(grant.policy.as_db())
+        .bind(&tokens)
+        .bind(&networks)
+        .execute(&mut *tx)
+        .await?;
+        if result.rows_affected() == 0 {
+            return Ok(false);
+        }
+        sqlx::query(r#"DELETE FROM api_key_withdrawal_limits WHERE "apiKeyId" = $1"#)
             .bind(id)
-            .bind(can_send)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
-        Ok(result.rows_affected() > 0)
+        for (token, max, daily) in &grant.limits {
+            sqlx::query(
+                r#"INSERT INTO api_key_withdrawal_limits ("apiKeyId", token, "maxPerWithdrawalRaw", "dailyMaxRaw", "updatedAt")
+                   VALUES ($1, $2::"Token", $3::numeric, $4::numeric, NOW())"#,
+            )
+            .bind(id)
+            .bind(token.as_db())
+            .bind(RawAmount(*max))
+            .bind(RawAmount(*daily))
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(true)
     }
 
     /// Returns `false` when the key does not exist or is already revoked.

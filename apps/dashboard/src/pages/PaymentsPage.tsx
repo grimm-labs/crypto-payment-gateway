@@ -43,12 +43,13 @@ import { toastError } from "@/lib/errors"
 import {
   formatAmount,
   formatDate,
-  isBtcNetwork,
+  isValidDecimalAmount,
   networkLabel,
-  networkToken,
   satsToBtc,
   shortHash,
+  tokenDecimals,
 } from "@/lib/format"
+import { PAYMENT_TOKENS, isBtcNetwork } from "@/lib/networks"
 import type { DepositAddress } from "@/lib/types"
 
 const PAGE_SIZE = 20
@@ -151,7 +152,10 @@ export function PaymentsPage() {
                         {shortHash(payment.address)}
                       </Link>
                     </TableCell>
-                    <TableCell>{networkLabel(payment.network)}</TableCell>
+                    <TableCell>
+                      {networkLabel(payment.network)}
+                      <span className="text-xs text-muted-foreground"> · {payment.token}</span>
+                    </TableCell>
                     <TableCell className="tabular-nums">
                       {formatAmount(payment.expected_amount, payment.token)}
                     </TableCell>
@@ -199,7 +203,9 @@ function isValidSats(value: string): boolean {
 const createSchema = z
   .object({
     network: z.enum(["tron", "ethereum", "solana", "bitcoin", "lightning"]),
-    // USDT (decimal) on tron/ethereum/solana, sats (integer) on bitcoin/lightning.
+    // One of the network's payment tokens (USDT or ETH on ethereum).
+    token: z.enum(["USDT", "BTC", "ETH"]),
+    // Token units (decimal) for USDT/ETH, sats (integer) on bitcoin/lightning.
     expected_amount: z.string().trim(),
     description: z.string().trim().optional(),
     expires_at: z.string().optional(),
@@ -229,15 +235,19 @@ const createSchema = z
           message: "Whole number of sats, at least 1",
         })
       }
-    } else if (
-      !/^\d+(\.\d{1,6})?$/.test(values.expected_amount) ||
-      // String check, no float parsing: some non-zero digit.
-      !/[1-9]/.test(values.expected_amount)
-    ) {
+    } else if (!isValidDecimalAmount(values.expected_amount, values.token)) {
+      // String → BigInt check, never floats.
       ctx.addIssue({
         code: z.ZodIssueCode.custom,
         path: ["expected_amount"],
-        message: "Positive amount, up to 6 decimals",
+        message: `Positive amount, up to ${tokenDecimals(values.token)} decimals`,
+      })
+    }
+    if (!(PAYMENT_TOKENS[values.network] as string[]).includes(values.token)) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["token"],
+        message: `${networkLabel(values.network)} does not accept ${values.token}`,
       })
     }
     if (values.expires_at) {
@@ -268,9 +278,11 @@ function CreatePaymentDialog() {
   const createPayment = useCreatePayment()
   const form = useForm<CreateValues>({
     resolver: zodResolver(createSchema),
-    defaultValues: { network: "tron", expected_amount: "" },
+    defaultValues: { network: "tron", token: "USDT", expected_amount: "" },
   })
   const selectedNetwork = form.watch("network")
+  const selectedToken = form.watch("token")
+  const networkTokens = PAYMENT_TOKENS[selectedNetwork]
   const isBtc = isBtcNetwork(selectedNetwork)
   const btcHint = isBtc ? satsToBtc(form.watch("expected_amount") ?? "") : null
 
@@ -284,7 +296,7 @@ function CreatePaymentDialog() {
       const btc = isBtcNetwork(values.network)
       const payment = await createPayment.mutateAsync({
         network: values.network,
-        token: networkToken(values.network),
+        token: values.token,
         ...(btc
           ? { expected_amount_sats: values.expected_amount }
           : { expected_amount: values.expected_amount }),
@@ -308,6 +320,7 @@ function CreatePaymentDialog() {
       setCreated(null)
       form.reset({
         network: "tron",
+        token: "USDT",
         expected_amount: "",
         description: "",
         expires_at: "",
@@ -378,9 +391,11 @@ function CreatePaymentDialog() {
                   value={selectedNetwork}
                   onValueChange={(value) => {
                     const next = value as CreateValues["network"]
-                    // The amount unit changes (USDT ↔ sats): don't carry it over.
-                    if (isBtcNetwork(next) !== isBtc) form.setValue("expected_amount", "")
+                    const nextToken = PAYMENT_TOKENS[next][0] as CreateValues["token"]
+                    // The amount unit changes (USDT ↔ ETH ↔ sats): don't carry it over.
+                    if (nextToken !== selectedToken) form.setValue("expected_amount", "")
                     form.setValue("network", next)
+                    form.setValue("token", nextToken)
                   }}
                 >
                   <SelectTrigger className="w-full">
@@ -388,23 +403,51 @@ function CreatePaymentDialog() {
                   </SelectTrigger>
                   <SelectContent>
                     <SelectItem value="tron">Tron (TRC-20)</SelectItem>
-                    <SelectItem value="ethereum">Ethereum (ERC-20)</SelectItem>
+                    <SelectItem value="ethereum">Ethereum (ERC-20 / ETH)</SelectItem>
                     <SelectItem value="solana">Solana (SPL)</SelectItem>
                     <SelectItem value="bitcoin">Bitcoin (on-chain)</SelectItem>
                     <SelectItem value="lightning">Lightning (BOLT11)</SelectItem>
                   </SelectContent>
                 </Select>
-                {isBtc && (
-                  <p className="text-xs text-muted-foreground">Token: BTC</p>
+                {networkTokens.length === 1 && (
+                  <p className="text-xs text-muted-foreground">Token: {networkTokens[0]}</p>
                 )}
               </div>
+              {networkTokens.length > 1 && (
+                <div className="space-y-2">
+                  <Label>Token</Label>
+                  <Select
+                    value={selectedToken}
+                    onValueChange={(value) => {
+                      const next = value as CreateValues["token"]
+                      // Different decimals (USDT 6, ETH 18): start over.
+                      if (next !== selectedToken) form.setValue("expected_amount", "")
+                      form.setValue("token", next)
+                    }}
+                  >
+                    <SelectTrigger className="w-full">
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      {networkTokens.map((token) => (
+                        <SelectItem key={token} value={token}>
+                          {token === "ETH" ? "ETH (native)" : `${token} (ERC-20)`}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                  {errors.token && (
+                    <p className="text-xs text-destructive">{errors.token.message}</p>
+                  )}
+                </div>
+              )}
               <div className="space-y-2">
                 <Label htmlFor="expected_amount">
-                  Expected amount ({isBtc ? "sats" : "USDT"})
+                  Expected amount ({isBtc ? "sats" : selectedToken})
                 </Label>
                 <Input
                   id="expected_amount"
-                  placeholder={isBtc ? "150000" : "25.00"}
+                  placeholder={isBtc ? "150000" : selectedToken === "ETH" ? "0.05" : "25.00"}
                   inputMode={isBtc ? "numeric" : "decimal"}
                   {...form.register("expected_amount")}
                 />

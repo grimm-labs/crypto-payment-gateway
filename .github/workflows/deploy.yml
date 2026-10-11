@@ -18,7 +18,8 @@ run-name: Deployment - ${{ fromJSON('{"test":"Test","staging":"Staging","product
 # Optional: APP_ENV (defaults to the environment name), SSH_USER (default root;
 # a deploy user in the docker group is the target), BITCOIN_ESPLORA_BASE_URL
 # (empty disables Bitcoin), TRUSTED_PROXIES, ALLOW_INSECURE_TRANSPORT ("true"
-# allows plain-text Redis/Postgres outside development; empty = refused).
+# allows plain-text Redis/Postgres outside development; empty = refused),
+# OUTFLOWS_FROZEN ("true" forces the outflow freeze; empty = dashboard-managed).
 # Secrets (`secrets.*`, every one listed in .kamal/secrets), per environment:
 # SSH_PRIVATE_KEY, WALLET_MNEMONIC, DATABASE_URL, REDIS_URL, JWT_SECRET; optional:
 # SETUP_TOKEN (first-admin bootstrap; empty = generated and logged at boot) and the
@@ -167,6 +168,7 @@ jobs:
           BITCOIN_ESPLORA_BASE_URL: ${{ vars.BITCOIN_ESPLORA_BASE_URL || '' }}
           TRUSTED_PROXIES: ${{ vars.TRUSTED_PROXIES || '' }}
           ALLOW_INSECURE_TRANSPORT: ${{ vars.ALLOW_INSECURE_TRANSPORT || '' }}
+          OUTFLOWS_FROZEN: ${{ vars.OUTFLOWS_FROZEN || '' }}
           WALLET_MNEMONIC: ${{ secrets.WALLET_MNEMONIC }}
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
           REDIS_URL: ${{ secrets.REDIS_URL }}

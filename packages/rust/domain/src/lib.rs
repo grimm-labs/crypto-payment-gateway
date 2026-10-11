@@ -2,13 +2,23 @@ use rust_decimal::{Decimal, RoundingStrategy};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+mod withdrawal;
+
+pub use withdrawal::*;
+
 pub const USDT_DECIMALS: u32 = 6;
 /// 1 BTC = 100 000 000 sats.
 pub const BTC_DECIMALS: u32 = 8;
+/// 1 ETH = 10^18 wei.
+pub const ETH_DECIMALS: u32 = 18;
+/// 1 TRX = 1 000 000 sun.
+pub const TRX_DECIMALS: u32 = 6;
+/// 1 SOL = 10^9 lamports.
+pub const SOL_DECIMALS: u32 = 9;
 /// Total bitcoin supply in sats — the upper bound of any BTC amount.
 pub const BTC_MAX_SATS: u64 = 2_100_000_000_000_000;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "UPPERCASE")]
 pub enum Network {
     Tron,
@@ -29,11 +39,40 @@ impl Network {
         Self::Lightning,
     ];
 
-    /// The one token received on this network (see `supports`).
-    pub fn token(&self) -> Token {
+    /// Tokens accepted as payments on this network (see `supports`).
+    pub fn payment_tokens(&self) -> &'static [Token] {
         match self {
-            Self::Tron | Self::Ethereum | Self::Solana => Token::Usdt,
-            Self::Bitcoin | Self::Lightning => Token::Btc,
+            Self::Tron | Self::Solana => &[Token::Usdt],
+            Self::Ethereum => &[Token::Usdt, Token::Eth],
+            Self::Bitcoin | Self::Lightning => &[Token::Btc],
+        }
+    }
+
+    /// The native coin paying this network's fees; Lightning has none (its
+    /// fees are paid in BTC from the Spark balance, see `fee_token`).
+    pub fn gas_token(&self) -> Option<Token> {
+        match self {
+            Self::Ethereum => Some(Token::Eth),
+            Self::Tron => Some(Token::Trx),
+            Self::Solana => Some(Token::Sol),
+            Self::Bitcoin => Some(Token::Btc),
+            Self::Lightning => None,
+        }
+    }
+
+    /// What a withdrawal's fee is paid in.
+    pub fn fee_token(&self) -> Token {
+        self.gas_token().unwrap_or(Token::Btc)
+    }
+
+    /// Tokens that can leave the gateway on this network: the payment tokens
+    /// plus the gas token, deduplicated.
+    pub fn withdrawable_tokens(&self) -> &'static [Token] {
+        match self {
+            Self::Tron => &[Token::Usdt, Token::Trx],
+            Self::Ethereum => &[Token::Usdt, Token::Eth],
+            Self::Solana => &[Token::Usdt, Token::Sol],
+            Self::Bitcoin | Self::Lightning => &[Token::Btc],
         }
     }
 
@@ -80,17 +119,27 @@ impl Network {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Token {
     Usdt,
     Btc,
+    Eth,
+    /// Gas asset only (Tron fees): never accepted as a payment.
+    Trx,
+    /// Gas asset only (Solana fees): never accepted as a payment.
+    Sol,
 }
 
 impl Token {
+    pub const ALL: [Self; 5] = [Self::Usdt, Self::Btc, Self::Eth, Self::Trx, Self::Sol];
+
     pub fn as_db(&self) -> &'static str {
         match self {
             Self::Usdt => "USDT",
             Self::Btc => "BTC",
+            Self::Eth => "ETH",
+            Self::Trx => "TRX",
+            Self::Sol => "SOL",
         }
     }
 
@@ -100,13 +149,10 @@ impl Token {
     }
 
     pub fn parse_api(value: &str) -> Result<Self, DomainError> {
-        if value.eq_ignore_ascii_case("USDT") {
-            Ok(Self::Usdt)
-        } else if value.eq_ignore_ascii_case("BTC") {
-            Ok(Self::Btc)
-        } else {
-            Err(DomainError::UnsupportedToken(value.to_string()))
-        }
+        Self::ALL
+            .into_iter()
+            .find(|token| value.eq_ignore_ascii_case(token.as_db()))
+            .ok_or_else(|| DomainError::UnsupportedToken(value.to_string()))
     }
 
     pub fn from_db(value: &str) -> Result<Self, DomainError> {
@@ -118,14 +164,30 @@ impl Token {
         match self {
             Self::Usdt => USDT_DECIMALS,
             Self::Btc => BTC_DECIMALS,
+            Self::Eth => ETH_DECIMALS,
+            Self::Trx => TRX_DECIMALS,
+            Self::Sol => SOL_DECIMALS,
         }
+    }
+
+    /// A gas asset held only to pay fees: withdrawable by admins, never a
+    /// payment.
+    pub fn is_gas_only(&self) -> bool {
+        matches!(self, Self::Trx | Self::Sol)
     }
 }
 
 /// Whether `token` can be received on `network`: USDT on the three account
-/// networks, BTC on bitcoin and lightning.
+/// networks, native ETH on Ethereum, BTC on bitcoin and lightning. Gas-only
+/// assets (TRX, SOL) are never payments.
 pub fn supports(network: Network, token: Token) -> bool {
-    network.token() == token
+    network.payment_tokens().contains(&token)
+}
+
+/// Whether `token` can be withdrawn on `network` (payment tokens + the gas
+/// token).
+pub fn is_withdrawable(network: Network, token: Token) -> bool {
+    network.withdrawable_tokens().contains(&token)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -247,7 +309,10 @@ impl WebhookDeliveryStatus {
 /// Event a webhook endpoint can subscribe to. Address lifecycle events mirror
 /// `DepositAddressStatus`: PENDING fires at address creation, PAID at deposit
 /// confirmation, EXPIRED when the address expires unpaid. Payout events
-/// report the final outcome of every outgoing Lightning wallet payment.
+/// report the final outcome of Lightning wallet sends the gateway did not
+/// make as a withdrawal; withdrawal events follow a withdrawal's lifecycle;
+/// alert events report operational conditions (gas, caps, address book,
+/// stuck withdrawals).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum WebhookEventType {
     Pending,
@@ -255,15 +320,49 @@ pub enum WebhookEventType {
     Expired,
     PayoutSucceeded,
     PayoutFailed,
+    WithdrawalPendingApproval,
+    WithdrawalBroadcast,
+    WithdrawalConfirmed,
+    WithdrawalFailed,
+    WithdrawalCancelled,
+    GasReserveLow,
+    TreasuryCapExceeded,
+    AddressBookEntryAdded,
+    WithdrawalStuck,
+}
+
+/// What a webhook delivery is about — decides which `webhook_deliveries`
+/// column holds its subject id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WebhookSubject {
+    /// `deposits.id` (PAID).
+    Deposit,
+    /// `deposit_addresses.id` (PENDING / EXPIRED).
+    DepositAddress,
+    /// SDK payment id (payout events).
+    LightningPayment,
+    /// `withdrawals.id`.
+    Withdrawal,
+    /// `alerts.id`.
+    Alert,
 }
 
 impl WebhookEventType {
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 14] = [
         Self::Pending,
         Self::Paid,
         Self::Expired,
         Self::PayoutSucceeded,
         Self::PayoutFailed,
+        Self::WithdrawalPendingApproval,
+        Self::WithdrawalBroadcast,
+        Self::WithdrawalConfirmed,
+        Self::WithdrawalFailed,
+        Self::WithdrawalCancelled,
+        Self::GasReserveLow,
+        Self::TreasuryCapExceeded,
+        Self::AddressBookEntryAdded,
+        Self::WithdrawalStuck,
     ];
 
     pub fn as_db(&self) -> &'static str {
@@ -273,6 +372,15 @@ impl WebhookEventType {
             Self::Expired => "EXPIRED",
             Self::PayoutSucceeded => "PAYOUT_SUCCEEDED",
             Self::PayoutFailed => "PAYOUT_FAILED",
+            Self::WithdrawalPendingApproval => "WITHDRAWAL_PENDING_APPROVAL",
+            Self::WithdrawalBroadcast => "WITHDRAWAL_BROADCAST",
+            Self::WithdrawalConfirmed => "WITHDRAWAL_CONFIRMED",
+            Self::WithdrawalFailed => "WITHDRAWAL_FAILED",
+            Self::WithdrawalCancelled => "WITHDRAWAL_CANCELLED",
+            Self::GasReserveLow => "GAS_RESERVE_LOW",
+            Self::TreasuryCapExceeded => "TREASURY_CAP_EXCEEDED",
+            Self::AddressBookEntryAdded => "ADDRESS_BOOK_ENTRY_ADDED",
+            Self::WithdrawalStuck => "WITHDRAWAL_STUCK",
         }
     }
 
@@ -283,6 +391,15 @@ impl WebhookEventType {
             Self::Expired => "expired",
             Self::PayoutSucceeded => "payout_succeeded",
             Self::PayoutFailed => "payout_failed",
+            Self::WithdrawalPendingApproval => "withdrawal_pending_approval",
+            Self::WithdrawalBroadcast => "withdrawal_broadcast",
+            Self::WithdrawalConfirmed => "withdrawal_confirmed",
+            Self::WithdrawalFailed => "withdrawal_failed",
+            Self::WithdrawalCancelled => "withdrawal_cancelled",
+            Self::GasReserveLow => "gas_reserve_low",
+            Self::TreasuryCapExceeded => "treasury_cap_exceeded",
+            Self::AddressBookEntryAdded => "address_book_entry_added",
+            Self::WithdrawalStuck => "withdrawal_stuck",
         }
     }
 
@@ -293,37 +410,56 @@ impl WebhookEventType {
             Self::Pending => "payment_pending",
             Self::Paid => "deposit_confirmed",
             Self::Expired => "payment_expired",
-            Self::PayoutSucceeded => "payout_succeeded",
-            Self::PayoutFailed => "payout_failed",
+            other => other.as_api(),
+        }
+    }
+
+    pub fn subject(&self) -> WebhookSubject {
+        match self {
+            Self::Paid => WebhookSubject::Deposit,
+            Self::Pending | Self::Expired => WebhookSubject::DepositAddress,
+            Self::PayoutSucceeded | Self::PayoutFailed => WebhookSubject::LightningPayment,
+            Self::WithdrawalPendingApproval
+            | Self::WithdrawalBroadcast
+            | Self::WithdrawalConfirmed
+            | Self::WithdrawalFailed
+            | Self::WithdrawalCancelled => WebhookSubject::Withdrawal,
+            Self::GasReserveLow
+            | Self::TreasuryCapExceeded
+            | Self::AddressBookEntryAdded
+            | Self::WithdrawalStuck => WebhookSubject::Alert,
         }
     }
 
     /// Payout events are keyed on a Lightning wallet payment id, not on a
     /// deposit address.
     pub fn is_payout(&self) -> bool {
-        matches!(self, Self::PayoutSucceeded | Self::PayoutFailed)
+        self.subject() == WebhookSubject::LightningPayment
+    }
+
+    /// The webhook an alert of this type fires.
+    pub fn for_alert(alert: AlertType) -> Self {
+        match alert {
+            AlertType::GasReserveLow => Self::GasReserveLow,
+            AlertType::TreasuryCapExceeded => Self::TreasuryCapExceeded,
+            AlertType::AddressBookEntryAdded => Self::AddressBookEntryAdded,
+            AlertType::WithdrawalStuck => Self::WithdrawalStuck,
+        }
     }
 
     pub fn parse_api(value: &str) -> Result<Self, DomainError> {
-        match value.to_lowercase().as_str() {
-            "pending" => Ok(Self::Pending),
-            "paid" => Ok(Self::Paid),
-            "expired" => Ok(Self::Expired),
-            "payout_succeeded" => Ok(Self::PayoutSucceeded),
-            "payout_failed" => Ok(Self::PayoutFailed),
-            _ => Err(DomainError::InvalidStatus(value.to_string())),
-        }
+        let value = value.to_lowercase();
+        Self::ALL
+            .into_iter()
+            .find(|event| event.as_api() == value)
+            .ok_or(DomainError::InvalidStatus(value))
     }
 
     pub fn from_db(value: &str) -> Result<Self, DomainError> {
-        match value {
-            "PENDING" => Ok(Self::Pending),
-            "PAID" => Ok(Self::Paid),
-            "EXPIRED" => Ok(Self::Expired),
-            "PAYOUT_SUCCEEDED" => Ok(Self::PayoutSucceeded),
-            "PAYOUT_FAILED" => Ok(Self::PayoutFailed),
-            _ => Err(DomainError::InvalidStatus(value.to_string())),
-        }
+        Self::ALL
+            .into_iter()
+            .find(|event| event.as_db() == value)
+            .ok_or_else(|| DomainError::InvalidStatus(value.to_string()))
     }
 }
 
@@ -566,7 +702,7 @@ pub struct DetectedTransfer {
 pub enum DomainError {
     #[error("Unsupported network: {0}")]
     UnsupportedNetwork(String),
-    #[error("Unsupported token: {0}. Supported tokens: USDT, BTC.")]
+    #[error("Unsupported token: {0}. Supported tokens: USDT, BTC, ETH, TRX, SOL.")]
     UnsupportedToken(String),
     #[error("Invalid status: {0}")]
     InvalidStatus(String),
@@ -578,6 +714,10 @@ pub enum DomainError {
     InvalidSurface(String),
     #[error("Invalid window: {0}")]
     InvalidWindow(String),
+    #[error("Invalid destination kind: {0}")]
+    InvalidDestinationKind(String),
+    #[error("Transition not allowed: {0}")]
+    InvalidTransition(String),
 }
 
 /// Integer string in token base units → decimal amount (never via floats).
@@ -597,9 +737,71 @@ pub fn raw_to_decimal_string(raw: &str, token: Token) -> Result<String, DomainEr
 
 /// Decimal amount → integer string in token base units. Precision beyond the
 /// token's decimals is truncated (callers store amounts via `round_to_token`).
+/// Built from the mantissa rather than by multiplying: 10^18 times a large
+/// ETH amount overflows `Decimal` (≈ 7.9e28).
 pub fn decimal_to_raw(amount: Decimal, token: Token) -> String {
-    let scaled = amount * Decimal::from(10u64.pow(token.decimals()));
-    scaled.trunc().normalize().to_string()
+    let decimals = token.decimals();
+    let truncated = amount.round_dp_with_strategy(decimals, RoundingStrategy::ToZero);
+    let mantissa = truncated.mantissa();
+    if mantissa == 0 {
+        return "0".into();
+    }
+    let zeros = decimals.saturating_sub(truncated.scale()) as usize;
+    format!("{mantissa}{}", "0".repeat(zeros))
+}
+
+/// Base units → trimmed decimal string (`1500000000` lamports → `1.5`),
+/// exact for the whole `u128` range.
+pub fn raw_u128_to_string(raw: u128, token: Token) -> String {
+    let digits = raw.to_string();
+    let decimals = token.decimals() as usize;
+    if decimals == 0 {
+        return digits;
+    }
+    let padded = format!("{digits:0>width$}", width = decimals + 1);
+    let (int, frac) = padded.split_at(padded.len() - decimals);
+    let frac = frac.trim_end_matches('0');
+    if frac.is_empty() {
+        int.to_string()
+    } else {
+        format!("{int}.{frac}")
+    }
+}
+
+/// A client-supplied decimal amount (`"0.05"`) → base units, strictly:
+/// plain digits with an optional fraction, at most the token's decimals
+/// (never rounded), greater than zero, within `u128`.
+pub fn parse_amount_raw(value: &str, token: Token) -> Result<u128, DomainError> {
+    let invalid = || DomainError::InvalidAmount(value.to_string());
+    let (int, frac) = match value.split_once('.') {
+        Some((int, frac)) => (int, frac),
+        None => (value, ""),
+    };
+    let digits_only = |part: &str| part.bytes().all(|b| b.is_ascii_digit());
+    if int.is_empty()
+        || !digits_only(int)
+        || !digits_only(frac)
+        || (value.contains('.') && frac.is_empty())
+        || frac.len() > token.decimals() as usize
+    {
+        return Err(invalid());
+    }
+    let scale = 10u128.pow(token.decimals());
+    let int: u128 = int.parse().map_err(|_| invalid())?;
+    let frac_raw: u128 = if frac.is_empty() {
+        0
+    } else {
+        let padded = format!("{frac:0<width$}", width = token.decimals() as usize);
+        padded.parse().map_err(|_| invalid())?
+    };
+    let raw = int
+        .checked_mul(scale)
+        .and_then(|raw| raw.checked_add(frac_raw))
+        .ok_or_else(invalid)?;
+    if raw == 0 {
+        return Err(invalid());
+    }
+    Ok(raw)
 }
 
 /// Decimal string (plain or scientific notation, as provider JSON numbers
@@ -880,7 +1082,7 @@ mod tests {
         assert_eq!(Token::Btc.as_api(), "BTC");
         assert_eq!(Token::from_db("BTC").unwrap(), Token::Btc);
         assert_eq!(Token::from_db("USDT").unwrap(), Token::Usdt);
-        assert!(Token::parse_api("ETH").is_err());
+        assert!(Token::parse_api("DOGE").is_err());
     }
 
     #[test]
@@ -893,18 +1095,140 @@ mod tests {
             assert!(supports(network, Token::Btc), "{network:?} must accept BTC");
             assert!(!supports(network, Token::Usdt), "{network:?} must reject USDT");
         }
+        // Native ETH on Ethereum only.
+        assert!(supports(Network::Ethereum, Token::Eth));
+        for network in [Network::Tron, Network::Solana, Network::Bitcoin, Network::Lightning] {
+            assert!(!supports(network, Token::Eth), "{network:?} must reject ETH");
+        }
+        // Gas assets are never payments.
+        for network in Network::ALL {
+            assert!(!supports(network, Token::Trx), "{network:?} must reject TRX");
+            assert!(!supports(network, Token::Sol), "{network:?} must reject SOL");
+        }
     }
 
     #[test]
-    fn each_network_receives_its_own_token() {
-        assert_eq!(Network::Tron.token(), Token::Usdt);
-        assert_eq!(Network::Ethereum.token(), Token::Usdt);
-        assert_eq!(Network::Solana.token(), Token::Usdt);
-        assert_eq!(Network::Bitcoin.token(), Token::Btc);
-        assert_eq!(Network::Lightning.token(), Token::Btc);
+    fn payment_tokens_per_network() {
+        assert_eq!(Network::Tron.payment_tokens(), &[Token::Usdt]);
+        assert_eq!(Network::Ethereum.payment_tokens(), &[Token::Usdt, Token::Eth]);
+        assert_eq!(Network::Solana.payment_tokens(), &[Token::Usdt]);
+        assert_eq!(Network::Bitcoin.payment_tokens(), &[Token::Btc]);
+        assert_eq!(Network::Lightning.payment_tokens(), &[Token::Btc]);
         for network in Network::ALL {
-            assert!(supports(network, network.token()));
+            for token in network.payment_tokens() {
+                assert!(supports(network, *token));
+            }
         }
+    }
+
+    #[test]
+    fn gas_and_withdrawable_tokens_per_network() {
+        assert_eq!(Network::Ethereum.gas_token(), Some(Token::Eth));
+        assert_eq!(Network::Tron.gas_token(), Some(Token::Trx));
+        assert_eq!(Network::Solana.gas_token(), Some(Token::Sol));
+        assert_eq!(Network::Bitcoin.gas_token(), Some(Token::Btc));
+        assert_eq!(Network::Lightning.gas_token(), None);
+
+        // Payment tokens + gas token, deduplicated (ETH is both on Ethereum).
+        assert_eq!(Network::Ethereum.withdrawable_tokens(), &[Token::Usdt, Token::Eth]);
+        assert_eq!(Network::Tron.withdrawable_tokens(), &[Token::Usdt, Token::Trx]);
+        assert_eq!(Network::Solana.withdrawable_tokens(), &[Token::Usdt, Token::Sol]);
+        assert_eq!(Network::Bitcoin.withdrawable_tokens(), &[Token::Btc]);
+        assert_eq!(Network::Lightning.withdrawable_tokens(), &[Token::Btc]);
+        for network in Network::ALL {
+            for token in network.payment_tokens() {
+                assert!(network.withdrawable_tokens().contains(token));
+            }
+            if let Some(gas) = network.gas_token() {
+                assert!(network.withdrawable_tokens().contains(&gas));
+            }
+        }
+        assert!(is_withdrawable(Network::Tron, Token::Trx));
+        assert!(!is_withdrawable(Network::Ethereum, Token::Trx));
+
+        // Fees: the gas token, BTC for Lightning.
+        assert_eq!(Network::Lightning.fee_token(), Token::Btc);
+        assert_eq!(Network::Tron.fee_token(), Token::Trx);
+    }
+
+    #[test]
+    fn gas_assets_are_flagged() {
+        assert!(Token::Trx.is_gas_only());
+        assert!(Token::Sol.is_gas_only());
+        for token in [Token::Usdt, Token::Btc, Token::Eth] {
+            assert!(!token.is_gas_only(), "{token:?}");
+        }
+    }
+
+    #[test]
+    fn every_token_casing_roundtrips() {
+        for token in Token::ALL {
+            assert_eq!(Token::from_db(token.as_db()).unwrap(), token);
+            assert_eq!(Token::parse_api(&token.as_api().to_lowercase()).unwrap(), token);
+        }
+        assert_eq!(Token::Eth.as_db(), "ETH");
+        assert_eq!(Token::Trx.as_api(), "TRX");
+        assert_eq!(Token::parse_api("sol").unwrap(), Token::Sol);
+        let err = Token::parse_api("DOGE").unwrap_err().to_string();
+        for token in Token::ALL {
+            assert!(err.contains(token.as_api()), "{err}");
+        }
+    }
+
+    #[test]
+    fn token_decimals_cover_the_new_assets() {
+        assert_eq!(Token::Eth.decimals(), ETH_DECIMALS);
+        assert_eq!(ETH_DECIMALS, 18);
+        assert_eq!(Token::Trx.decimals(), TRX_DECIMALS);
+        assert_eq!(TRX_DECIMALS, 6);
+        assert_eq!(Token::Sol.decimals(), SOL_DECIMALS);
+        assert_eq!(SOL_DECIMALS, 9);
+    }
+
+    #[test]
+    fn wei_conversions_are_exact_without_overflow() {
+        assert_eq!(raw_to_decimal("1", Token::Eth).unwrap(), dec!(0.000000000000000001));
+        assert_eq!(raw_to_decimal("1000000000000000000", Token::Eth).unwrap(), dec!(1));
+        assert_eq!(
+            raw_to_decimal("1000000000000000000000000", Token::Eth).unwrap(),
+            dec!(1000000)
+        );
+        assert_eq!(decimal_to_raw(dec!(0.000000000000000001), Token::Eth), "1");
+        assert_eq!(decimal_to_raw(dec!(1), Token::Eth), "1000000000000000000");
+        assert_eq!(decimal_to_raw(dec!(1000000), Token::Eth), "1000000000000000000000000");
+        assert_eq!(decimal_to_raw(dec!(0.05), Token::Eth), "50000000000000000");
+        // Far beyond what Decimal can hold once scaled: exact, no panic.
+        assert_eq!(
+            decimal_to_raw(dec!(100000000000000000000), Token::Eth),
+            "100000000000000000000000000000000000000"
+        );
+        assert_eq!(decimal_to_raw(dec!(0), Token::Eth), "0");
+        assert_eq!(format_amount(dec!(0.05), Token::Eth), "0.050000000000000000");
+        assert_eq!(raw_u128_to_string(1, Token::Eth), "0.000000000000000001");
+        assert_eq!(raw_u128_to_string(10u128.pow(24), Token::Eth), "1000000");
+        assert_eq!(raw_u128_to_string(1_500_000_000, Token::Sol), "1.5");
+        assert_eq!(raw_u128_to_string(0, Token::Trx), "0");
+        assert_eq!(raw_u128_to_string(u128::MAX, Token::Eth), "340282366920938463463.374607431768211455");
+    }
+
+    #[test]
+    fn decimal_amounts_parse_to_base_units_exactly() {
+        assert_eq!(parse_amount_raw("0.05", Token::Eth).unwrap(), 50_000_000_000_000_000);
+        assert_eq!(parse_amount_raw("1", Token::Eth).unwrap(), 10u128.pow(18));
+        assert_eq!(parse_amount_raw("0.000000000000000001", Token::Eth).unwrap(), 1);
+        assert_eq!(parse_amount_raw("25.5", Token::Usdt).unwrap(), 25_500_000);
+        assert_eq!(parse_amount_raw("100000", Token::Eth).unwrap(), 10u128.pow(23));
+        assert_eq!(parse_amount_raw("0.1", Token::Sol).unwrap(), 100_000_000);
+        for bad in [
+            "", "0", "0.0", "-1", "+1", "1e3", "1.", ".5", "1.2.3", " 1", "abc",
+            // More decimals than the token has: refused, never rounded.
+            "0.0000001",
+            // Overflows u128.
+            "999999999999999999999999999999999999999999",
+        ] {
+            assert!(parse_amount_raw(bad, Token::Usdt).is_err(), "{bad:?}");
+        }
+        assert!(parse_amount_raw("0.0000000000000000001", Token::Eth).is_err());
     }
 
     #[test]
@@ -1000,7 +1324,42 @@ mod tests {
         );
         assert_eq!(WebhookEventType::PayoutFailed.payload_event_type(), "payout_failed");
         assert!(WebhookEventType::from_db("payout_failed").is_err());
-        assert_eq!(WebhookEventType::ALL.len(), 5);
+        assert_eq!(WebhookEventType::ALL.len(), 14);
+    }
+
+    #[test]
+    fn withdrawal_and_alert_events_roundtrip_and_name_their_subject() {
+        for event in WebhookEventType::ALL {
+            assert_eq!(WebhookEventType::from_db(event.as_db()).unwrap(), event);
+            assert_eq!(WebhookEventType::parse_api(event.as_api()).unwrap(), event);
+        }
+        for (event, db, api) in [
+            (WebhookEventType::WithdrawalPendingApproval, "WITHDRAWAL_PENDING_APPROVAL", "withdrawal_pending_approval"),
+            (WebhookEventType::WithdrawalBroadcast, "WITHDRAWAL_BROADCAST", "withdrawal_broadcast"),
+            (WebhookEventType::WithdrawalConfirmed, "WITHDRAWAL_CONFIRMED", "withdrawal_confirmed"),
+            (WebhookEventType::WithdrawalFailed, "WITHDRAWAL_FAILED", "withdrawal_failed"),
+            (WebhookEventType::WithdrawalCancelled, "WITHDRAWAL_CANCELLED", "withdrawal_cancelled"),
+            (WebhookEventType::GasReserveLow, "GAS_RESERVE_LOW", "gas_reserve_low"),
+            (WebhookEventType::TreasuryCapExceeded, "TREASURY_CAP_EXCEEDED", "treasury_cap_exceeded"),
+            (WebhookEventType::AddressBookEntryAdded, "ADDRESS_BOOK_ENTRY_ADDED", "address_book_entry_added"),
+            (WebhookEventType::WithdrawalStuck, "WITHDRAWAL_STUCK", "withdrawal_stuck"),
+        ] {
+            assert_eq!(event.as_db(), db);
+            assert_eq!(event.as_api(), api);
+            // Payload names equal the API names for the new events.
+            assert_eq!(event.payload_event_type(), api);
+        }
+        assert_eq!(WebhookEventType::Paid.subject(), WebhookSubject::Deposit);
+        assert_eq!(WebhookEventType::Expired.subject(), WebhookSubject::DepositAddress);
+        assert_eq!(WebhookEventType::PayoutFailed.subject(), WebhookSubject::LightningPayment);
+        assert_eq!(WebhookEventType::WithdrawalBroadcast.subject(), WebhookSubject::Withdrawal);
+        assert_eq!(WebhookEventType::WithdrawalStuck.subject(), WebhookSubject::Alert);
+        for alert in AlertType::ALL {
+            let event = WebhookEventType::for_alert(*alert);
+            assert_eq!(event.subject(), WebhookSubject::Alert);
+            assert_eq!(event.as_db(), alert.as_db());
+        }
+        assert!(!WebhookEventType::WithdrawalFailed.is_payout());
     }
 
     #[test]

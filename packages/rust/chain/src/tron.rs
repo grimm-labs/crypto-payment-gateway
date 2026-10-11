@@ -10,7 +10,6 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Mutex, PoisonError};
 
-use config::USDT_TRON;
 use serde::Deserialize;
 
 /// Txids whose solidified block is remembered; past this, the oldest are
@@ -54,12 +53,12 @@ pub(crate) struct Trc20Candidate {
 /// USDT `Transfer` events paying `address`. Anything else — another token,
 /// an `Approval` naming the address as spender, a transfer elsewhere, a
 /// malformed txid or amount — is dropped.
-pub(crate) fn usdt_transfers_to(txs: Vec<Trc20Tx>, address: &str) -> Vec<Trc20Candidate> {
+pub(crate) fn usdt_transfers_to(txs: Vec<Trc20Tx>, usdt_contract: &str, address: &str) -> Vec<Trc20Candidate> {
     txs.into_iter()
         .filter_map(|tx| {
             if tx.kind.as_deref() != Some("Transfer")
                 || tx.to.as_deref() != Some(address)
-                || tx.token_info.and_then(|t| t.address).as_deref() != Some(USDT_TRON)
+                || tx.token_info.and_then(|t| t.address).as_deref() != Some(usdt_contract)
             {
                 return None;
             }
@@ -181,6 +180,7 @@ impl TxBlockCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use config::USDT_TRON;
 
     const ADDRESS: &str = "TJDENsfBJs4RFETt1X1W8wMDc8M5XnJhCe";
     const TX_A: &str = "4e5169e0889ec563b270240c27c3a1b4a517a86ec6a2ffc0cc33da4b4d107048";
@@ -269,7 +269,7 @@ mod tests {
 
     #[test]
     fn real_trc20_page_yields_its_usdt_transfers() {
-        let candidates = usdt_transfers_to(page(TRC20_PAGE), ADDRESS);
+        let candidates = usdt_transfers_to(page(TRC20_PAGE), USDT_TRON, ADDRESS);
         assert_eq!(
             candidates,
             vec![
@@ -300,7 +300,7 @@ mod tests {
             entry(TX_B, USDT_TRON, ADDRESS, "Transfer", "25000000"),
         );
         assert_eq!(
-            usdt_transfers_to(page(&json), ADDRESS),
+            usdt_transfers_to(page(&json), USDT_TRON, ADDRESS),
             vec![Trc20Candidate { tx_id: TX_B.into(), amount_raw: "25000000".into() }]
         );
     }
@@ -308,7 +308,7 @@ mod tests {
     #[test]
     fn empty_or_error_pages_have_no_data() {
         let empty: Trc20Page = serde_json::from_str(r#"{ "data": [], "success": true, "meta": {} }"#).unwrap();
-        assert!(usdt_transfers_to(empty.data.unwrap(), ADDRESS).is_empty());
+        assert!(usdt_transfers_to(empty.data.unwrap(), USDT_TRON, ADDRESS).is_empty());
         let failed: Trc20Page =
             serde_json::from_str(r#"{ "success": false, "error": "bad address", "statusCode": 400 }"#)
                 .unwrap();

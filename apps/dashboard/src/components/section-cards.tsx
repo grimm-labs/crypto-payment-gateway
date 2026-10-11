@@ -42,15 +42,19 @@ export function SectionCards() {
           <CardAction>
             <Badge variant="outline">
               <WalletIcon />
-              {availableNetworks}/{networks.length} networks
+              {availableNetworks}/{networks.length} assets
             </Badge>
           </CardAction>
         </CardHeader>
         <CardFooter className="flex-col items-start gap-1.5 text-sm">
           <div className="line-clamp-1 flex gap-2 font-medium">
             {balances.data?.total_btc !== undefined
-              ? `+ ${formatAmount(balances.data.total_btc, "BTC")} (Bitcoin & Lightning)`
-              : "Across all HD wallet addresses"}
+              ? `+ ${formatAmount(balances.data.total_btc, "BTC")}${
+                  balances.data.total_eth !== undefined
+                    ? ` · ${formatAmount(balances.data.total_eth, "ETH")}`
+                    : ""
+                }`
+              : "Treasuries and deposit addresses"}
           </div>
           <div className="text-muted-foreground">
             {balances.data?.updated_at

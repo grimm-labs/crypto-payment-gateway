@@ -8,6 +8,7 @@ license.workspace = true
 anyhow.workspace = true
 async-trait.workspace = true
 breez-sdk-spark.workspace = true
+thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 

@@ -41,6 +41,8 @@ export type DepositAddressStatus = "pending" | "paid" | "expired"
 export type DepositStatus = "detected" | "confirmed"
 export type WebhookStatus = "pending" | "delivered" | "failed"
 export type Network = "tron" | "ethereum" | "solana" | "bitcoin" | "lightning"
+/** API token codes. TRX and SOL are gas assets: never accepted as payments. */
+export type Token = "USDT" | "BTC" | "ETH" | "TRX" | "SOL"
 
 // All amounts are decimal strings — never parse them into floats.
 export interface DepositAddress {
@@ -51,7 +53,7 @@ export interface DepositAddress {
   token: string
   status: DepositAddressStatus
   expected_amount: string
-  /** Base units: sats for BTC, 10^-6 for USDT. */
+  /** Base units of the row's token: sats for BTC, wei for ETH, 10^-6 for USDT. */
   expected_amount_raw: string
   expires_at: string
   created_at: string
@@ -95,6 +97,15 @@ export type WebhookEventType =
   | "expired"
   | "payout_succeeded"
   | "payout_failed"
+  | "withdrawal_pending_approval"
+  | "withdrawal_broadcast"
+  | "withdrawal_confirmed"
+  | "withdrawal_failed"
+  | "withdrawal_cancelled"
+  | "gas_reserve_low"
+  | "treasury_cap_exceeded"
+  | "address_book_entry_added"
+  | "withdrawal_stuck"
 
 export interface WebhookDelivery {
   id: string
@@ -106,6 +117,10 @@ export interface WebhookDelivery {
   deposit_address_id: string | null
   /** Lightning wallet payment id — payout deliveries only. */
   lightning_payment_id: string | null
+  /** Withdrawal lifecycle deliveries only. */
+  withdrawal_id?: string | null
+  /** Operational alert deliveries only. */
+  alert_id?: string | null
   /** null on deliveries from before per-endpoint tracking. */
   webhook_endpoint_id: string | null
   endpoint_url: string | null
@@ -114,7 +129,7 @@ export interface WebhookDelivery {
   /** null on payout deliveries. */
   address: string | null
   network: Network | "unknown"
-  /** Deposit amount for paid events, expected amount for address events, sent amount for payouts. */
+  /** Deposit amount for paid events, expected amount for address events, sent amount for payouts and withdrawals. */
   amount: string | null
   deposit_status: DepositStatus | null
   status: WebhookStatus
@@ -129,7 +144,30 @@ export interface WebhookDelivery {
 
 export type ApiKeyStatus = "active" | "revoked" | "expired"
 
-export interface ApiKey {
+/** Destination policy of a merchant key: `book` = address-book entries
+ *  only, `open` = any destination within the key's own limits. */
+export type WithdrawalPolicy = "none" | "book" | "open"
+
+/** Tokens a merchant key may be allowed to withdraw (gas assets are admin-only). */
+export type KeyWithdrawalToken = "USDT" | "BTC" | "ETH"
+
+export interface ApiKeyWithdrawalLimit {
+  token: Token
+  max_per_withdrawal: string | null
+  max_per_withdrawal_raw: string
+  daily_max: string | null
+  daily_max_raw: string
+}
+
+export interface ApiKeyWithdrawalGrant {
+  withdrawal_policy: WithdrawalPolicy
+  withdrawal_tokens: string[]
+  /** null = every network of the allowed tokens. */
+  withdrawal_networks: Network[] | null
+  withdrawal_limits: ApiKeyWithdrawalLimit[]
+}
+
+export interface ApiKey extends ApiKeyWithdrawalGrant {
   id: string
   name: string
   prefix: string
@@ -137,14 +175,12 @@ export interface ApiKey {
   created_by: string | null
   last_used_at: string | null
   revoked_at: string | null
-  /** null = never expires (revocable only). */
+  /** null = never expires (revocable only — such a key never withdraws). */
   expires_at: string | null
-  /** May send Lightning payouts through /api/v1. */
-  can_send: boolean
   created_at: string
 }
 
-export interface CreatedApiKey {
+export interface CreatedApiKey extends ApiKeyWithdrawalGrant {
   id: string
   name: string
   prefix: string
@@ -152,8 +188,17 @@ export interface CreatedApiKey {
   key: string
   status: ApiKeyStatus
   expires_at: string | null
-  can_send: boolean
   created_at: string
+}
+
+export interface ApiKeyWithdrawalGrantUpdate {
+  withdrawal_policy: WithdrawalPolicy
+  withdrawal_tokens: KeyWithdrawalToken[]
+  withdrawal_networks: Network[] | null
+  /** Decimal token amounts; "0" disables. Required for every token of an open key. */
+  withdrawal_limits: Array<{ token: KeyWithdrawalToken; max_per_withdrawal: string; daily_max: string }>
+  /** Step-up code — required unless the policy is set to none. */
+  totp_code?: string
 }
 
 export interface AdminStats {
@@ -163,11 +208,18 @@ export interface AdminStats {
   webhooks: { pending: number; delivered: number; failed: number }
 }
 
+/** One (network, token): treasury + unswept deposit addresses. */
 export interface NetworkBalance {
   network: string
   token: string
   amount: string
   amount_raw: string
+  /** null when unreadable (or cached before treasuries existed). */
+  treasury_amount?: string | null
+  treasury_amount_raw?: string | null
+  /** Held on deposit addresses, not swept yet. */
+  deposits_amount?: string
+  deposits_amount_raw?: string
   available: boolean
   message?: string
   indices_scanned?: number
@@ -178,6 +230,10 @@ export interface WalletBalances {
   total_usdt: string
   /** Bitcoin + Lightning — never folded into total_usdt. */
   total_btc?: string
+  total_eth?: string
+  /** Gas reserves (treasuries). */
+  total_trx?: string
+  total_sol?: string
   networks: NetworkBalance[]
   updated_at?: string | null
 }
@@ -209,15 +265,6 @@ export interface LightningPayment {
   deposit_address_id: string | null
 }
 
-/** Fee quote shown on the payout review step. All values are integer sats strings. */
-export interface LightningQuote {
-  ln_address: string
-  amount_sats: string
-  fees_sats: string
-  /** amount + fees. */
-  total_sats: string
-}
-
 /** No total from the SDK: paging is driven by `has_more`. */
 export interface LightningPaymentsPage {
   data: LightningPayment[]
@@ -233,10 +280,6 @@ export interface AppSettings {
   totp_issuer: string
   /** Days the API traffic log is kept; null = forever. */
   api_traffic_retention_days: number | null
-  /** Max sats per Lightning payout (fees excluded); 0 = payouts disabled. */
-  payout_max_sats: number
-  /** Max sats sent over a rolling 24 h window; 0 = payouts disabled. */
-  payout_daily_max_sats: number
 }
 
 /** PATCH /settings is partial — only provided fields are updated. */
@@ -247,10 +290,6 @@ export type AppSettingsUpdate = Partial<{
   totp_issuer: string
   /** 1–3650 days, or null to keep forever. */
   api_traffic_retention_days: number | null
-  payout_max_sats: number
-  payout_daily_max_sats: number
-  /** Step-up code — required when a payout limit is present. */
-  totp_code: string
 }>
 
 /** `merchant` = /api/v1 (API keys), `admin` = dashboard calls, `all` = both. */
@@ -353,5 +392,294 @@ export interface AuditLogEntry {
   target_id: string | null
   details: Record<string, unknown>
   ip: string | null
+  created_at: string
+}
+
+// ---------------------------------------------------------------- withdrawals
+// Amounts: `x` is a decimal string in token units, `x_raw` the integer string
+// in base units — never parsed into floats.
+
+export type WithdrawalStatus =
+  | "pending_approval"
+  | "queued"
+  | "signed"
+  | "broadcast"
+  | "confirmed"
+  | "failed"
+  | "cancelled"
+  | "stuck"
+
+export type DestinationKind = "address" | "ln_address" | "bolt11"
+
+export interface Requester {
+  type: "api_key" | "staff"
+  id: string
+}
+
+export interface Withdrawal {
+  id: string
+  status: WithdrawalStatus
+  network: Network
+  token: Token
+  amount: string
+  amount_raw: string
+  fee_estimate: string | null
+  fee_estimate_raw: string | null
+  /** Actual fee, recorded once the network settled it. */
+  fee: string | null
+  fee_raw: string | null
+  /** What the fee is paid in (the network's gas asset, BTC on bitcoin/lightning). */
+  fee_token: Token
+  destination: string
+  destination_kind: DestinationKind
+  address_book_entry_id: string | null
+  approval_required: boolean
+  /** Staff id of the approving admin. */
+  approved_by: string | null
+  approved_at: string | null
+  /** Pending approvals are cancelled (expired) after this. */
+  approval_expires_at: string | null
+  /** Single-admin instance: the requester may approve their own after this. */
+  self_approval_not_before: string | null
+  cancel_reason: string | null
+  /** On-chain hash — the wallet payment id on lightning. */
+  tx_hash: string | null
+  confirmations: number | null
+  failure_reason: string | null
+  reference: string | null
+  comment: string | null
+  metadata: Record<string, unknown> | null
+  requested_by: Requester | null
+  created_at: string
+  updated_at: string
+  broadcast_at: string | null
+  confirmed_at: string | null
+}
+
+export type OutboundPurpose = "withdrawal" | "sweep" | "gas_topup"
+export type OutboundTxStatus = "signed" | "broadcast" | "confirmed" | "failed" | "replaced" | "expired"
+
+export interface OutboundTx {
+  id: string
+  purpose: OutboundPurpose
+  tx_hash: string | null
+  status: OutboundTxStatus
+  from_address: string | null
+  to_address: string | null
+  nonce: number | null
+  /** In the network's fee token. */
+  fee_raw: string | null
+  /** The transaction this one replaced (fee bump). */
+  replaces_id: string | null
+  block_number: number | null
+  confirmations: number | null
+  last_error: string | null
+  created_at: string
+  broadcast_at: string | null
+  confirmed_at: string | null
+}
+
+export interface WithdrawalDetail extends Withdrawal {
+  transactions: OutboundTx[]
+}
+
+export interface WithdrawalQuote {
+  network: Network
+  token: Token
+  amount: string
+  amount_raw: string
+  fee_estimate: string
+  fee_estimate_raw: string
+  fee_token: Token
+  approval_required: boolean
+  destination: string
+  destination_kind: DestinationKind
+  address_book_entry_id: string | null
+  /** False when this caller may not send to this destination (see refusal). */
+  destination_acceptable: boolean
+  destination_refusal: string | null
+  /** Available balance of the token; null when unreadable. */
+  available: string | null
+  available_raw: string | null
+  /** Available balance of the fee token. */
+  fee_available: string | null
+  fee_available_raw: string | null
+}
+
+export interface WithdrawalRequest {
+  network: Network
+  token: Token
+  /** Decimal token amount — or `amount_sats` on bitcoin/lightning. */
+  amount?: string
+  amount_sats?: string
+  /** Exactly one of destination / address_book_entry_id. */
+  destination?: string
+  address_book_entry_id?: string
+  reference?: string
+  /** Lightning only. */
+  comment?: string
+  metadata?: Record<string, unknown>
+}
+
+export interface AddressBookEntry {
+  id: string
+  network: Network
+  destination_kind: DestinationKind
+  destination: string
+  label: string
+  is_cold_storage: boolean
+  /** Usable once the cooling-off delay (24 h) has passed. */
+  active: boolean
+  active_at: string
+  created_by: string | null
+  created_at: string
+}
+
+export interface TreasuryRow {
+  network: Network
+  token: Token
+  treasury_address: string | null
+  /** Solana USDT: the token account holding the treasury's USDT. */
+  token_account: string | null
+  confirmed: string | null
+  confirmed_raw: string | null
+  reserved: string | null
+  reserved_raw: string
+  /** Estimated fees of reserved withdrawals paid in this token. */
+  reserved_fees_raw: string
+  available_amount: string | null
+  available_raw: string | null
+  unswept: string | null
+  unswept_raw: string
+  unattributed: string | null
+  unattributed_raw: string
+  gas_floor: string | null
+  gas_floor_raw: string | null
+  gas_alert_below: string | null
+  gas_alert_below_raw: string | null
+  gas_low: boolean
+  hot_wallet_cap: string | null
+  hot_wallet_cap_raw: string | null
+  cap_exceeded: boolean
+  /** Whether the balance could be read. */
+  available: boolean
+  message: string | null
+}
+
+export interface TreasuryView {
+  data: TreasuryRow[]
+  outflows_frozen: boolean
+}
+
+export type SweepStatus =
+  | "planned"
+  | "topup_sent"
+  | "ready"
+  | "broadcast"
+  | "confirmed"
+  | "failed"
+  | "skipped"
+
+export interface Sweep {
+  id: string
+  network: Network
+  token: Token
+  deposit_address_id: string | null
+  from_address: string
+  amount: string
+  amount_raw: string
+  /** Part of the amount settling confirmed deposits. */
+  credited: string
+  /** Unattributed funds swept along (settled no payment). */
+  unattributed: string
+  unattributed_raw: string
+  fee: string | null
+  fee_token: Token
+  status: SweepStatus
+  last_error: string | null
+  created_at: string
+  updated_at: string
+}
+
+export type AlertType =
+  | "gas_reserve_low"
+  | "treasury_cap_exceeded"
+  | "address_book_entry_added"
+  | "withdrawal_stuck"
+
+export interface Alert {
+  alert_id: string
+  type: AlertType
+  network: Network | null
+  token: Token | null
+  details: Record<string, unknown>
+  created_at: string
+}
+
+export interface OutflowsState {
+  frozen: boolean
+  /** OUTFLOWS_FROZEN=true: the freeze cannot be lifted from the dashboard. */
+  forced_by_environment: boolean
+}
+
+export interface AmountSetting {
+  amount: string
+  raw: string
+}
+
+export interface AssetSettings {
+  token: Token
+  max_per_withdrawal: AmountSetting
+  daily_max: AmountSetting
+  approval_threshold: AmountSetting
+  hot_wallet_cap: AmountSetting | null
+  gas_reserve_floor: AmountSetting | null
+  gas_alert_below: AmountSetting | null
+  /** ETH, TRX, SOL: held in treasuries to pay network fees. */
+  is_gas_asset: boolean
+  updated_at: string
+}
+
+export interface SweepSetting {
+  network: Network
+  token: Token
+  minimum: string
+  minimum_raw: string
+  enabled: boolean
+}
+
+export interface AssetSettingsView {
+  assets: AssetSettings[]
+  sweeps: SweepSetting[]
+}
+
+/** PATCH /settings/assets — only the fields present are changed. */
+export interface AssetSettingsUpdate {
+  assets: Partial<
+    Record<
+      Token,
+      Partial<{
+        max_per_withdrawal: string
+        daily_max: string
+        approval_threshold: string
+        /** null clears the optional settings. */
+        hot_wallet_cap: string | null
+        gas_reserve_floor: string | null
+        gas_alert_below: string | null
+      }>
+    >
+  >
+  sweeps: Array<{ network: Network; token: Token; minimum?: string; enabled?: boolean }>
+  totp_code: string
+}
+
+/** Pre-withdrawal Lightning payout (read-only history). */
+export interface LegacyPayoutRequest {
+  id: string
+  ln_address: string
+  amount_sats: string
+  status: string
+  payment_id: string | null
+  requested_by: Requester | null
   created_at: string
 }

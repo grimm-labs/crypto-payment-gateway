@@ -36,8 +36,9 @@ pub const INVALID_API_KEY_PER_IP: Limit = Limit { scope: "api-key-invalid-ip", m
 pub const DEPOSIT_ADDRESS_CREATION: Limit = Limit { scope: "address-create", max: 120, window_secs: 60 };
 /// Merchant webhook replays, per deposit.
 pub const WEBHOOK_REPLAY_PER_DEPOSIT: Limit = Limit { scope: "webhook-replay", max: 1, window_secs: 60 };
-/// Payout sends and quotes, per caller.
-pub const PAYOUTS: Limit = Limit { scope: "payout", max: 10, window_secs: 60 };
+/// Withdrawal creations and quotes (the Lightning payout alias included),
+/// per caller.
+pub const WITHDRAWALS: Limit = Limit { scope: "withdrawal", max: 10, window_secs: 60 };
 
 fn window_key(state: &AppState, limit: Limit, id: &str, now: i64) -> (String, i64) {
     let window = now.div_euclid(limit.window_secs);
@@ -110,7 +111,7 @@ mod tests {
             INVALID_API_KEY_PER_IP,
             DEPOSIT_ADDRESS_CREATION,
             WEBHOOK_REPLAY_PER_DEPOSIT,
-            PAYOUTS,
+            WITHDRAWALS,
         ] {
             assert!(limit.max >= 1 && limit.window_secs >= 1, "{}", limit.scope);
         }

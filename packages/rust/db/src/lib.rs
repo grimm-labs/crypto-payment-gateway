@@ -2,35 +2,55 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use domain::{
     DepositAddressStatus, DepositStatus, Network, Token, WebhookDeliveryStatus, WebhookEventType,
+    WebhookSubject,
 };
 use rust_decimal::Decimal;
 use serde_json::Value;
 use sqlx::{postgres::PgPoolOptions, FromRow, PgPool};
 use uuid::Uuid;
 
+mod address_book;
 mod admin_queries;
+mod alerts;
+mod amount;
 mod api_keys;
 mod api_traffic;
+mod asset_settings;
 mod audit;
+pub mod outbound;
 mod payouts;
 mod settings;
 mod staff;
+mod sweeps;
 mod webhook_endpoints;
+mod withdrawals;
 
-pub use admin_queries::{AdminStats, DailyDepositStat, WebhookDeliveryDetailRow};
-pub use api_keys::{ApiKeyListRow, ApiKeyRow};
+pub use address_book::{AddressBookEntryRow, NewAddressBookEntry};
+pub use admin_queries::{AdminStats, DailyDepositStat, FailedWebhookTarget, WebhookDeliveryDetailRow};
+pub use alerts::{AlertRow, NewAlert};
+pub use amount::RawAmount;
+pub use api_keys::{ApiKeyListRow, ApiKeyRow, WithdrawalGrant};
+pub use asset_settings::{
+    ApiKeyWithdrawalLimitRow, AssetSettingsRow, AssetSettingsUpdate, SweepSettingsRow,
+};
+pub use outbound::{NewOutboundTx, OutboundTxRow, OutboundUpdate};
 pub use api_traffic::{
     ApiRequestFilter, ApiRequestRow, ApiTrafficEvent, TrafficApiKeyStat, TrafficBucket,
     TrafficRouteStat, TrafficSummary,
 };
 pub use audit::{AuditActor, AuditLogRow, NewAuditEntry};
-pub use payouts::{NewPayoutRequest, PayoutRequestRow, PayoutReservation};
+pub use payouts::PayoutRequestRow;
 pub use settings::{
     API_KEY_PREFIX_SETTING, API_TRAFFIC_RETENTION_FOREVER, API_TRAFFIC_RETENTION_SETTING,
-    DEPOSIT_EXPIRY_SETTING, PAYOUT_DAILY_MAX_SETTING, PAYOUT_MAX_SETTING, TOTP_ISSUER_SETTING,
+    DEPOSIT_EXPIRY_SETTING, OUTFLOWS_FROZEN_SETTING, TOTP_ISSUER_SETTING,
 };
 pub use staff::{StaffUpdate, StaffUserRow};
+pub use sweeps::{NewSweep, SweepCandidate, SweepClaim, SweepRow};
 pub use webhook_endpoints::{WebhookEndpointListRow, WebhookEndpointRow};
+pub use withdrawals::{
+    NewWithdrawal, Reservations, WithdrawalAdmission, WithdrawalClaim, WithdrawalFilter,
+    WithdrawalRow, WithdrawalUpdate,
+};
 
 #[derive(Clone)]
 pub struct Db {
@@ -43,7 +63,7 @@ pub struct Db {
 // are UTC instants) instead of using SELECT * / RETURNING *.
 const DEPOSIT_ADDRESS_COLUMNS: &str = r#"id, network::text AS network, token::text AS token, address, "derivationIndex", "expectedAmount", status::text AS status, "expiresAt" AT TIME ZONE 'UTC' AS "expiresAt", metadata, "apiKeyId", "createdAt" AT TIME ZONE 'UTC' AS "createdAt", "updatedAt" AT TIME ZONE 'UTC' AS "updatedAt""#;
 const DEPOSIT_COLUMNS: &str = r#"id, "depositAddressId", "txHash", amount, "amountRaw", confirmations, status::text AS status, "detectedAt" AT TIME ZONE 'UTC' AS "detectedAt", "confirmedAt" AT TIME ZONE 'UTC' AS "confirmedAt""#;
-const WEBHOOK_DELIVERY_COLUMNS: &str = r#"id, "depositId", "depositAddressId", "lightningPaymentId", "eventType", "webhookEndpointId", status::text AS status, attempts, "lastResponse", "lastError", "createdAt" AT TIME ZONE 'UTC' AS "createdAt", "updatedAt" AT TIME ZONE 'UTC' AS "updatedAt""#;
+const WEBHOOK_DELIVERY_COLUMNS: &str = r#"id, "depositId", "depositAddressId", "lightningPaymentId", "withdrawalId", "alertId", "eventType", "webhookEndpointId", status::text AS status, attempts, "lastResponse", "lastError", "createdAt" AT TIME ZONE 'UTC' AS "createdAt", "updatedAt" AT TIME ZONE 'UTC' AS "updatedAt""#;
 
 #[derive(Debug, Clone, FromRow)]
 pub struct DepositAddressRow {
@@ -99,6 +119,12 @@ pub struct WebhookDeliveryRow {
     /// SDK payment id — set on payout deliveries only.
     #[sqlx(rename = "lightningPaymentId")]
     pub lightning_payment_id: Option<String>,
+    /// Set on withdrawal deliveries only.
+    #[sqlx(rename = "withdrawalId")]
+    pub withdrawal_id: Option<String>,
+    /// Set on alert deliveries only.
+    #[sqlx(rename = "alertId")]
+    pub alert_id: Option<String>,
     /// DB value of the `WebhookEventType` this delivery notifies.
     #[sqlx(rename = "eventType")]
     pub event_type: String,
@@ -353,6 +379,8 @@ impl Db {
         Ok(rows)
     }
 
+    /// Every address issued on `network` (whatever token it was issued
+    /// for — an address can hold any token of its network).
     pub async fn addresses_for_network(&self, network: Network) -> Result<Vec<String>> {
         let rows: Vec<(String,)> = sqlx::query_as(
             r#"SELECT DISTINCT address FROM deposit_addresses WHERE network = $1::"Network""#,
@@ -361,6 +389,20 @@ impl Db {
         .fetch_all(&self.pool)
         .await?;
         Ok(rows.into_iter().map(|(a,)| a).collect())
+    }
+
+    /// Whether `address` is a deposit address the gateway issued on
+    /// `network` (case-insensitive: Ethereum addresses come in two
+    /// casings). Withdrawals never go there (invariant 7).
+    pub async fn is_deposit_address(&self, network: Network, address: &str) -> Result<bool> {
+        let (found,): (bool,) = sqlx::query_as(
+            r#"SELECT EXISTS (SELECT 1 FROM deposit_addresses WHERE network = $1::"Network" AND lower(address) = lower($2))"#,
+        )
+        .bind(network.as_db())
+        .bind(address)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(found)
     }
 
     /// Map an address string back to its row — for Lightning, `address` is
@@ -700,6 +742,70 @@ impl Db {
         Ok(row)
     }
 
+    /// Get-or-create for a delivery keyed on (subject, event, endpoint),
+    /// the subject column following `event.subject()` — every event but
+    /// PAID (keyed on its deposit, see `get_or_create_webhook_delivery`).
+    pub async fn get_or_create_subject_webhook_delivery(
+        &self,
+        event: WebhookEventType,
+        subject_id: &str,
+        endpoint_id: &str,
+    ) -> Result<WebhookDeliveryRow> {
+        if let Some(row) = self
+            .find_subject_webhook_delivery(event, subject_id, endpoint_id)
+            .await?
+        {
+            return Ok(row);
+        }
+        let column = subject_column(event)?;
+        let inserted = sqlx::query_as::<_, WebhookDeliveryRow>(&format!(
+            r#"
+            INSERT INTO webhook_deliveries
+              (id, "{column}", "eventType", "webhookEndpointId", status, attempts, "createdAt", "updatedAt")
+            VALUES
+              ($1, $2, $3, $4, 'PENDING'::"WebhookDeliveryStatus", 0, NOW(), NOW())
+            ON CONFLICT DO NOTHING
+            RETURNING {WEBHOOK_DELIVERY_COLUMNS}
+            "#
+        ))
+        .bind(Uuid::new_v4().to_string())
+        .bind(subject_id)
+        .bind(event.as_db())
+        .bind(endpoint_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        match inserted {
+            Some(row) => Ok(row),
+            None => self
+                .find_subject_webhook_delivery(event, subject_id, endpoint_id)
+                .await?
+                .with_context(|| format!("No delivery row for {} {subject_id}", event.as_api())),
+        }
+    }
+
+    /// Most recent delivery row for a (subject, event, endpoint).
+    pub async fn find_subject_webhook_delivery(
+        &self,
+        event: WebhookEventType,
+        subject_id: &str,
+        endpoint_id: &str,
+    ) -> Result<Option<WebhookDeliveryRow>> {
+        let column = subject_column(event)?;
+        let row = sqlx::query_as::<_, WebhookDeliveryRow>(&format!(
+            r#"
+            SELECT {WEBHOOK_DELIVERY_COLUMNS} FROM webhook_deliveries
+            WHERE "{column}" = $1 AND "eventType" = $2 AND "webhookEndpointId" = $3
+            ORDER BY "createdAt" DESC LIMIT 1
+            "#
+        ))
+        .bind(subject_id)
+        .bind(event.as_db())
+        .bind(endpoint_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row)
+    }
+
     pub async fn find_webhook_delivery_by_id(
         &self,
         id: &str,
@@ -868,4 +974,16 @@ impl Db {
         .await?;
         Ok(())
     }
+}
+
+/// The `webhook_deliveries` column holding the subject id of `event`'s
+/// deliveries (static names — never user input in the SQL).
+fn subject_column(event: WebhookEventType) -> Result<&'static str> {
+    Ok(match event.subject() {
+        WebhookSubject::DepositAddress => "depositAddressId",
+        WebhookSubject::LightningPayment => "lightningPaymentId",
+        WebhookSubject::Withdrawal => "withdrawalId",
+        WebhookSubject::Alert => "alertId",
+        WebhookSubject::Deposit => anyhow::bail!("PAID deliveries are keyed on their deposit"),
+    })
 }

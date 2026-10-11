@@ -1,5 +1,6 @@
 import { useLocation } from "react-router-dom"
 
+import { HeaderFreezeControl } from "@/components/outflows/OutflowControls"
 import { Separator } from "@/components/ui/separator"
 import { SidebarTrigger } from "@/components/ui/sidebar"
 
@@ -9,9 +10,13 @@ const TITLES: Array<[string, string]> = [
   ["/traffic", "Traffic"],
   ["/webhooks", "Webhooks"],
   ["/wallets", "Wallets"],
+  ["/withdrawals", "Withdrawals"],
+  ["/treasury", "Treasury"],
+  ["/address-book", "Address book"],
   ["/lightning", "Lightning"],
   ["/api-keys", "API Keys"],
   ["/staff", "Staff"],
+  ["/settings/assets", "Settings · Assets"],
   ["/settings", "Settings"],
   ["/audit-log", "Audit log"],
   ["/account", "Account security"],
@@ -31,6 +36,10 @@ export function SiteHeader() {
           className="mx-2 data-[orientation=vertical]:h-4"
         />
         <h1 className="text-base font-medium">{title}</h1>
+        {/* Emergency stop, one click away on every page (any staff member). */}
+        <div className="ml-auto">
+          <HeaderFreezeControl />
+        </div>
       </div>
     </header>
   )

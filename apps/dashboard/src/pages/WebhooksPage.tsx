@@ -53,26 +53,89 @@ import {
   useWebhookEndpoints,
 } from "@/hooks/queries"
 import { toastError } from "@/lib/errors"
-import { formatDate } from "@/lib/format"
+import { formatDate, humanize } from "@/lib/format"
 import type { WebhookEndpoint, WebhookEventType } from "@/lib/types"
 
-const EVENT_OPTIONS: Array<{
+interface EventOption {
   value: WebhookEventType
   label: string
   description: string
-}> = [
-  { value: "pending", label: "Pending", description: "A payment address is created" },
-  { value: "paid", label: "Paid", description: "A deposit is confirmed on-chain" },
-  { value: "expired", label: "Expired", description: "An address expires unpaid" },
+}
+
+const EVENT_GROUPS: Array<{ title: string; options: EventOption[] }> = [
   {
-    value: "payout_succeeded",
-    label: "Payout succeeded",
-    description: "An outgoing Lightning wallet payment completed (any sender)",
+    title: "Payments",
+    options: [
+      { value: "pending", label: "Pending", description: "A payment address is created" },
+      { value: "paid", label: "Paid", description: "A deposit is confirmed on-chain" },
+      { value: "expired", label: "Expired", description: "An address expires unpaid" },
+    ],
   },
   {
-    value: "payout_failed",
-    label: "Payout failed",
-    description: "An outgoing Lightning wallet payment failed (any sender)",
+    title: "Withdrawals",
+    options: [
+      {
+        value: "withdrawal_pending_approval",
+        label: "Pending approval",
+        description: "A withdrawal at or above the approval threshold awaits an admin",
+      },
+      {
+        value: "withdrawal_broadcast",
+        label: "Broadcast",
+        description: "A withdrawal was sent to the network",
+      },
+      {
+        value: "withdrawal_confirmed",
+        label: "Confirmed",
+        description: "A withdrawal reached its confirmations (settled on Lightning)",
+      },
+      { value: "withdrawal_failed", label: "Failed", description: "A withdrawal failed" },
+      {
+        value: "withdrawal_cancelled",
+        label: "Cancelled",
+        description: "A withdrawal was cancelled, rejected or its approval expired",
+      },
+    ],
+  },
+  {
+    title: "Operational alerts",
+    options: [
+      {
+        value: "gas_reserve_low",
+        label: "Gas reserve low",
+        description: "A treasury's gas asset fell below its alert threshold",
+      },
+      {
+        value: "treasury_cap_exceeded",
+        label: "Treasury cap exceeded",
+        description: "A treasury holds more than its hot-wallet cap",
+      },
+      {
+        value: "address_book_entry_added",
+        label: "Address-book entry added",
+        description: "A destination was added to the address book",
+      },
+      {
+        value: "withdrawal_stuck",
+        label: "Withdrawal stuck",
+        description: "A withdrawal reached its fee cap without confirming",
+      },
+    ],
+  },
+  {
+    title: "Lightning wallet",
+    options: [
+      {
+        value: "payout_succeeded",
+        label: "Payout succeeded",
+        description: "A wallet send not made by a gateway withdrawal completed",
+      },
+      {
+        value: "payout_failed",
+        label: "Payout failed",
+        description: "A wallet send not made by a gateway withdrawal failed",
+      },
+    ],
   },
 ]
 
@@ -145,8 +208,9 @@ export function WebhooksPage() {
           <h1 className="text-2xl font-semibold tracking-tight">Webhooks</h1>
           <p className="text-sm text-muted-foreground">
             Each active endpoint receives a POST for the events it subscribes
-            to — pending (address created), paid (deposit confirmed), expired,
-            and payout succeeded / failed (outgoing Lightning payments).
+            to — payment lifecycle (pending, paid, expired), withdrawal
+            lifecycle, operational alerts, and Lightning wallet sends made
+            outside the gateway.
           </p>
         </div>
         <AddEndpointDialog />
@@ -210,7 +274,7 @@ export function WebhooksPage() {
                       <div className="flex flex-wrap gap-1">
                         {endpoint.events.map((event) => (
                           <Badge key={event} variant="secondary" className="capitalize">
-                            {event}
+                            {humanize(event)}
                           </Badge>
                         ))}
                       </div>
@@ -297,18 +361,25 @@ function EventChecklist({
   onToggle: (event: WebhookEventType, checked: boolean) => void
 }) {
   return (
-    <div className="space-y-3">
-      {EVENT_OPTIONS.map((option) => (
-        <div key={option.value} className="flex items-start gap-3">
-          <Checkbox
-            id={`event-${option.value}`}
-            checked={selected.includes(option.value)}
-            onCheckedChange={(checked) => onToggle(option.value, checked === true)}
-          />
-          <div className="grid gap-0.5 leading-none">
-            <Label htmlFor={`event-${option.value}`}>{option.label}</Label>
-            <p className="text-xs text-muted-foreground">{option.description}</p>
-          </div>
+    <div className="max-h-[45vh] space-y-4 overflow-y-auto pr-1">
+      {EVENT_GROUPS.map((group) => (
+        <div key={group.title} className="space-y-3">
+          <p className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
+            {group.title}
+          </p>
+          {group.options.map((option) => (
+            <div key={option.value} className="flex items-start gap-3">
+              <Checkbox
+                id={`event-${option.value}`}
+                checked={selected.includes(option.value)}
+                onCheckedChange={(checked) => onToggle(option.value, checked === true)}
+              />
+              <div className="grid gap-0.5 leading-none">
+                <Label htmlFor={`event-${option.value}`}>{option.label}</Label>
+                <p className="text-xs text-muted-foreground">{option.description}</p>
+              </div>
+            </div>
+          ))}
         </div>
       ))}
     </div>

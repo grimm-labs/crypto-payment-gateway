@@ -55,12 +55,23 @@ pub struct WebhookDeliveryDetailRow {
     /// attempt is made, and on non-payout rows.
     #[sqlx(rename = "payoutAmount")]
     pub payout_amount: Option<String>,
+    /// Withdrawal deliveries only.
+    #[sqlx(rename = "withdrawalId")]
+    pub withdrawal_id: Option<String>,
+    #[sqlx(rename = "withdrawalAmountRaw")]
+    pub withdrawal_amount_raw: Option<String>,
+    #[sqlx(rename = "withdrawalToken")]
+    pub withdrawal_token: Option<String>,
+    /// Alert deliveries only.
+    #[sqlx(rename = "alertId")]
+    pub alert_id: Option<String>,
     pub address: Option<String>,
+    /// The deposit address's, withdrawal's or alert's network.
     pub network: Option<String>,
 }
 
 const WEBHOOK_DETAIL_INNER: &str = r#"
-    SELECT DISTINCT ON (w."depositAddressId", w."lightningPaymentId", w."eventType", w."depositId", w."webhookEndpointId")
+    SELECT DISTINCT ON (w."depositAddressId", w."lightningPaymentId", w."withdrawalId", w."alertId", w."eventType", w."depositId", w."webhookEndpointId")
         w.id, w."eventType", w."depositId", w."webhookEndpointId", e.url AS "endpointUrl",
         w.status::text AS status, w.attempts,
         w."lastResponse", w."lastError", w."lastPayload",
@@ -69,17 +80,23 @@ const WEBHOOK_DETAIL_INNER: &str = r#"
         d."txHash", d.amount, d.status::text AS "depositStatus",
         w."depositAddressId", w."lightningPaymentId",
         CASE WHEN w."lightningPaymentId" IS NOT NULL THEN w."lastPayload"->'data'->>'amount' END AS "payoutAmount",
-        a.address, a.network::text AS network,
+        w."withdrawalId", wd."amountRaw"::text AS "withdrawalAmountRaw", wd.token::text AS "withdrawalToken",
+        w."alertId",
+        COALESCE(a.address, wd.destination) AS address,
+        COALESCE(a.network::text, wd.network::text, al.network::text) AS network,
         a."expectedAmount"
     FROM webhook_deliveries w
     LEFT JOIN deposits d ON d.id = w."depositId"
     LEFT JOIN deposit_addresses a ON a.id = w."depositAddressId"
+    LEFT JOIN withdrawals wd ON wd.id = w."withdrawalId"
+    LEFT JOIN alerts al ON al.id = w."alertId"
     LEFT JOIN webhook_endpoints e ON e.id = w."webhookEndpointId"
-    ORDER BY w."depositAddressId", w."lightningPaymentId", w."eventType", w."depositId", w."webhookEndpointId", w."createdAt" DESC
+    ORDER BY w."depositAddressId", w."lightningPaymentId", w."withdrawalId", w."alertId", w."eventType", w."depositId", w."webhookEndpointId", w."createdAt" DESC
 "#;
 
 /// One (delivery key) eligible for a bulk manual retry. `deposit_id` is set
-/// on PAID targets, `lightning_payment_id` on payout targets;
+/// on PAID targets, `lightning_payment_id` on payout targets,
+/// `withdrawal_id` / `alert_id` on withdrawal / alert targets;
 /// `webhook_endpoint_id` is `None` on legacy rows (callers fan those out to
 /// all active endpoints).
 #[derive(Debug, Clone, FromRow)]
@@ -92,8 +109,25 @@ pub struct FailedWebhookTarget {
     pub deposit_address_id: Option<String>,
     #[sqlx(rename = "lightningPaymentId")]
     pub lightning_payment_id: Option<String>,
+    #[sqlx(rename = "withdrawalId")]
+    pub withdrawal_id: Option<String>,
+    #[sqlx(rename = "alertId")]
+    pub alert_id: Option<String>,
     #[sqlx(rename = "webhookEndpointId")]
     pub webhook_endpoint_id: Option<String>,
+}
+
+impl FailedWebhookTarget {
+    /// The subject id the queue member carries for this target's event.
+    pub fn subject_id(&self, event: domain::WebhookEventType) -> Option<&str> {
+        match event.subject() {
+            domain::WebhookSubject::Deposit => self.deposit_id.as_deref(),
+            domain::WebhookSubject::DepositAddress => self.deposit_address_id.as_deref(),
+            domain::WebhookSubject::LightningPayment => self.lightning_payment_id.as_deref(),
+            domain::WebhookSubject::Withdrawal => self.withdrawal_id.as_deref(),
+            domain::WebhookSubject::Alert => self.alert_id.as_deref(),
+        }
+    }
 }
 
 /// One day of confirmed-deposit activity for the dashboard chart.
@@ -161,14 +195,14 @@ impl Db {
     pub async fn failed_webhook_targets(&self) -> Result<Vec<FailedWebhookTarget>> {
         let rows = sqlx::query_as::<_, FailedWebhookTarget>(
             r#"
-            SELECT t."eventType", t."depositId", t."depositAddressId", t."lightningPaymentId", t."webhookEndpointId" FROM (
-                SELECT DISTINCT ON (w."depositAddressId", w."lightningPaymentId", w."eventType", w."depositId", w."webhookEndpointId")
-                    w."eventType", w."depositId", w."depositAddressId", w."lightningPaymentId", w."webhookEndpointId",
+            SELECT t."eventType", t."depositId", t."depositAddressId", t."lightningPaymentId", t."withdrawalId", t."alertId", t."webhookEndpointId" FROM (
+                SELECT DISTINCT ON (w."depositAddressId", w."lightningPaymentId", w."withdrawalId", w."alertId", w."eventType", w."depositId", w."webhookEndpointId")
+                    w."eventType", w."depositId", w."depositAddressId", w."lightningPaymentId", w."withdrawalId", w."alertId", w."webhookEndpointId",
                     w.status::text AS status
                 FROM webhook_deliveries w
                 LEFT JOIN deposits d ON d.id = w."depositId"
                 WHERE w."depositId" IS NULL OR d.status = 'CONFIRMED'::"DepositStatus"
-                ORDER BY w."depositAddressId", w."lightningPaymentId", w."eventType", w."depositId", w."webhookEndpointId", w."createdAt" DESC
+                ORDER BY w."depositAddressId", w."lightningPaymentId", w."withdrawalId", w."alertId", w."eventType", w."depositId", w."webhookEndpointId", w."createdAt" DESC
             ) t
             LEFT JOIN webhook_endpoints e ON e.id = t."webhookEndpointId"
             WHERE t.status = 'FAILED'
@@ -251,9 +285,9 @@ impl Db {
         let webhook_counts: Vec<(String, i64)> = sqlx::query_as(
             r#"
             SELECT t.status, COUNT(*) FROM (
-                SELECT DISTINCT ON ("depositAddressId", "lightningPaymentId", "eventType", "depositId", "webhookEndpointId") status::text AS status
+                SELECT DISTINCT ON ("depositAddressId", "lightningPaymentId", "withdrawalId", "alertId", "eventType", "depositId", "webhookEndpointId") status::text AS status
                 FROM webhook_deliveries
-                ORDER BY "depositAddressId", "lightningPaymentId", "eventType", "depositId", "webhookEndpointId", "createdAt" DESC
+                ORDER BY "depositAddressId", "lightningPaymentId", "withdrawalId", "alertId", "eventType", "depositId", "webhookEndpointId", "createdAt" DESC
             ) t GROUP BY t.status
             "#,
         )

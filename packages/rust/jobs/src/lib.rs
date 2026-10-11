@@ -16,7 +16,7 @@ use db::DepositAddressRow;
 use domain::{
     format_amount, raw_to_decimal, raw_to_decimal_string, required_confirmations,
     DetectedTransfer, DepositAddressStatus, DepositStatus, Network, Token, WebhookDeliveryStatus,
-    WebhookEventType, is_amount_within_tolerance,
+    WebhookEventType, WebhookSubject, is_amount_within_tolerance,
 };
 use lightning_client::{
     LightningClient, LightningEvent, PaymentDirection, ReceivedPayment, WalletPayment,
@@ -28,12 +28,19 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, error, info, warn};
 use wallet::WalletService;
 
+pub mod alerts;
 pub mod audit;
+pub mod fees;
+pub mod freeze;
+pub mod outbound;
 pub mod payouts;
+pub mod sweeper;
 pub mod traffic;
+pub mod treasury;
 pub mod webhook_client;
+pub mod withdrawals;
 pub use audit::Actor;
-pub use payouts::{quote_payout, request_payout, PayoutCommand, PayoutError, PayoutOutcome};
+pub use payouts::{legacy_payout_input, PAYOUT_ALIAS_SUNSET};
 pub use traffic::TrafficRecorder;
 pub use webhook_client::{check_webhook_host_resolves_publicly, validate_webhook_url, WebhookClient};
 
@@ -399,6 +406,11 @@ pub async fn notify_payout(state: &AppState, payment: &WalletPayment) -> Result<
         error!("Payout webhook skipped — unexpected payment id shape {:?}", payment.id);
         return Ok(0);
     }
+    // Gateway withdrawals (and legacy payout requests) are reported by
+    // their own webhooks: `payout_*` is for sends the gateway did not make.
+    if state.db.is_gateway_send(&payment.id).await? {
+        return Ok(0);
+    }
     let mut queued = 0;
     for endpoint in state.db.active_webhook_endpoints_for_event(event).await? {
         if state
@@ -732,8 +744,8 @@ pub async fn retrigger_delivery(state: &AppState, delivery_id: &str) -> Result<(
         return Err(RetriggerError::EndpointNotEligible);
     }
 
-    let subject_id = match event {
-        WebhookEventType::Paid => {
+    let subject_id = match event.subject() {
+        WebhookSubject::Deposit => {
             let deposit_id = delivery.deposit_id.ok_or(RetriggerError::DeliveryNotFound)?;
             let deposit = state
                 .db
@@ -743,17 +755,14 @@ pub async fn retrigger_delivery(state: &AppState, delivery_id: &str) -> Result<(
             if deposit.status != DepositStatus::Confirmed.as_db() {
                 return Err(RetriggerError::DepositNotConfirmed);
             }
-            deposit_id
+            Some(deposit_id)
         }
-        event if event.is_payout() => delivery
-            .lightning_payment_id
-            .clone()
-            .ok_or(RetriggerError::DeliveryNotFound)?,
-        _ => delivery
-            .deposit_address_id
-            .clone()
-            .ok_or(RetriggerError::DeliveryNotFound)?,
-    };
+        WebhookSubject::LightningPayment => delivery.lightning_payment_id.clone(),
+        WebhookSubject::Withdrawal => delivery.withdrawal_id.clone(),
+        WebhookSubject::Alert => delivery.alert_id.clone(),
+        WebhookSubject::DepositAddress => delivery.deposit_address_id.clone(),
+    }
+    .ok_or(RetriggerError::DeliveryNotFound)?;
 
     state.db.reset_webhook_delivery_by_id(&delivery.id).await?;
     enqueue_webhook(state, event, &subject_id, &endpoint_id).await?;
@@ -783,19 +792,8 @@ pub async fn retrigger_failed_webhooks(state: &AppState) -> Result<usize, Retrig
             warn!("Bulk webhook retry skipped unknown event type {}", target.event_type);
             continue;
         };
-        let subject_id = match event {
-            WebhookEventType::Paid => match target.deposit_id.as_deref() {
-                Some(id) => id,
-                None => continue,
-            },
-            event if event.is_payout() => match target.lightning_payment_id.as_deref() {
-                Some(id) => id,
-                None => continue,
-            },
-            _ => match target.deposit_address_id.as_deref() {
-                Some(id) => id,
-                None => continue,
-            },
+        let Some(subject_id) = target.subject_id(event) else {
+            continue;
         };
         let target_endpoints: Vec<&str> = match &target.webhook_endpoint_id {
             Some(id) => vec![id.as_str()],
@@ -804,24 +802,14 @@ pub async fn retrigger_failed_webhooks(state: &AppState) -> Result<usize, Retrig
         };
         for endpoint_id in target_endpoints {
             let result: Result<()> = async {
-                match event {
-                    WebhookEventType::Paid => {
-                        state.db.reset_webhook_delivery(subject_id, endpoint_id).await?;
-                    }
-                    event if event.is_payout() => {
-                        let row = state
-                            .db
-                            .get_or_create_payout_webhook_delivery(subject_id, event, endpoint_id)
-                            .await?;
-                        state.db.reset_webhook_delivery_by_id(&row.id).await?;
-                    }
-                    _ => {
-                        let row = state
-                            .db
-                            .get_or_create_address_webhook_delivery(subject_id, event, endpoint_id)
-                            .await?;
-                        state.db.reset_webhook_delivery_by_id(&row.id).await?;
-                    }
+                if event == WebhookEventType::Paid {
+                    state.db.reset_webhook_delivery(subject_id, endpoint_id).await?;
+                } else {
+                    let row = state
+                        .db
+                        .get_or_create_subject_webhook_delivery(event, subject_id, endpoint_id)
+                        .await?;
+                    state.db.reset_webhook_delivery_by_id(&row.id).await?;
                 }
                 enqueue_webhook(state, event, subject_id, endpoint_id).await
             }
@@ -839,8 +827,9 @@ pub async fn retrigger_failed_webhooks(state: &AppState) -> Result<usize, Retrig
 }
 
 /// Deliver one queued webhook. `subject_id` is a deposit id for PAID, a
-/// deposit-address id for PENDING/EXPIRED and a Lightning payment id for
-/// payout events.
+/// deposit-address id for PENDING/EXPIRED, a Lightning payment id for
+/// payout events, a withdrawal id for withdrawal events and an alert id for
+/// alert events (`WebhookEventType::subject`).
 pub async fn deliver_webhook(
     state: &AppState,
     event: WebhookEventType,
@@ -868,10 +857,12 @@ pub async fn deliver_webhook(
             return Ok(DeliveryOutcome::Skipped);
         }
     };
-    let subject_label = match event {
-        WebhookEventType::Paid => format!("deposit {subject_id}"),
-        event if event.is_payout() => format!("payout {subject_id} ({})", event.as_api()),
-        _ => format!("address {subject_id} ({})", event.as_api()),
+    let subject_label = match event.subject() {
+        WebhookSubject::Deposit => format!("deposit {subject_id}"),
+        WebhookSubject::LightningPayment => format!("payout {subject_id} ({})", event.as_api()),
+        WebhookSubject::Withdrawal => format!("withdrawal {subject_id} ({})", event.as_api()),
+        WebhookSubject::Alert => format!("alert {subject_id} ({})", event.as_api()),
+        WebhookSubject::DepositAddress => format!("address {subject_id} ({})", event.as_api()),
     };
 
     let Some((delivery, mut payload, occurred_at)) =
@@ -1035,6 +1026,32 @@ async fn prepare_delivery(
                 .unwrap_or_else(chrono::Utc::now);
             Ok(Some((delivery, payout_payload(event, &payment), occurred_at)))
         }
+        event if event.subject() == WebhookSubject::Withdrawal => {
+            let Some(row) = state.db.find_withdrawal(subject_id).await? else {
+                return Ok(None);
+            };
+            let delivery = state
+                .db
+                .get_or_create_subject_webhook_delivery(event, subject_id, endpoint_id)
+                .await?;
+            let occurred_at = match event {
+                WebhookEventType::WithdrawalPendingApproval => row.created_at,
+                WebhookEventType::WithdrawalBroadcast => row.broadcast_at.unwrap_or(row.updated_at),
+                WebhookEventType::WithdrawalConfirmed => row.confirmed_at.unwrap_or(row.updated_at),
+                _ => row.updated_at,
+            };
+            Ok(Some((delivery, withdrawals::withdrawal_payload(event, &row)?, occurred_at)))
+        }
+        _ => {
+            let Some(alert) = state.db.find_alert(subject_id).await? else {
+                return Ok(None);
+            };
+            let delivery = state
+                .db
+                .get_or_create_subject_webhook_delivery(event, subject_id, endpoint_id)
+                .await?;
+            Ok(Some((delivery, alerts::alert_payload(&alert)?, alert.created_at)))
+        }
     }
 }
 
@@ -1083,16 +1100,10 @@ async fn close_undeliverable(
 ) -> Result<()> {
     let row = match event {
         WebhookEventType::Paid => state.db.find_webhook_delivery(subject_id, endpoint_id).await?,
-        event if event.is_payout() => {
-            state
-                .db
-                .find_payout_webhook_delivery(subject_id, event, endpoint_id)
-                .await?
-        }
         event => {
             state
                 .db
-                .find_address_webhook_delivery(subject_id, event, endpoint_id)
+                .find_subject_webhook_delivery(event, subject_id, endpoint_id)
                 .await?
         }
     };
@@ -1158,6 +1169,20 @@ pub fn spawn_workers(
     tokio::spawn(async move { wallet_balance_sync_loop(s5).await });
     let s6 = state.clone();
     tokio::spawn(async move { api_key_expiry_loop(s6).await });
+
+    // Withdrawals, sweeps and treasuries.
+    for network in Network::ALL {
+        let s = state.clone();
+        tokio::spawn(async move { outbound::outbound_loop(s, network).await });
+    }
+    for network in sweeper::SWEPT_NETWORKS {
+        let s = state.clone();
+        tokio::spawn(async move { sweeper::sweep_loop(s, network).await });
+    }
+    let s7 = state.clone();
+    tokio::spawn(async move { treasury::treasury_monitor_loop(s7).await });
+    let s8 = state.clone();
+    tokio::spawn(async move { withdrawals::approval_expiry_loop(s8).await });
 }
 
 /// Materialize EXPIRED statuses for past-deadline API keys. Runs once right
@@ -1212,6 +1237,10 @@ async fn lightning_event_loop(state: AppState, lightning: LightningClient) {
                 }
             }
             LightningEvent::SendFinished(payment) => {
+                if let Err(err) = outbound::lightning::on_send_finished(&state, &payment).await {
+                    // The reconciliation pass settles it on its next tick.
+                    error!("Lightning withdrawal update error for {}: {err:#}", payment.id);
+                }
                 if let Err(err) = notify_payout(&state, &payment).await {
                     // The next boot catch-up picks it up.
                     error!("Payout webhook queueing error for {}: {err:#}", payment.id);
@@ -1292,6 +1321,11 @@ async fn poll_network(state: &AppState, network: Network) -> Result<()> {
         }
         let transfers = match network {
             Network::Tron => state.chain.poll_tron_address(&address.address).await,
+            // Native ETH and USDT payments share the network: dispatch on
+            // the token the address was issued for.
+            Network::Ethereum if address.token == Token::Eth.as_db() => {
+                state.chain.poll_ethereum_native(&address.address).await
+            }
             Network::Ethereum => state.chain.poll_ethereum_address(&address.address).await,
             Network::Solana => state.chain.poll_solana_address(&address.address).await,
             Network::Bitcoin => state.chain.poll_bitcoin_address(&address.address).await,
@@ -1545,12 +1579,15 @@ async fn wallet_balance_sync_loop(state: AppState) {
     }
 }
 
-/// Raw totals per token. Each network carries a single token, so sats can
-/// never leak into the USDT figure (and vice versa).
+/// Raw totals per token. Each entry carries one token, so sats never leak
+/// into the USDT figure, nor wei into anything else.
 #[derive(Debug, Default)]
 pub struct TokenTotals {
     pub usdt_raw: u128,
     pub btc_raw: u128,
+    pub eth_raw: u128,
+    pub trx_raw: u128,
+    pub sol_raw: u128,
 }
 
 impl TokenTotals {
@@ -1561,6 +1598,18 @@ impl TokenTotals {
     pub fn total_btc(&self) -> String {
         format_raw(self.btc_raw, Token::Btc)
     }
+
+    pub fn total_eth(&self) -> String {
+        format_raw(self.eth_raw, Token::Eth)
+    }
+
+    pub fn total_trx(&self) -> String {
+        format_raw(self.trx_raw, Token::Trx)
+    }
+
+    pub fn total_sol(&self) -> String {
+        format_raw(self.sol_raw, Token::Sol)
+    }
 }
 
 /// Sum `(token, amount_raw)` entries as reported in balance payloads;
@@ -1569,30 +1618,61 @@ pub fn token_totals<'a>(entries: impl IntoIterator<Item = (&'a str, &'a str)>) -
     let mut totals = TokenTotals::default();
     for (token, amount_raw) in entries {
         let raw = amount_raw.parse::<u128>().unwrap_or(0);
-        match Token::parse_api(token) {
-            // A hostile provider must not overflow the totals.
-            Ok(Token::Usdt) => totals.usdt_raw = totals.usdt_raw.saturating_add(raw),
-            Ok(Token::Btc) => totals.btc_raw = totals.btc_raw.saturating_add(raw),
-            Err(_) => {}
-        }
+        // A hostile provider must not overflow the totals.
+        let total = match Token::parse_api(token) {
+            Ok(Token::Usdt) => &mut totals.usdt_raw,
+            Ok(Token::Btc) => &mut totals.btc_raw,
+            Ok(Token::Eth) => &mut totals.eth_raw,
+            Ok(Token::Trx) => &mut totals.trx_raw,
+            Ok(Token::Sol) => &mut totals.sol_raw,
+            Err(_) => continue,
+        };
+        *total = total.saturating_add(raw);
     }
     totals
 }
 
-/// Networks served by a chain provider, polled per derived address
-/// (Lightning goes through the Breez client instead).
-const CHAIN_NETWORKS: [Network; 4] =
-    [Network::Tron, Network::Ethereum, Network::Solana, Network::Bitcoin];
-
-async fn fetch_address_balance(state: &AppState, network: Network, address: &str) -> Result<u128> {
-    match network {
-        Network::Bitcoin => state.chain.fetch_btc_balance(address).await,
-        _ => state.chain.fetch_usdt_balance(network, address).await,
+/// The (network, token) entries of the balance views: every payment token,
+/// plus the gas assets held only by the treasuries (TRX, SOL).
+fn balance_entries() -> Vec<(Network, Token)> {
+    let mut entries = Vec::new();
+    for network in [Network::Tron, Network::Ethereum, Network::Solana, Network::Bitcoin, Network::Lightning] {
+        for token in network.withdrawable_tokens() {
+            entries.push((network, *token));
+        }
     }
+    entries
+}
+
+/// Deposit addresses hold payment tokens; gas assets sit on treasuries.
+fn held_by_deposits(network: Network, token: Token) -> bool {
+    domain::supports(network, token) && network != Network::Lightning
 }
 
 fn format_raw(raw: u128, token: Token) -> String {
-    raw_to_decimal_string(&raw.to_string(), token).unwrap_or_else(|_| "0".into())
+    raw_to_decimal_string(&raw.to_string(), token).unwrap_or_else(|_| domain::raw_u128_to_string(raw, token))
+}
+
+/// The treasury's latest balance of (network, token) — `None` on error
+/// (logged), 0 when unconfigured.
+async fn treasury_balance_now(state: &AppState, network: Network, token: Token) -> Option<u128> {
+    let result = match network {
+        Network::Lightning => match &state.lightning {
+            Some(lightning) => lightning.balance_sats(false).await.map(u128::from),
+            None => Ok(0),
+        },
+        _ => match treasury::treasury_token_holder(state, network, token) {
+            Ok(holder) => state.chain.fetch_balance(network, token, &holder).await,
+            Err(err) => Err(err),
+        },
+    };
+    match result {
+        Ok(balance) => Some(balance),
+        Err(err) => {
+            warn!("Treasury balance of {} {} unreadable: {err:#}", network.as_api(), token.as_api());
+            None
+        }
+    }
 }
 
 pub async fn sync_wallet_balances(state: &AppState) -> Result<()> {
@@ -1603,10 +1683,9 @@ pub async fn sync_wallet_balances(state: &AppState) -> Result<()> {
 
     info!("Starting wallet HD balance sync");
     let mut networks = Vec::new();
-    for network in CHAIN_NETWORKS {
-        networks.push(sync_network(state, network).await?);
+    for (network, token) in balance_entries() {
+        networks.push(sync_network(state, network, token).await?);
     }
-    networks.push(lightning_wallet_balance(state).await);
 
     let totals = token_totals(networks.iter().map(|n| (n.token.as_str(), n.amount_raw.as_str())));
     let payload = CachedWalletBalances {
@@ -1614,6 +1693,9 @@ pub async fn sync_wallet_balances(state: &AppState) -> Result<()> {
         total_usdt_raw: totals.usdt_raw.to_string(),
         total_btc: totals.total_btc(),
         total_btc_raw: totals.btc_raw.to_string(),
+        total_eth: totals.total_eth(),
+        total_trx: totals.total_trx(),
+        total_sol: totals.total_sol(),
         networks,
         updated_at: chrono::Utc::now().to_rfc3339(),
     };
@@ -1622,96 +1704,57 @@ pub async fn sync_wallet_balances(state: &AppState) -> Result<()> {
     let mut redis = state.redis.clone();
     let _: () = redis.set(key, serde_json::to_string(&payload)?).await?;
     info!(
-        "Wallet HD balance sync completed — total USDT: {}, total BTC: {}",
-        payload.total_usdt, payload.total_btc
+        "Wallet HD balance sync completed — total USDT: {}, total BTC: {}, total ETH: {}",
+        payload.total_usdt, payload.total_btc, payload.total_eth
     );
     Ok(())
 }
 
-async fn sync_network(state: &AppState, network: Network) -> Result<NetworkWalletBalance> {
-    let network_name = network.as_api().to_string();
-    let token = network.token();
+/// Every derived index of `network` (whether issued for this token or not)
+/// plus the treasury.
+async fn sync_network(state: &AppState, network: Network, token: Token) -> Result<NetworkWalletBalance> {
     if !state.is_network_enabled(network) {
         return Ok(NetworkWalletBalance {
-            network: network_name,
-            token: token.as_api().into(),
-            amount: "0".into(),
-            amount_raw: "0".into(),
-            indices_scanned: 0,
-            available: false,
             message: Some(state.network_disabled_message(network).to_string()),
+            ..empty_wallet_network(network, token)
         });
     }
 
-    let max_index = state.db.max_derivation_index(network).await?;
-    let mut total_raw: u128 = 0;
-    for index in 0..=max_index {
-        if index > 0 {
-            tokio::time::sleep(Duration::from_millis(ADDRESS_REQUEST_DELAY_MS)).await;
+    let mut deposits_raw: u128 = 0;
+    let mut indices_scanned = 0;
+    if held_by_deposits(network, token) {
+        let max_index = state.db.max_derivation_index(network).await?;
+        for index in 0..=max_index {
+            if index > 0 {
+                tokio::time::sleep(Duration::from_millis(ADDRESS_REQUEST_DELAY_MS)).await;
+            }
+            let address = state.wallet.derive_address(network, index as u32)?;
+            match state.chain.fetch_balance(network, token, &address).await {
+                Ok(bal) => deposits_raw = deposits_raw.saturating_add(bal),
+                Err(err) => warn!(
+                    "Failed to fetch wallet {} balance for {} index {index}: {err:#}",
+                    token.as_api(),
+                    network.as_api()
+                ),
+            }
         }
-        let address = state.wallet.derive_address(network, index as u32)?;
-        match fetch_address_balance(state, network, &address).await {
-            Ok(bal) => total_raw = total_raw.saturating_add(bal),
-            Err(err) => warn!(
-                "Failed to fetch wallet balance for {network_name} index {index}: {err:#}"
-            ),
-        }
+        indices_scanned = max_index + 1;
     }
-
+    let treasury_raw = treasury_balance_now(state, network, token).await;
+    let total = deposits_raw.saturating_add(treasury_raw.unwrap_or(0));
     Ok(NetworkWalletBalance {
-        network: network_name,
+        network: network.as_api().into(),
         token: token.as_api().into(),
-        amount: format_raw(total_raw, token),
-        amount_raw: total_raw.to_string(),
-        indices_scanned: max_index + 1,
+        amount: format_raw(total, token),
+        amount_raw: total.to_string(),
+        treasury_amount: treasury_raw.map(|raw| format_raw(raw, token)),
+        treasury_amount_raw: treasury_raw.map(|raw| raw.to_string()),
+        deposits_amount: format_raw(deposits_raw, token),
+        deposits_amount_raw: deposits_raw.to_string(),
+        indices_scanned,
         available: true,
-        message: None,
+        message: treasury_raw.is_none().then(|| "Treasury balance unavailable".to_string()),
     })
-}
-
-/// The Breez/Spark wallet balance — a single entry, no derived addresses.
-struct LightningBalance {
-    amount: String,
-    amount_raw: String,
-    available: bool,
-    message: Option<String>,
-}
-
-async fn lightning_balance(state: &AppState, ensure_synced: bool) -> LightningBalance {
-    let mut balance = LightningBalance {
-        amount: "0".into(),
-        amount_raw: "0".into(),
-        available: false,
-        message: None,
-    };
-    let Some(lightning) = &state.lightning else {
-        balance.message = Some(state.network_disabled_message(Network::Lightning).to_string());
-        return balance;
-    };
-    match lightning.balance_sats(ensure_synced).await {
-        Ok(sats) => {
-            balance.amount = format_raw(u128::from(sats), Token::Btc);
-            balance.amount_raw = sats.to_string();
-            balance.available = true;
-        }
-        Err(err) => {
-            warn!("Failed to fetch Lightning wallet balance: {err:#}");
-            balance.message = Some("Failed to read the Lightning wallet balance".into());
-        }
-    }
-    balance
-}
-
-async fn lightning_wallet_balance(state: &AppState) -> NetworkWalletBalance {
-    // The hourly sync can afford a fresh figure.
-    let balance = lightning_balance(state, true).await;
-    NetworkWalletBalance {
-        amount: balance.amount,
-        amount_raw: balance.amount_raw,
-        available: balance.available,
-        message: balance.message,
-        ..empty_wallet_network(Network::Lightning)
-    }
 }
 
 pub async fn get_cached_wallet_balances(state: &AppState) -> Result<WalletBalancesResponse> {
@@ -1723,6 +1766,9 @@ pub async fn get_cached_wallet_balances(state: &AppState) -> Result<WalletBalanc
         return Ok(WalletBalancesResponse {
             total_usdt: cached.total_usdt,
             total_btc: cached.total_btc,
+            total_eth: cached.total_eth,
+            total_trx: cached.total_trx,
+            total_sol: cached.total_sol,
             networks: cached.networks,
             updated_at: Some(cached.updated_at),
         });
@@ -1730,22 +1776,33 @@ pub async fn get_cached_wallet_balances(state: &AppState) -> Result<WalletBalanc
     Ok(WalletBalancesResponse {
         total_usdt: "0".into(),
         total_btc: "0".into(),
-        networks: Network::ALL.into_iter().map(empty_wallet_network).collect(),
+        total_eth: "0".into(),
+        total_trx: "0".into(),
+        total_sol: "0".into(),
+        networks: balance_entries()
+            .into_iter()
+            .map(|(network, token)| empty_wallet_network(network, token))
+            .collect(),
         updated_at: None,
     })
 }
 
-/// Live balances of every issued address. Querying all of them costs one
-/// provider call per address, so the result is cached for
-/// `LIVE_BALANCES_CACHE_SECS` and recomputed in the background by a single
-/// caller (Redis lock). `None` = being computed, ask again shortly.
+/// Live balances of every issued address and of the treasuries. Querying
+/// all of them costs one provider call per address, so the result is
+/// cached for `LIVE_BALANCES_CACHE_SECS` and recomputed in the background
+/// by a single caller (Redis lock). `None` = being computed, ask again
+/// shortly.
 pub async fn get_live_balances(state: &AppState) -> Result<Option<BalancesResponse>> {
     let cache_key = state.config.redis_key(LIVE_BALANCES_KEY);
     let lock_key = state.config.redis_key(LIVE_BALANCES_LOCK_KEY);
     let mut redis = state.redis.clone();
     let cached: Option<String> = redis.get(&cache_key).await?;
     if let Some(cached) = cached {
-        return Ok(Some(serde_json::from_str(&cached)?));
+        // A payload cached by the previous release (one entry per network)
+        // is recomputed rather than served half-filled.
+        if let Ok(balances) = serde_json::from_str::<BalancesResponse>(&cached) {
+            return Ok(Some(balances));
+        }
     }
 
     // The lock outlives any sane computation; it is released when done.
@@ -1783,78 +1840,94 @@ pub async fn get_live_balances(state: &AppState) -> Result<Option<BalancesRespon
 
 async fn compute_live_balances(state: &AppState) -> Result<BalancesResponse> {
     let mut networks = Vec::new();
-    for network in CHAIN_NETWORKS {
-        networks.push(live_network_balance(state, network).await?);
+    for (network, token) in balance_entries() {
+        networks.push(live_network_balance(state, network, token).await?);
     }
-    networks.push(live_lightning_balance(state).await);
 
     let totals = token_totals(networks.iter().map(|n| (n.token.as_str(), n.amount_raw.as_str())));
     Ok(BalancesResponse {
         total_usdt: totals.total_usdt(),
         total_btc: totals.total_btc(),
+        total_eth: totals.total_eth(),
+        total_trx: totals.total_trx(),
+        total_sol: totals.total_sol(),
         networks,
         updated_at: chrono::Utc::now().to_rfc3339(),
     })
 }
 
-async fn live_network_balance(state: &AppState, network: Network) -> Result<NetworkBalance> {
-    let network_name = network.as_api().to_string();
-    let token = network.token();
+/// Treasury + unswept deposits of (network, token).
+async fn live_network_balance(state: &AppState, network: Network, token: Token) -> Result<NetworkBalance> {
     if !state.is_network_enabled(network) {
         return Ok(NetworkBalance {
-            network: network_name,
-            token: token.as_api().into(),
-            amount: "0".into(),
-            amount_raw: "0".into(),
-            addresses_checked: 0,
-            available: false,
             message: Some(state.network_disabled_message(network).to_string()),
+            ..empty_network_balance(network, token)
         });
     }
 
-    let addresses = state.db.addresses_for_network(network).await?;
-    let mut total_raw: u128 = 0;
-    for (i, address) in addresses.iter().enumerate() {
-        if i > 0 {
-            tokio::time::sleep(Duration::from_millis(ADDRESS_REQUEST_DELAY_MS)).await;
+    let mut deposits_raw: u128 = 0;
+    let mut checked = 0;
+    if held_by_deposits(network, token) {
+        let addresses = state.db.addresses_for_network(network).await?;
+        for (i, address) in addresses.iter().enumerate() {
+            if i > 0 {
+                tokio::time::sleep(Duration::from_millis(ADDRESS_REQUEST_DELAY_MS)).await;
+            }
+            match state.chain.fetch_balance(network, token, address).await {
+                Ok(bal) => deposits_raw = deposits_raw.saturating_add(bal),
+                Err(err) => warn!(
+                    "Failed to fetch {} {} balance for {address}: {err:#}",
+                    network.as_api(),
+                    token.as_api()
+                ),
+            }
         }
-        match fetch_address_balance(state, network, address).await {
-            Ok(bal) => total_raw = total_raw.saturating_add(bal),
-            Err(err) => warn!("Failed to fetch {network_name} balance for {address}: {err:#}"),
-        }
+        checked = addresses.len() as i32;
     }
-
+    let treasury_raw = treasury_balance_now(state, network, token).await;
+    let total = deposits_raw.saturating_add(treasury_raw.unwrap_or(0));
     Ok(NetworkBalance {
-        network: network_name,
+        network: network.as_api().into(),
         token: token.as_api().into(),
-        amount: format_raw(total_raw, token),
-        amount_raw: total_raw.to_string(),
-        addresses_checked: addresses.len() as i32,
+        amount: format_raw(total, token),
+        amount_raw: total.to_string(),
+        treasury_amount: treasury_raw.map(|raw| format_raw(raw, token)),
+        treasury_amount_raw: treasury_raw.map(|raw| raw.to_string()),
+        deposits_amount: format_raw(deposits_raw, token),
+        deposits_amount_raw: deposits_raw.to_string(),
+        addresses_checked: checked,
         available: true,
-        message: None,
+        message: treasury_raw.is_none().then(|| "Treasury balance unavailable".to_string()),
     })
 }
 
-async fn live_lightning_balance(state: &AppState) -> NetworkBalance {
-    let balance = lightning_balance(state, false).await;
-    NetworkBalance {
-        network: Network::Lightning.as_api().into(),
-        token: Token::Btc.as_api().into(),
-        amount: balance.amount,
-        amount_raw: balance.amount_raw,
-        addresses_checked: 0,
-        available: balance.available,
-        message: balance.message,
+fn empty_wallet_network(network: Network, token: Token) -> NetworkWalletBalance {
+    NetworkWalletBalance {
+        network: network.as_api().into(),
+        token: token.as_api().into(),
+        amount: "0".into(),
+        amount_raw: "0".into(),
+        treasury_amount: None,
+        treasury_amount_raw: None,
+        deposits_amount: "0".into(),
+        deposits_amount_raw: "0".into(),
+        indices_scanned: 0,
+        available: false,
+        message: None,
     }
 }
 
-fn empty_wallet_network(network: Network) -> NetworkWalletBalance {
-    NetworkWalletBalance {
+fn empty_network_balance(network: Network, token: Token) -> NetworkBalance {
+    NetworkBalance {
         network: network.as_api().into(),
-        token: network.token().as_api().into(),
+        token: token.as_api().into(),
         amount: "0".into(),
         amount_raw: "0".into(),
-        indices_scanned: 0,
+        treasury_amount: None,
+        treasury_amount_raw: None,
+        deposits_amount: "0".into(),
+        deposits_amount_raw: "0".into(),
+        addresses_checked: 0,
         available: false,
         message: None,
     }
@@ -1864,11 +1937,17 @@ fn empty_wallet_network(network: Network) -> NetworkWalletBalance {
 pub struct CachedWalletBalances {
     pub total_usdt: String,
     pub total_usdt_raw: String,
-    /// Defaults keep payloads cached before BTC support readable.
+    /// Defaults keep payloads cached before BTC/ETH support readable.
     #[serde(default = "zero_string")]
     pub total_btc: String,
     #[serde(default = "zero_string")]
     pub total_btc_raw: String,
+    #[serde(default = "zero_string")]
+    pub total_eth: String,
+    #[serde(default = "zero_string")]
+    pub total_trx: String,
+    #[serde(default = "zero_string")]
+    pub total_sol: String,
     pub networks: Vec<NetworkWalletBalance>,
     pub updated_at: String,
 }
@@ -1877,12 +1956,22 @@ fn zero_string() -> String {
     "0".into()
 }
 
+/// One (network, token): treasury + deposit addresses.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NetworkWalletBalance {
     pub network: String,
     pub token: String,
     pub amount: String,
     pub amount_raw: String,
+    /// `None` when unreadable (or cached before treasuries existed).
+    #[serde(default)]
+    pub treasury_amount: Option<String>,
+    #[serde(default)]
+    pub treasury_amount_raw: Option<String>,
+    #[serde(default = "zero_string")]
+    pub deposits_amount: String,
+    #[serde(default = "zero_string")]
+    pub deposits_amount_raw: String,
     pub indices_scanned: i32,
     pub available: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1894,6 +1983,10 @@ pub struct WalletBalancesResponse {
     pub total_usdt: String,
     /// Sum of the bitcoin + lightning entries; never folded into USDT.
     pub total_btc: String,
+    pub total_eth: String,
+    /// Gas reserves (treasuries).
+    pub total_trx: String,
+    pub total_sol: String,
     pub networks: Vec<NetworkWalletBalance>,
     pub updated_at: Option<String>,
 }
@@ -1903,17 +1996,26 @@ pub struct BalancesResponse {
     pub total_usdt: String,
     /// Sum of the bitcoin + lightning entries; never folded into USDT.
     pub total_btc: String,
+    pub total_eth: String,
+    /// Gas reserves (treasuries).
+    pub total_trx: String,
+    pub total_sol: String,
     pub networks: Vec<NetworkBalance>,
     /// When this (cached) figure was computed.
     pub updated_at: String,
 }
 
+/// One (network, token): treasury + unswept deposit addresses.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct NetworkBalance {
     pub network: String,
     pub token: String,
     pub amount: String,
     pub amount_raw: String,
+    pub treasury_amount: Option<String>,
+    pub treasury_amount_raw: Option<String>,
+    pub deposits_amount: String,
+    pub deposits_amount_raw: String,
     pub addresses_checked: i32,
     pub available: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1930,7 +2032,7 @@ mod tests {
         DepositAddressRow {
             id: "addr-1".into(),
             network: network.as_db().into(),
-            token: network.token().as_db().into(),
+            token: network.payment_tokens()[0].as_db().into(),
             address: "lnbc1500u1invoice".into(),
             derivation_index: 0,
             expected_amount: rust_decimal::Decimal::new(150_000, 8),
@@ -2154,6 +2256,36 @@ mod tests {
                 },
             })
         );
+    }
+
+    #[test]
+    fn totals_keep_every_asset_apart() {
+        let totals = token_totals([
+            ("ETH", "50000000000000000"),
+            ("ETH", "1"),
+            ("TRX", "1500000"),
+            ("SOL", "100000000"),
+            ("USDT", "1"),
+        ]);
+        assert_eq!(totals.total_eth(), "0.050000000000000001");
+        assert_eq!(totals.total_trx(), "1.5");
+        assert_eq!(totals.total_sol(), "0.1");
+        assert_eq!(totals.total_usdt(), "0.000001");
+        assert_eq!(totals.btc_raw, 0);
+    }
+
+    #[test]
+    fn balance_entries_cover_every_withdrawable_asset() {
+        let entries = balance_entries();
+        assert!(entries.contains(&(Network::Ethereum, Token::Usdt)));
+        assert!(entries.contains(&(Network::Ethereum, Token::Eth)));
+        assert!(entries.contains(&(Network::Tron, Token::Trx)));
+        assert!(entries.contains(&(Network::Solana, Token::Sol)));
+        assert!(entries.contains(&(Network::Lightning, Token::Btc)));
+        // Gas assets sit on treasuries only.
+        assert!(!held_by_deposits(Network::Tron, Token::Trx));
+        assert!(held_by_deposits(Network::Ethereum, Token::Eth));
+        assert!(!held_by_deposits(Network::Lightning, Token::Btc));
     }
 
     #[test]

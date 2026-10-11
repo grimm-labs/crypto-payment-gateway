@@ -24,3 +24,7 @@ spl-associated-token-account.workspace = true
 spl-token.workspace = true
 thiserror.workspace = true
 zeroize.workspace = true
+
+[dev-dependencies]
+# Independent BIP32 implementation the treasury golden vectors are checked against.
+bitcoin.workspace = true

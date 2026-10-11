@@ -16,8 +16,10 @@ use breez_sdk_spark::{
     connect, default_config, AssetFilter, BreezSdk, ConnectRequest, EventListener, GetInfoRequest,
     GetInfoResponse, GetPaymentRequest, GetPaymentResponse, InputType, ListPaymentsRequest,
     ListPaymentsResponse, LnurlPayRequest, LnurlPayResponse, Network, Payment, PaymentDetails,
-    PaymentMethod, PaymentStatus, PaymentType, PrepareLnurlPayRequest, PrepareLnurlPayResponse,
+    PaymentMethod, PaymentRequest, PaymentStatus, PaymentType, PrepareLnurlPayRequest,
+    PrepareLnurlPayResponse, PrepareSendPaymentRequest, PrepareSendPaymentResponse,
     ReceivePaymentMethod, ReceivePaymentRequest, ReceivePaymentResponse, SdkError, SdkEvent, Seed,
+    SendPaymentMethod, SendPaymentOptions, SendPaymentRequest, SendPaymentResponse,
 };
 use tracing::info;
 
@@ -46,6 +48,13 @@ pub trait LightningOps: Send + Sync {
     ) -> Result<PrepareLnurlPayResponse, SdkError>;
     /// Sends; returns as soon as the payment is accepted (usually Pending).
     async fn lnurl_pay(&self, request: LnurlPayRequest) -> Result<LnurlPayResponse, SdkError>;
+    /// Resolves a payment request (BOLT11) and its fees, without paying.
+    async fn prepare_send_payment(
+        &self,
+        request: PrepareSendPaymentRequest,
+    ) -> Result<PrepareSendPaymentResponse, SdkError>;
+    /// Sends a prepared payment; returns once accepted (usually Pending).
+    async fn send_payment(&self, request: SendPaymentRequest) -> Result<SendPaymentResponse, SdkError>;
     async fn get_payment(&self, request: GetPaymentRequest)
         -> Result<GetPaymentResponse, SdkError>;
     /// Returns the listener id.
@@ -88,6 +97,17 @@ impl LightningOps for BreezSdk {
         BreezSdk::lnurl_pay(self, request).await
     }
 
+    async fn prepare_send_payment(
+        &self,
+        request: PrepareSendPaymentRequest,
+    ) -> Result<PrepareSendPaymentResponse, SdkError> {
+        BreezSdk::prepare_send_payment(self, request).await
+    }
+
+    async fn send_payment(&self, request: SendPaymentRequest) -> Result<SendPaymentResponse, SdkError> {
+        BreezSdk::send_payment(self, request).await
+    }
+
     async fn get_payment(
         &self,
         request: GetPaymentRequest,
@@ -110,6 +130,24 @@ pub struct LightningConfig {
     pub mnemonic: String,
     /// Absolute path; must persist across restarts.
     pub storage_dir: String,
+    /// `CHAIN_MODE=testnet`: Spark regtest instead of mainnet.
+    pub testnet: bool,
+}
+
+/// A send whose network fee exceeds the withdrawal's fee cap: refused
+/// before anything is sent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("Lightning fee {fee_sats} sats exceeds the cap of {cap_sats} sats")]
+pub struct FeeAboveCap {
+    pub fee_sats: u64,
+    pub cap_sats: u64,
+}
+
+fn check_fee_cap(fee_sats: u64, cap_sats: Option<u64>) -> Result<()> {
+    match cap_sats {
+        Some(cap_sats) if fee_sats > cap_sats => Err(FeeAboveCap { fee_sats, cap_sats }.into()),
+        _ => Ok(()),
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -276,7 +314,11 @@ impl LightningClient {
         std::fs::create_dir_all(&config.storage_dir)
             .with_context(|| format!("Cannot create Breez storage dir {}", config.storage_dir))?;
 
-        let mut sdk_config = default_config(Network::Mainnet);
+        let mut sdk_config = default_config(if config.testnet {
+            Network::Regtest
+        } else {
+            Network::Mainnet
+        });
         sdk_config.api_key = Some(config.api_key);
         let sdk = connect(ConnectRequest {
             config: sdk_config,
@@ -398,12 +440,15 @@ impl LightningClient {
     /// the final status arrives as a `SendFinished` event. A reused
     /// `idempotency_key` (UUID) returns the original payment, never a
     /// second send.
+    /// `max_fee_sats` (the withdrawal's fee cap) refuses a send whose fee is
+    /// higher before anything is paid.
     pub async fn pay_lightning_address(
         &self,
         address: &str,
         amount_sats: u64,
         comment: Option<String>,
         idempotency_key: Option<String>,
+        max_fee_sats: Option<u64>,
     ) -> Result<WalletPayment> {
         // The SDK stores a keyed send under the key itself. Answer a replay
         // from storage before resolving the address again: the recipient may
@@ -422,6 +467,7 @@ impl LightningClient {
         let prepare_response = self
             .prepare_lightning_address(address, amount_sats, comment)
             .await?;
+        check_fee_cap(prepare_response.fee_sats, max_fee_sats)?;
         let response = self
             .ops
             .lnurl_pay(LnurlPayRequest {
@@ -480,6 +526,77 @@ impl LightningClient {
             })
             .await
             .context("Breez prepare_lnurl_pay failed")
+    }
+
+    /// Fixed-amount BOLT11 invoice quote: its amount (which must be
+    /// `amount_sats`) and the fees on top (Lightning routing + Spark
+    /// transfer, both counted).
+    pub async fn quote_bolt11(&self, invoice: &str, amount_sats: u64) -> Result<PayoutQuote> {
+        let prepared = self.prepare_bolt11(invoice, amount_sats).await?;
+        Ok(PayoutQuote {
+            amount_sats,
+            fees_sats: bolt11_fees(&prepared)?,
+        })
+    }
+
+    /// Pay a fixed-amount BOLT11 invoice, once per `idempotency_key` (UUID,
+    /// the withdrawal id): a replayed key returns the stored send. The
+    /// invoice amount must be `amount_sats` and the fees within
+    /// `max_fee_sats`, else nothing is sent.
+    pub async fn pay_bolt11(
+        &self,
+        invoice: &str,
+        amount_sats: u64,
+        idempotency_key: &str,
+        max_fee_sats: Option<u64>,
+    ) -> Result<WalletPayment> {
+        if let Some(existing) = self.get_payment(idempotency_key).await? {
+            if existing.direction != PaymentDirection::Send {
+                anyhow::bail!("Idempotency key collides with a non-send payment");
+            }
+            return Ok(existing);
+        }
+        let prepared = self.prepare_bolt11(invoice, amount_sats).await?;
+        check_fee_cap(bolt11_fees(&prepared)?, max_fee_sats)?;
+        let response = self
+            .ops
+            .send_payment(SendPaymentRequest {
+                prepare_response: prepared,
+                options: Some(SendPaymentOptions::Bolt11Invoice {
+                    prefer_spark: false,
+                    completion_timeout_secs: None,
+                }),
+                idempotency_key: Some(idempotency_key.to_string()),
+            })
+            .await
+            .context("Breez send_payment failed")?;
+        Ok(WalletPayment::from(response.payment))
+    }
+
+    async fn prepare_bolt11(&self, invoice: &str, amount_sats: u64) -> Result<PrepareSendPaymentResponse> {
+        let prepared = self
+            .ops
+            .prepare_send_payment(PrepareSendPaymentRequest {
+                payment_request: PaymentRequest::Input {
+                    input: invoice.to_string(),
+                },
+                // Fixed-amount invoices only: the amount is the invoice's.
+                amount: None,
+                token_identifier: None,
+                conversion_options: None,
+                fee_policy: None,
+            })
+            .await
+            .context("Breez prepare_send_payment failed")?;
+        let SendPaymentMethod::Bolt11Invoice { invoice_details, .. } = &prepared.payment_method else {
+            anyhow::bail!("Payment request is not a BOLT11 invoice");
+        };
+        if invoice_details.amount_msat != amount_sats.checked_mul(1_000)
+            || prepared.amount != u128::from(amount_sats)
+        {
+            anyhow::bail!("BOLT11 amount does not match the withdrawal amount");
+        }
+        Ok(prepared)
     }
 
     /// One wallet payment by SDK id; `None` when the wallet has no such
@@ -547,6 +664,19 @@ impl LightningClient {
     /// Close the SDK (and its SQLite storage) cleanly.
     pub async fn disconnect(&self) -> Result<()> {
         self.ops.disconnect().await.context("Breez disconnect failed")
+    }
+}
+
+/// Lightning routing fee plus the Spark transfer fee of a prepared BOLT11
+/// send (the most it can cost).
+fn bolt11_fees(prepared: &PrepareSendPaymentResponse) -> Result<u64> {
+    match &prepared.payment_method {
+        SendPaymentMethod::Bolt11Invoice {
+            spark_transfer_fee_sats,
+            lightning_fee_sats,
+            ..
+        } => Ok(lightning_fee_sats.saturating_add(spark_transfer_fee_sats.unwrap_or(0))),
+        _ => anyhow::bail!("Payment request is not a BOLT11 invoice"),
     }
 }
 
@@ -1121,6 +1251,7 @@ mod tests {
                 150_000,
                 Some("thanks".into()),
                 Some("6f1c7a8e-2f43-4d55-9a8b-1c2d3e4f5a6b".into()),
+                Some(3),
             )
             .await
             .unwrap();
@@ -1154,6 +1285,7 @@ mod tests {
                 150_000,
                 None,
                 Some("6f1c7a8e-2f43-4d55-9a8b-1c2d3e4f5a6b".into()),
+                None,
             )
             .await
             .unwrap();
@@ -1177,6 +1309,7 @@ mod tests {
                 1_000,
                 None,
                 Some("6f1c7a8e-2f43-4d55-9a8b-1c2d3e4f5a6b".into()),
+                None,
             )
             .await
             .unwrap_err();
@@ -1209,10 +1342,129 @@ mod tests {
             .returning(|_| Ok(InputType::LnurlPay(pay_request_details())));
         let client = LightningClient::new(Arc::new(ops));
         let err = client
-            .pay_lightning_address("lnurl1dp68gurn8ghj7", 1_000, None, None)
+            .pay_lightning_address("lnurl1dp68gurn8ghj7", 1_000, None, None, None)
             .await
             .unwrap_err();
         assert!(format!("{err:#}").contains("not a Lightning address"));
+    }
+
+    #[tokio::test]
+    async fn a_lightning_address_fee_above_the_cap_is_never_sent() {
+        let mut ops = MockLightningOps::new();
+        ops.expect_parse().returning(|_| Ok(lightning_address_input()));
+        ops.expect_prepare_lnurl_pay()
+            .returning(|request| Ok(prepared(150_000, 40, request.comment)));
+        // No `lnurl_pay` expectation.
+        let client = LightningClient::new(Arc::new(ops));
+        let err = client
+            .pay_lightning_address("alice@example.com", 150_000, None, None, Some(39))
+            .await
+            .unwrap_err();
+        assert!(err.downcast_ref::<FeeAboveCap>().is_some(), "{err:#}");
+    }
+
+    const BOLT11: &str = "lnbc1500u1recipient";
+
+    fn prepared_bolt11(amount_sats: u64, lightning_fee: u64, spark_fee: Option<u64>) -> PrepareSendPaymentResponse {
+        PrepareSendPaymentResponse {
+            payment_method: SendPaymentMethod::Bolt11Invoice {
+                invoice_details: prepared(amount_sats, 0, None).invoice_details,
+                spark_transfer_fee_sats: spark_fee,
+                lightning_fee_sats: lightning_fee,
+            },
+            amount: u128::from(amount_sats),
+            token_identifier: None,
+            conversion_estimate: None,
+            fee_policy: FeePolicy::FeesExcluded,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_bolt11_invoice_is_paid_once_its_amount_and_fee_are_checked() {
+        let mut ops = MockLightningOps::new();
+        ops.expect_get_payment().times(1).returning(|_| Err(unknown_payment()));
+        ops.expect_prepare_send_payment()
+            .withf(|request| {
+                matches!(&request.payment_request, PaymentRequest::Input { input } if input == BOLT11)
+                    // The amount comes from the invoice, never overridden.
+                    && request.amount.is_none()
+                    && request.token_identifier.is_none()
+                    && request.fee_policy.is_none()
+            })
+            .times(1)
+            .returning(|_| Ok(prepared_bolt11(150_000, 4, Some(1))));
+        ops.expect_send_payment()
+            .withf(|request| {
+                request.idempotency_key.as_deref() == Some("6f1c7a8e-2f43-4d55-9a8b-1c2d3e4f5a6b")
+                    && matches!(
+                        request.options,
+                        Some(SendPaymentOptions::Bolt11Invoice { prefer_spark: false, completion_timeout_secs: None })
+                    )
+            })
+            .times(1)
+            .returning(|_| {
+                Ok(SendPaymentResponse {
+                    payment: with_status(
+                        payment("6f1c7a8e-2f43-4d55-9a8b-1c2d3e4f5a6b", PaymentType::Send, Some(lightning_details(BOLT11))),
+                        PaymentStatus::Pending,
+                    ),
+                })
+            });
+        let client = LightningClient::new(Arc::new(ops));
+        let sent = client
+            .pay_bolt11(BOLT11, 150_000, "6f1c7a8e-2f43-4d55-9a8b-1c2d3e4f5a6b", Some(5))
+            .await
+            .unwrap();
+        assert_eq!(sent.direction, PaymentDirection::Send);
+        assert_eq!(sent.status, WalletPaymentStatus::Pending);
+    }
+
+    #[tokio::test]
+    async fn a_bolt11_invoice_with_another_amount_or_too_high_a_fee_is_never_sent() {
+        let mut ops = MockLightningOps::new();
+        ops.expect_get_payment().returning(|_| Err(unknown_payment()));
+        ops.expect_prepare_send_payment()
+            .times(1)
+            .returning(|_| Ok(prepared_bolt11(150_001, 4, None)));
+        let client = LightningClient::new(Arc::new(ops));
+        let err = client.pay_bolt11(BOLT11, 150_000, "key", None).await.unwrap_err();
+        assert!(format!("{err:#}").contains("amount"), "{err:#}");
+
+        let mut ops = MockLightningOps::new();
+        ops.expect_get_payment().returning(|_| Err(unknown_payment()));
+        // Both fee components count against the cap.
+        ops.expect_prepare_send_payment()
+            .times(1)
+            .returning(|_| Ok(prepared_bolt11(150_000, 4, Some(2))));
+        let client = LightningClient::new(Arc::new(ops));
+        let err = client.pay_bolt11(BOLT11, 150_000, "key", Some(5)).await.unwrap_err();
+        assert_eq!(err.downcast_ref::<FeeAboveCap>(), Some(&FeeAboveCap { fee_sats: 6, cap_sats: 5 }));
+    }
+
+    #[tokio::test]
+    async fn a_bolt11_quote_reports_amount_and_fees_without_paying() {
+        let mut ops = MockLightningOps::new();
+        ops.expect_prepare_send_payment()
+            .times(1)
+            .returning(|_| Ok(prepared_bolt11(150_000, 4, Some(1))));
+        let client = LightningClient::new(Arc::new(ops));
+        assert_eq!(
+            client.quote_bolt11(BOLT11, 150_000).await.unwrap(),
+            PayoutQuote { amount_sats: 150_000, fees_sats: 5 }
+        );
+    }
+
+    #[tokio::test]
+    async fn a_replayed_bolt11_key_returns_the_original_send() {
+        let mut ops = MockLightningOps::new();
+        ops.expect_get_payment().times(1).returning(|_| {
+            Ok(GetPaymentResponse {
+                payment: payment("key", PaymentType::Send, Some(lightning_details(BOLT11))),
+            })
+        });
+        let client = LightningClient::new(Arc::new(ops));
+        let replayed = client.pay_bolt11(BOLT11, 150_000, "key", Some(1)).await.unwrap();
+        assert_eq!(replayed.id, "key");
     }
 
     #[tokio::test]
@@ -1224,7 +1476,7 @@ mod tests {
         // No `lnurl_pay` expectation: calling it would fail the test.
         let client = LightningClient::new(Arc::new(ops));
         assert!(client
-            .pay_lightning_address("alice@example.com", 1, None, None)
+            .pay_lightning_address("alice@example.com", 1, None, None, None)
             .await
             .is_err());
     }

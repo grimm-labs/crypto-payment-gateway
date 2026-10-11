@@ -2,14 +2,14 @@ use std::collections::HashMap;
 use std::time::Duration as StdDuration;
 
 use axum::extract::{DefaultBodyLimit, Path, Query, State};
-use axum::http::{header, HeaderMap, HeaderName, Method, StatusCode};
+use axum::http::{header, HeaderName, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Extension, Json, Router};
 use chrono::{DateTime, Duration, Utc};
 use config::{
-    DEPOSIT_EXPIRY_MAX_MINUTES, DEPOSIT_EXPIRY_MIN_MINUTES, MAX_PENDING_ADDRESSES_PER_API_KEY,
-    USDT_MAX_EXPECTED_AMOUNT,
+    DEPOSIT_EXPIRY_MAX_MINUTES, DEPOSIT_EXPIRY_MIN_MINUTES, ETH_MAX_EXPECTED_AMOUNT,
+    MAX_PENDING_ADDRESSES_PER_API_KEY, USDT_MAX_EXPECTED_AMOUNT,
 };
 use db::{AuditActor, DepositAddressRow, WebhookDeliveryRow};
 use domain::{
@@ -20,8 +20,7 @@ use domain::{
 use jobs::{
     get_cached_wallet_balances, get_live_balances, lightning_payment_entry,
     lightning_payment_history, notify_address_event, retrigger_failed_deposit_webhooks,
-    retrigger_webhook, Actor, AppState, LightningError, LightningHistoryEntry, PayoutCommand,
-    PayoutError, RetriggerError,
+    retrigger_webhook, Actor, AppState, LightningError, LightningHistoryEntry, RetriggerError,
 };
 use middleware::{ClientIp, CurrentApiKey, CurrentStaff};
 use rust_decimal::Decimal;
@@ -38,6 +37,7 @@ mod middleware;
 mod rate_limit;
 mod session;
 mod traffic;
+mod withdrawals;
 
 const READINESS_TIMEOUT: StdDuration = StdDuration::from_secs(2);
 /// Whole-request bound; above the payout call's own timeout.
@@ -61,10 +61,19 @@ pub fn router(state: AppState) -> Router {
         .route("/balances", get(get_balances))
         .route("/wallet-balances", get(get_wallet_balances))
         .route(
-            "/lightning/payments",
-            get(list_lightning_payments).post(create_lightning_payout),
+            "/withdrawals",
+            post(withdrawals::create_withdrawal).get(withdrawals::list_withdrawals),
         )
-        .route("/lightning/payments/quote", post(quote_lightning_payout))
+        .route("/withdrawals/quote", post(withdrawals::quote_withdrawal))
+        .route("/withdrawals/{id}", get(withdrawals::get_withdrawal))
+        .route("/withdrawals/{id}/cancel", post(withdrawals::cancel_withdrawal))
+        .route("/address-book", get(withdrawals::merchant_address_book))
+        // Deprecated alias of POST /withdrawals (Lightning addresses).
+        .route(
+            "/lightning/payments",
+            get(list_lightning_payments).post(withdrawals::create_lightning_payout),
+        )
+        .route("/lightning/payments/quote", post(withdrawals::quote_lightning_payout))
         .route("/lightning/payments/{id}", get(get_lightning_payment))
         .route_layer(axum::middleware::from_fn_with_state(
             state.clone(),
@@ -373,7 +382,8 @@ struct ValidCreateRequest {
 
 /// BTC networks take an integer `expected_amount_sats` and refuse
 /// `expected_amount` (so `1500` is never ambiguous between sats and BTC);
-/// USDT networks keep the decimal `expected_amount`.
+/// USDT and ETH take the decimal `expected_amount` (rounded to the token's
+/// decimals: 6 for USDT, 18 for ETH).
 fn validate_create_request(
     body: &CreateDepositAddressRequest,
 ) -> Result<ValidCreateRequest, ApiError> {
@@ -404,7 +414,7 @@ fn validate_create_request(
             let amount = raw_to_decimal(&sats.to_string(), token).map_err(ApiError::from)?;
             (amount, Some(sats))
         }
-        Token::Usdt => {
+        Token::Usdt | Token::Eth => {
             if body.expected_amount_sats.is_some() {
                 return Err(ApiError::bad_request(
                     "expected_amount_sats is only accepted on bitcoin/lightning",
@@ -416,17 +426,24 @@ fn validate_create_request(
                 .and_then(|v| v.parse().ok())
                 .ok_or_else(|| ApiError::bad_request("Invalid expected_amount"))?;
             let amount = round_to_token(amount, token);
+            let max = if token == Token::Eth {
+                ETH_MAX_EXPECTED_AMOUNT
+            } else {
+                USDT_MAX_EXPECTED_AMOUNT
+            };
             // 0 would be settled by any zero-value transfer (address
-            // poisoning); huge values overflow DECIMAL(24,8).
-            if amount <= Decimal::ZERO || amount > Decimal::from(USDT_MAX_EXPECTED_AMOUNT) {
+            // poisoning); huge values overflow DECIMAL(38,18).
+            if amount <= Decimal::ZERO || amount > Decimal::from(max) {
                 return Err(ApiError::new(
                     StatusCode::BAD_REQUEST,
-                    format!(
-                        "expected_amount must be greater than 0 and at most {USDT_MAX_EXPECTED_AMOUNT}"
-                    ),
+                    format!("expected_amount must be greater than 0 and at most {max}"),
                 ));
             }
             (amount, None)
+        }
+        // Gas assets are never payments (`supports` refused them above).
+        Token::Trx | Token::Sol => {
+            return Err(ApiError::bad_request("Token not supported on this network"))
         }
     };
 
@@ -696,13 +713,22 @@ async fn get_balances(State(state): State<AppState>) -> Result<Json<Value>, ApiE
 }
 
 /// The Lightning wallet history exposes every payee and payer of the
-/// (possibly shared) wallet: merchant keys need `can_send`; on the admin
-/// surface the routes are ADMIN-only.
+/// (possibly shared) wallet: merchant keys need a withdrawal grant for BTC
+/// on Lightning; on the admin surface the routes are ADMIN-only.
 fn authorize_lightning_read(api_key: Option<&CurrentApiKey>) -> Result<(), ApiError> {
     match api_key {
-        Some(key) if !key.can_send => Err(ApiError::forbidden(
-            "This API key is not allowed to access the Lightning wallet",
-        )),
+        Some(key)
+            if jobs::withdrawals::rules::authorize(
+                &withdrawals::key_requester(key),
+                Network::Lightning,
+                Token::Btc,
+            )
+            .is_err() =>
+        {
+            Err(ApiError::forbidden(
+                "This API key is not allowed to access the Lightning wallet",
+            ))
+        }
         _ => Ok(()),
     }
 }
@@ -733,273 +759,6 @@ async fn list_lightning_payments(
             Err(ApiError::internal("Failed to list Lightning payments".into()))
         }
     }
-}
-
-/// Longest Lightning address accepted (local part + `@` + domain).
-const LN_ADDRESS_MAX_LEN: usize = 320;
-
-#[derive(Debug, Deserialize)]
-struct PayoutRequest {
-    /// `user@domain` — the only payout destination (no LNURL strings or
-    /// invoices).
-    ln_address: String,
-    /// Integer string, sats; fees come on top.
-    amount_sats: String,
-    /// Sent to the recipient; its maximum length is the recipient's.
-    comment: Option<String>,
-    /// Staff only: fresh TOTP code (step-up).
-    totp_code: Option<String>,
-}
-
-#[derive(Debug)]
-struct ValidPayout {
-    ln_address: String,
-    amount_sats: u64,
-    comment: Option<String>,
-    /// Canonical (lowercase, hyphenated) UUID, as the SDK requires.
-    idempotency_key: Option<String>,
-}
-
-fn validate_payout_request(
-    body: &PayoutRequest,
-    idempotency_key: Option<&str>,
-) -> Result<ValidPayout, ApiError> {
-    let ln_address = body.ln_address.trim();
-    if !is_lightning_address(ln_address) {
-        return Err(ApiError::bad_request(
-            "ln_address must be a Lightning address (user@domain)",
-        ));
-    }
-    let amount_sats = parse_sats(&body.amount_sats).map_err(|_| {
-        ApiError::new(
-            StatusCode::BAD_REQUEST,
-            format!("Invalid amount_sats (integer string, 1 to {BTC_MAX_SATS})"),
-        )
-    })?;
-    let idempotency_key = idempotency_key
-        .map(|key| {
-            uuid::Uuid::parse_str(key.trim())
-                .map(|uuid| uuid.hyphenated().to_string())
-                .map_err(|_| ApiError::bad_request("Idempotency-Key must be a UUID"))
-        })
-        .transpose()?;
-    Ok(ValidPayout {
-        ln_address: ln_address.to_string(),
-        amount_sats,
-        comment: body.comment.clone().filter(|c| !c.trim().is_empty()),
-        idempotency_key,
-    })
-}
-
-/// Domain suffixes that only resolve inside a private network (or never).
-const LOCAL_TLDS: [&str; 13] = [
-    "local", "localhost", "internal", "lan", "home", "localdomain", "arpa", "test", "invalid",
-    "example", "onion", "corp", "intranet",
-];
-
-/// `user@domain` (LUD-16): one `@`, a user part of letters, digits and
-/// `-_.` (what the SDK accepts), and a public DNS name — the SDK fetches
-/// `https://domain/.well-known/lnurlp/user`, so IP literals and local names
-/// are refused to keep the gateway from probing its own network. Everything
-/// else the SDK could parse (LNURL, invoices, on-chain addresses) is refused
-/// before reaching it.
-fn is_lightning_address(value: &str) -> bool {
-    if value.len() > LN_ADDRESS_MAX_LEN {
-        return false;
-    }
-    let Some((user, domain)) = value.split_once('@') else {
-        return false;
-    };
-    let user_ok = !user.is_empty()
-        && user
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c));
-    let labels: Vec<&str> = domain.split('.').collect();
-    let labels_ok = labels.len() >= 2
-        && labels.iter().all(|label| {
-            !label.is_empty()
-                && !label.starts_with('-')
-                && !label.ends_with('-')
-                && label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
-        });
-    // A public TLD is alphabetic — this also rules out IPv4 literals.
-    let tld = labels.last().copied().unwrap_or_default().to_ascii_lowercase();
-    let tld_ok = tld.len() >= 2
-        && tld.chars().all(|c| c.is_ascii_alphabetic())
-        && !LOCAL_TLDS.contains(&tld.as_str());
-    user_ok && labels_ok && tld_ok
-}
-
-/// Payouts: a merchant key granted `can_send`, or ADMIN staff.
-fn authorize_payout(
-    api_key: Option<&CurrentApiKey>,
-    staff: Option<&CurrentStaff>,
-) -> Result<(), ApiError> {
-    match (api_key, staff) {
-        (Some(key), _) if key.can_send => Ok(()),
-        (Some(_), _) => Err(ApiError::forbidden(
-            "This API key is not allowed to send payments",
-        )),
-        (None, Some(staff)) if staff.role == domain::StaffRole::Admin => Ok(()),
-        (None, Some(_)) => Err(ApiError::forbidden("Admin role required")),
-        (None, None) => Err(ApiError::unauthorized("Not authenticated")),
-    }
-}
-
-/// The SDK fetches `https://<domain>/.well-known/lnurlp/<user>`: a public
-/// name that resolves to an internal address would make the gateway probe
-/// its own network (#65). Best effort (the SDK resolves again), skipped in
-/// development.
-async fn ensure_public_ln_domain(state: &AppState, ln_address: &str) -> Result<(), ApiError> {
-    if state.config.is_development() {
-        return Ok(());
-    }
-    let host = ln_address.rsplit_once('@').map(|(_, d)| d).unwrap_or_default();
-    let resolved: Vec<std::net::SocketAddr> = tokio::net::lookup_host((host, 443))
-        .await
-        .map_err(|_| ApiError::bad_request("Lightning address domain does not resolve"))?
-        .collect();
-    if resolved.is_empty() || !resolved.iter().all(|addr| domain::is_public_ip(addr.ip())) {
-        return Err(ApiError::bad_request(
-            "Lightning address domain must resolve to public addresses only",
-        ));
-    }
-    Ok(())
-}
-
-fn payout_error(err: PayoutError, quote: bool) -> ApiError {
-    match err {
-        PayoutError::Unavailable => {
-            ApiError::service_unavailable("Lightning is not configured".into())
-        }
-        PayoutError::PayoutsDisabled => {
-            ApiError::unprocessable("Payouts are disabled (limit set to 0)".into())
-        }
-        PayoutError::PerPayoutLimit { max_sats } => ApiError::unprocessable(format!(
-            "Amount exceeds the per-payout limit of {max_sats} sats"
-        )),
-        PayoutError::DailyLimit {
-            used_sats,
-            max_sats,
-        } => ApiError::unprocessable(format!(
-            "Daily payout limit reached: {used_sats} of {max_sats} sats already sent in the last 24 h"
-        )),
-        PayoutError::InProgress => {
-            ApiError::conflict("A payout with this Idempotency-Key is already in progress")
-        }
-        // Also covers a key used by another caller — without saying so.
-        PayoutError::KeyReused => ApiError::unprocessable(
-            "Idempotency-Key was already used with different parameters".into(),
-        ),
-        // Generic on purpose: the SDK detail stays server-side.
-        PayoutError::Failed if quote => ApiError::bad_gateway("Could not get a quote"),
-        PayoutError::Failed => ApiError::bad_gateway("Payment failed"),
-        PayoutError::Internal(err) => ApiError::internal(format!("{err:#}")),
-    }
-}
-
-/// Pay a Lightning address from the wallet, once per `Idempotency-Key`
-/// (required). Answers 202 as soon as the send is accepted (usually
-/// `pending`), 200 for a replayed key; the outcome follows as a payout
-/// webhook and through `GET /lightning/payments/{id}`. Staff need a fresh
-/// TOTP code.
-async fn create_lightning_payout(
-    State(state): State<AppState>,
-    api_key: Option<Extension<CurrentApiKey>>,
-    staff: Option<Extension<CurrentStaff>>,
-    client_ip: ClientIp,
-    headers: HeaderMap,
-    Json(body): Json<PayoutRequest>,
-) -> Result<(StatusCode, Json<Value>), ApiError> {
-    authorize_payout(api_key.as_deref(), staff.as_deref())?;
-    let idempotency_key = headers
-        .get("idempotency-key")
-        .map(|value| value.to_str().unwrap_or_default())
-        .ok_or_else(|| ApiError::bad_request("Idempotency-Key header is required (UUID)"))?;
-    let payout = validate_payout_request(&body, Some(idempotency_key))?;
-    let caller_id = api_key
-        .as_deref()
-        .map(|key| key.id.clone())
-        .or_else(|| staff.as_deref().map(|staff| staff.id.clone()))
-        .unwrap_or_default();
-    rate_limit::hit(&state, rate_limit::PAYOUTS, &caller_id).await?;
-    if let (None, Some(staff)) = (api_key.as_deref(), staff.as_deref()) {
-        admin::require_step_up(&state, &staff.id, body.totp_code.as_deref()).await?;
-    }
-    ensure_public_ln_domain(&state, &payout.ln_address).await?;
-
-    let command = PayoutCommand {
-        ln_address: payout.ln_address,
-        amount_sats: payout.amount_sats,
-        comment: payout.comment,
-        idempotency_key: payout
-            .idempotency_key
-            .ok_or_else(|| ApiError::bad_request("Idempotency-Key header is required (UUID)"))?,
-        api_key_id: api_key.as_deref().map(|key| key.id.clone()),
-        staff_id: match api_key.as_deref() {
-            Some(_) => None,
-            None => staff.as_deref().map(|staff| staff.id.clone()),
-        },
-    };
-    let actor = actor(api_key.as_deref(), staff.as_deref(), &client_ip);
-    let outcome = jobs::request_payout(&state, &actor, &command)
-        .await
-        .map_err(|err| payout_error(err, false))?;
-    let status = if outcome.replayed {
-        StatusCode::OK
-    } else {
-        StatusCode::ACCEPTED
-    };
-    Ok((
-        status,
-        Json(lightning_history_json(&LightningHistoryEntry {
-            payment: outcome.payment,
-            deposit_address_id: None,
-        })),
-    ))
-}
-
-#[derive(Debug, Deserialize)]
-struct PayoutQuoteRequest {
-    ln_address: String,
-    amount_sats: String,
-    comment: Option<String>,
-}
-
-/// What a payout would cost (the recipient's invoice + fee), without
-/// paying — the dashboard's confirmation step.
-async fn quote_lightning_payout(
-    State(state): State<AppState>,
-    api_key: Option<Extension<CurrentApiKey>>,
-    staff: Option<Extension<CurrentStaff>>,
-    Json(body): Json<PayoutQuoteRequest>,
-) -> Result<Json<Value>, ApiError> {
-    authorize_payout(api_key.as_deref(), staff.as_deref())?;
-    let payout = validate_payout_request(
-        &PayoutRequest {
-            ln_address: body.ln_address,
-            amount_sats: body.amount_sats,
-            comment: body.comment,
-            totp_code: None,
-        },
-        None,
-    )?;
-    let caller_id = api_key
-        .as_deref()
-        .map(|key| key.id.clone())
-        .or_else(|| staff.as_deref().map(|staff| staff.id.clone()))
-        .unwrap_or_default();
-    rate_limit::hit(&state, rate_limit::PAYOUTS, &caller_id).await?;
-    ensure_public_ln_domain(&state, &payout.ln_address).await?;
-    let quote = jobs::quote_payout(&state, &payout.ln_address, payout.amount_sats, payout.comment)
-        .await
-        .map_err(|err| payout_error(err, true))?;
-    Ok(Json(json!({
-        "ln_address": payout.ln_address,
-        "amount_sats": quote.amount_sats.to_string(),
-        "fees_sats": quote.fees_sats.to_string(),
-        "total_sats": quote.amount_sats.saturating_add(quote.fees_sats).to_string(),
-    })))
 }
 
 /// One wallet payment (any direction) — e.g. a payout's current status.
@@ -1413,111 +1172,6 @@ mod tests {
         assert_eq!(page(Some(20), Some(i64::MAX)), (20, u32::MAX));
     }
 
-    fn payout(body: Value) -> PayoutRequest {
-        serde_json::from_value(body).expect("valid payout shape")
-    }
-
-    #[test]
-    fn payout_request_accepts_a_lightning_address_and_sats() {
-        let valid = validate_payout_request(
-            &payout(json!({
-                "ln_address": " Alice@Example.com ", "amount_sats": "150000", "comment": "thanks"
-            })),
-            Some("6F1C7A8E-2F43-4D55-9A8B-1C2D3E4F5A6B"),
-        )
-        .unwrap();
-        assert_eq!(valid.ln_address, "Alice@Example.com");
-        assert_eq!(valid.amount_sats, 150_000);
-        assert_eq!(valid.comment.as_deref(), Some("thanks"));
-        // The SDK requires a canonical UUID.
-        assert_eq!(
-            valid.idempotency_key.as_deref(),
-            Some("6f1c7a8e-2f43-4d55-9a8b-1c2d3e4f5a6b")
-        );
-
-        let no_key = validate_payout_request(
-            &payout(json!({ "ln_address": "alice@example.com", "amount_sats": "1" })),
-            None,
-        )
-        .unwrap();
-        assert_eq!(no_key.idempotency_key, None);
-        assert_eq!(no_key.comment, None);
-    }
-
-    #[test]
-    fn payout_request_only_takes_user_at_domain() {
-        for address in [
-            "alice",
-            "@example.com",
-            "alice@",
-            "alice@localhost",
-            "alice@@example.com",
-            "a b@example.com",
-            "lnurl1dp68gurn8ghj7um9wfmxjcm99e3k7mf0v9cxj0m385ekvcenxc6r2c35xvukxefcv5mkvv34x5ekzd3ev56nyd3hxqurzepexejxxepnxscrvwfnv9nxzcn9xq6xyefhvgcxxcmyxymnserxfq5fns",
-            "lnbc1500n1pjexample",
-            // The SDK only accepts [a-z0-9-_.] in the user part.
-            "alice+tips@example.com",
-            // No IP literals or local names: the SDK would fetch them
-            // (blind SSRF from the gateway host).
-            "alice@127.0.0.1",
-            "alice@10.0.0.5",
-            "alice@169.254.169.254",
-            "alice@printer.local",
-            "alice@db.internal",
-            "alice@example.localhost",
-        ] {
-            let err = validate_payout_request(
-                &payout(json!({ "ln_address": address, "amount_sats": "1000" })),
-                None,
-            )
-            .expect_err(address);
-            assert_eq!(err.status, StatusCode::BAD_REQUEST, "{address}");
-        }
-        let too_long = format!("{}@example.com", "a".repeat(400));
-        assert!(validate_payout_request(
-            &payout(json!({ "ln_address": too_long, "amount_sats": "1000" })),
-            None,
-        )
-        .is_err());
-    }
-
-    #[test]
-    fn payout_request_rejects_bad_amounts_and_keys() {
-        for sats in ["0", "-1", "1.5", "abc", ""] {
-            let err = validate_payout_request(
-                &payout(json!({ "ln_address": "alice@example.com", "amount_sats": sats })),
-                None,
-            )
-            .expect_err(sats);
-            assert_eq!(err.status, StatusCode::BAD_REQUEST, "{sats}");
-        }
-        let err = validate_payout_request(
-            &payout(json!({ "ln_address": "alice@example.com", "amount_sats": "1000" })),
-            Some("order-123"),
-        )
-        .unwrap_err();
-        assert_eq!(err.status, StatusCode::BAD_REQUEST);
-        assert!(err.message.contains("Idempotency-Key"), "{}", err.message);
-    }
-
-    #[test]
-    fn payouts_need_a_permitted_key_or_an_admin() {
-        use crate::middleware::{CurrentApiKey, CurrentStaff};
-        let key = |can_send| CurrentApiKey { id: "k".into(), can_send };
-        let staff = |role| CurrentStaff { id: "s".into(), role };
-
-        assert!(authorize_payout(Some(&key(true)), None).is_ok());
-        let err = authorize_payout(Some(&key(false)), None).unwrap_err();
-        assert_eq!(err.status, StatusCode::FORBIDDEN);
-
-        assert!(authorize_payout(None, Some(&staff(domain::StaffRole::Admin))).is_ok());
-        let err = authorize_payout(None, Some(&staff(domain::StaffRole::Operator))).unwrap_err();
-        assert_eq!(err.status, StatusCode::FORBIDDEN);
-
-        let err = authorize_payout(None, None).unwrap_err();
-        assert_eq!(err.status, StatusCode::UNAUTHORIZED);
-    }
-
     #[test]
     fn usdt_amounts_must_be_positive_and_bounded() {
         for amount in ["0", "-5", "0.0000001", "1000000000000.01"] {
@@ -1544,28 +1198,47 @@ mod tests {
     }
 
     #[test]
-    fn lightning_history_needs_a_sending_key() {
+    fn lightning_history_needs_a_btc_lightning_grant() {
+        use domain::WithdrawalPolicy;
         assert!(authorize_lightning_read(None).is_ok());
-        let key = |can_send| CurrentApiKey { id: "k".into(), can_send };
-        assert!(authorize_lightning_read(Some(&key(true))).is_ok());
-        assert_eq!(
-            authorize_lightning_read(Some(&key(false))).unwrap_err().status,
-            StatusCode::FORBIDDEN
-        );
+        let key = |policy, tokens: Vec<Token>, networks: Option<Vec<Network>>| CurrentApiKey {
+            id: "k".into(),
+            withdrawal_policy: policy,
+            withdrawal_tokens: tokens,
+            withdrawal_networks: networks,
+        };
+        // The migrated `canSend` grant.
+        assert!(authorize_lightning_read(Some(&key(WithdrawalPolicy::Open, vec![Token::Btc], Some(vec![Network::Lightning])))).is_ok());
+        for denied in [
+            key(WithdrawalPolicy::None, vec![Token::Btc], None),
+            key(WithdrawalPolicy::Open, vec![Token::Usdt], None),
+            key(WithdrawalPolicy::Book, vec![Token::Btc], Some(vec![Network::Bitcoin])),
+        ] {
+            assert_eq!(authorize_lightning_read(Some(&denied)).unwrap_err().status, StatusCode::FORBIDDEN);
+        }
     }
 
     #[test]
-    fn payout_errors_map_to_client_safe_statuses() {
-        let status = |err| payout_error(err, false).status;
-        assert_eq!(status(PayoutError::PerPayoutLimit { max_sats: 1 }), StatusCode::UNPROCESSABLE_ENTITY);
-        assert_eq!(status(PayoutError::DailyLimit { used_sats: 1, max_sats: 2 }), StatusCode::UNPROCESSABLE_ENTITY);
-        assert_eq!(status(PayoutError::PayoutsDisabled), StatusCode::UNPROCESSABLE_ENTITY);
-        assert_eq!(status(PayoutError::KeyReused), StatusCode::UNPROCESSABLE_ENTITY);
-        assert_eq!(status(PayoutError::InProgress), StatusCode::CONFLICT);
-        assert_eq!(status(PayoutError::Failed), StatusCode::BAD_GATEWAY);
-        let internal = payout_error(PayoutError::Internal(anyhow::anyhow!("pg: relation x")), false);
-        assert_eq!(internal.status, StatusCode::INTERNAL_SERVER_ERROR);
-        assert_eq!(internal.message, "Internal server error");
+    fn native_eth_payments_take_a_decimal_amount_with_18_decimals() {
+        let valid = validate_create_request(&request(json!({
+            "network": "ethereum", "token": "ETH", "expected_amount": "0.050000000000000000001"
+        })))
+        .unwrap();
+        assert_eq!(valid.token, Token::Eth);
+        assert_eq!(valid.expected_amount, dec!(0.05));
+        assert_eq!(decimal_to_raw(valid.expected_amount, Token::Eth), "50000000000000000");
+        for (amount, ok) in [("100000", true), ("100000.000000000000000001", false), ("0", false)] {
+            let result = validate_create_request(&request(json!({
+                "network": "ethereum", "token": "ETH", "expected_amount": amount
+            })));
+            assert_eq!(result.is_ok(), ok, "{amount}");
+        }
+        // ETH on Ethereum only; gas assets never.
+        for (network, token) in [("tron", "ETH"), ("tron", "TRX"), ("solana", "SOL"), ("bitcoin", "ETH")] {
+            let err = rejected(json!({ "network": network, "token": token, "expected_amount": "1" }));
+            assert_eq!(err.status, StatusCode::BAD_REQUEST, "{network}/{token}");
+        }
+        assert!(rejected(json!({ "network": "ethereum", "token": "ETH", "expected_amount_sats": "1" })).message.contains("expected_amount_sats"));
     }
 
     #[test]
@@ -1575,19 +1248,12 @@ mod tests {
     }
 
     #[test]
-    fn local_lightning_domains_are_refused() {
-        for address in ["alice@node.test", "alice@1.0.0.10.in-addr.arpa", "alice@x.onion", "alice@pay.corp"] {
-            assert!(!is_lightning_address(address), "{address}");
-        }
-    }
-
-    #[test]
     fn expected_amount_raw_uses_token_base_units() {
         let now = Utc::now();
         let row = |network: Network, amount: Decimal| DepositAddressRow {
             id: "a".into(),
             network: network.as_db().into(),
-            token: network.token().as_db().into(),
+            token: network.payment_tokens()[0].as_db().into(),
             address: "addr".into(),
             derivation_index: 0,
             expected_amount: amount,
@@ -1607,5 +1273,12 @@ mod tests {
         let usdt = to_response(&row(Network::Tron, dec!(25.50000000))).unwrap();
         assert_eq!(usdt.expected_amount, "25.5");
         assert_eq!(usdt.expected_amount_raw, "25500000");
+
+        let mut eth = row(Network::Ethereum, dec!(0.050000000000000000));
+        eth.token = Token::Eth.as_db().into();
+        let eth = to_response(&eth).unwrap();
+        assert_eq!(eth.token, "ETH");
+        assert_eq!(eth.expected_amount, "0.05");
+        assert_eq!(eth.expected_amount_raw, "50000000000000000");
     }
 }

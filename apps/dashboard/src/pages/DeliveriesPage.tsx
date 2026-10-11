@@ -52,11 +52,84 @@ import {
 } from "@/hooks/queries"
 import { useIsAdmin } from "@/lib/auth"
 import { toastError } from "@/lib/errors"
-import { formatAmount, formatDate, networkLabel, networkToken, shortHash } from "@/lib/format"
+import { formatAmount, formatDate, humanize, networkLabel, shortHash } from "@/lib/format"
+import { PAYMENT_TOKENS, isNetwork } from "@/lib/networks"
 import type { WebhookDelivery } from "@/lib/types"
 
 const PAGE_SIZE = 20
 const ALL = "all"
+
+/**
+ * Token of a delivery's amount: the payload's own `token` once an attempt
+ * was made; otherwise the network's only payment token. Ethereum carries
+ * USDT or ETH, so it stays unknown (null) until then.
+ */
+function deliveryToken(webhook: WebhookDelivery): string | null {
+  const data = webhook.payload?.data
+  if (data && typeof data === "object" && "token" in data && typeof data.token === "string") {
+    return data.token
+  }
+  if (!isNetwork(webhook.network)) return null
+  const tokens = PAYMENT_TOKENS[webhook.network]
+  return tokens.length === 1 ? tokens[0] : null
+}
+
+function formatDeliveryAmount(webhook: WebhookDelivery): string {
+  if (!webhook.amount) return "—"
+  const token = deliveryToken(webhook)
+  return token ? formatAmount(webhook.amount, token) : webhook.amount
+}
+
+function DeliverySubject({ webhook, isAdmin }: { webhook: WebhookDelivery; isAdmin: boolean }) {
+  if (webhook.withdrawal_id) {
+    return (
+      <Link
+        to={`/withdrawals/${webhook.withdrawal_id}`}
+        className="font-mono text-xs underline-offset-4 hover:underline"
+        title={webhook.withdrawal_id}
+      >
+        Withdrawal {shortHash(webhook.withdrawal_id, 6)}
+      </Link>
+    )
+  }
+  if (webhook.alert_id) {
+    return (
+      <Link
+        to="/treasury"
+        className="font-mono text-xs underline-offset-4 hover:underline"
+        title={webhook.alert_id}
+      >
+        Alert {shortHash(webhook.alert_id, 6)}
+      </Link>
+    )
+  }
+  if (webhook.deposit_address_id && webhook.address) {
+    return (
+      <Link
+        to={`/payments/${webhook.deposit_address_id}`}
+        className="font-mono text-xs underline-offset-4 hover:underline"
+      >
+        {shortHash(webhook.address, 6)}
+      </Link>
+    )
+  }
+  if (webhook.lightning_payment_id) {
+    return isAdmin ? (
+      <Link
+        to="/lightning"
+        className="font-mono text-xs underline-offset-4 hover:underline"
+        title={webhook.lightning_payment_id}
+      >
+        Payout {shortHash(webhook.lightning_payment_id, 6)}
+      </Link>
+    ) : (
+      <span className="font-mono text-xs" title={webhook.lightning_payment_id}>
+        Payout {shortHash(webhook.lightning_payment_id, 6)}
+      </span>
+    )
+  }
+  return <span className="text-xs text-muted-foreground">—</span>
+}
 
 export function DeliveriesPage() {
   const [searchParams, setSearchParams] = useSearchParams()
@@ -123,8 +196,8 @@ export function DeliveriesPage() {
         <div>
           <h1 className="text-2xl font-semibold tracking-tight">Deliveries</h1>
           <p className="text-sm text-muted-foreground">
-            Delivery state of deposit-confirmation callbacks (latest attempt per
-            deposit and endpoint).
+            Delivery state of webhook callbacks — payments, payouts, withdrawals
+            and operational alerts (latest attempt per subject, event and endpoint).
           </p>
         </div>
         {isAdmin && (
@@ -174,7 +247,7 @@ export function DeliveriesPage() {
             <Table>
               <TableHeader>
                 <TableRow>
-                  <TableHead>Payment</TableHead>
+                  <TableHead>Subject</TableHead>
                   <TableHead>Event</TableHead>
                   <TableHead>Endpoint</TableHead>
                   <TableHead>Tx hash</TableHead>
@@ -197,38 +270,16 @@ export function DeliveriesPage() {
                 {webhooks.data?.data.map((webhook) => (
                   <TableRow key={webhook.id}>
                     <TableCell>
-                      {webhook.deposit_address_id && webhook.address ? (
-                        <Link
-                          to={`/payments/${webhook.deposit_address_id}`}
-                          className="font-mono text-xs underline-offset-4 hover:underline"
-                        >
-                          {shortHash(webhook.address, 6)}
-                        </Link>
-                      ) : webhook.lightning_payment_id && isAdmin ? (
-                        <Link
-                          to="/lightning"
-                          className="font-mono text-xs underline-offset-4 hover:underline"
-                          title={webhook.lightning_payment_id}
-                        >
-                          Payout {shortHash(webhook.lightning_payment_id, 6)}
-                        </Link>
-                      ) : webhook.lightning_payment_id ? (
-                        <span
-                          className="font-mono text-xs"
-                          title={webhook.lightning_payment_id}
-                        >
-                          Payout {shortHash(webhook.lightning_payment_id, 6)}
-                        </span>
-                      ) : (
-                        <span className="text-xs text-muted-foreground">—</span>
+                      <DeliverySubject webhook={webhook} isAdmin={isAdmin} />
+                      {webhook.network !== "unknown" && (
+                        <p className="text-xs text-muted-foreground">
+                          {networkLabel(webhook.network)}
+                        </p>
                       )}
-                      <p className="text-xs text-muted-foreground">
-                        {networkLabel(webhook.network)}
-                      </p>
                     </TableCell>
                     <TableCell>
                       <Badge variant="secondary" className="capitalize">
-                        {webhook.event.replace(/_/g, " ")}
+                        {humanize(webhook.event)}
                       </Badge>
                     </TableCell>
                     <TableCell>
@@ -248,9 +299,7 @@ export function DeliveriesPage() {
                       )}
                     </TableCell>
                     <TableCell className="tabular-nums">
-                      {webhook.amount
-                        ? formatAmount(webhook.amount, networkToken(webhook.network))
-                        : "—"}
+                      {formatDeliveryAmount(webhook)}
                     </TableCell>
                     <TableCell>
                       <StatusBadge status={webhook.status} />

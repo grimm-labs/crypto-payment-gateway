@@ -7,13 +7,18 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use config::{AppConfig, DEPOSIT_EXPIRY_MAX_MINUTES, USDT_ETH, USDT_SOLANA, USDT_TRON};
+use config::{AppConfig, DEPOSIT_EXPIRY_MAX_MINUTES};
 use domain::{decimal_str_to_raw, Network, Token};
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
 use solana_sdk::pubkey::Pubkey;
 use tracing::{debug, warn};
 
+pub mod btc_tx;
+pub mod destination;
+pub mod evm;
+pub mod solana_tx;
+pub mod tron_tx;
 mod esplora;
 mod mainnet;
 mod request;
@@ -168,6 +173,27 @@ impl ChainClients {
         }
     }
 
+    /// Balance of `token` held by `address` (latest state; on Solana the
+    /// address is the token account for USDT, the owner for SOL). Zero when
+    /// the network is unconfigured.
+    pub async fn fetch_balance(&self, network: Network, token: Token, address: &str) -> Result<u128> {
+        if !self.is_network_available(network) {
+            return Ok(0);
+        }
+        match (network, token) {
+            (_, Token::Usdt) => self.fetch_usdt_balance(network, address).await,
+            (Network::Bitcoin, Token::Btc) => self.fetch_btc_balance(address).await,
+            (Network::Ethereum, Token::Eth) => {
+                evm::EvmRpc::eth_balance(self, address, evm::BlockTag::Latest).await
+            }
+            (Network::Tron, Token::Trx) => {
+                Ok(tron_tx::TronRpc::account_balance(self, address).await?.unwrap_or(0))
+            }
+            (Network::Solana, Token::Sol) => solana_tx::SolanaRpc::lamports(self, address).await,
+            _ => anyhow::bail!("{} is not held on {}", token.as_api(), network.as_api()),
+        }
+    }
+
     /// Confirmed on-chain balance of a Bitcoin address, in sats.
     pub async fn fetch_btc_balance(&self, address: &str) -> Result<u128> {
         let Some(url) = self.esplora_url(&format!("address/{address}")) else {
@@ -230,7 +256,7 @@ impl ChainClients {
         };
 
         let candidates = match self.fetch_trc20(address, api_key).await {
-            Ok(txs) => tron::usdt_transfers_to(txs, address),
+            Ok(txs) => tron::usdt_transfers_to(txs, &self.config.chain.usdt_tron, address),
             Err(e) => return self.tron_failure(e, vec![]).await,
         };
 
@@ -275,7 +301,7 @@ impl ChainClients {
             &rpc,
             "eth_getLogs",
             serde_json::json!([{
-                "address": USDT_ETH,
+                "address": self.config.chain.usdt_eth,
                 "topics": [TRANSFER_TOPIC, serde_json::Value::Null, recipient_topic],
                 "fromBlock": format!("0x{:x}", current_block.saturating_sub(ETH_LOG_SCAN_BLOCKS)),
                 "toBlock": format!("0x{current_block:x}")
@@ -283,7 +309,7 @@ impl ChainClients {
         )
         .await?;
 
-        eth_usdt_transfers(logs, &recipient_topic, current_block)
+        eth_usdt_transfers(logs, &self.config.chain.usdt_eth, &recipient_topic, current_block)
     }
 
     pub async fn poll_solana_address(
@@ -313,7 +339,7 @@ impl ChainClients {
                 warn!("Helius answered for another transaction than {signature} — skipped");
                 continue;
             }
-            out.extend(helius_usdt_transfers(parsed, address));
+            out.extend(helius_usdt_transfers(parsed, &self.config.chain.usdt_solana_mint, address));
         }
         Ok(out)
     }
@@ -350,6 +376,11 @@ impl ChainClients {
         }
     }
 
+    fn expected_genesis(&self, network: Network) -> Result<&'static str> {
+        mainnet::expected_genesis(network, self.config.chain.mode)
+            .with_context(|| format!("no genesis identity for {}", network.as_api()))
+    }
+
     async fn verify_tron(&self) -> Result<()> {
         let api_key = self
             .api_key(Network::Tron)
@@ -364,7 +395,7 @@ impl ChainClients {
         .context("Tron mainnet check: wallet/getblockbynum failed")?;
         mainnet::expect_identity(
             Network::Tron,
-            mainnet::TRON_GENESIS_BLOCK_ID,
+            self.expected_genesis(Network::Tron)?,
             genesis.block_id.as_deref().unwrap_or_default(),
         )?;
         Ok(())
@@ -383,7 +414,7 @@ impl ChainClients {
             .unwrap_or(chain_id);
         mainnet::expect_identity(
             Network::Ethereum,
-            &format!("0x{:x}", mainnet::ETHEREUM_CHAIN_ID),
+            &format!("0x{:x}", self.config.chain.eth_chain_id),
             &actual,
         )?;
         Ok(())
@@ -397,7 +428,7 @@ impl ChainClients {
         let genesis: String = json_rpc(&self.http, &rpc, "getGenesisHash", serde_json::json!([]))
             .await
             .context("Solana mainnet check failed")?;
-        mainnet::expect_identity(Network::Solana, mainnet::SOLANA_GENESIS_HASH, &genesis)?;
+        mainnet::expect_identity(Network::Solana, self.expected_genesis(Network::Solana)?, &genesis)?;
         Ok(())
     }
 
@@ -408,7 +439,7 @@ impl ChainClients {
         let genesis = request::send_text(self.http.get(url))
             .await
             .context("Bitcoin mainnet check: Esplora block-height/0 failed")?;
-        mainnet::expect_identity(Network::Bitcoin, mainnet::BITCOIN_GENESIS_HASH, &genesis)?;
+        mainnet::expect_identity(Network::Bitcoin, self.expected_genesis(Network::Bitcoin)?, &genesis)?;
         Ok(())
     }
 
@@ -423,7 +454,7 @@ impl ChainClients {
                 .context("TronGrid account request failed")?;
         if let Some(entries) = resp.data.and_then(|d| d.into_iter().next()) {
             for map in entries.trc20.unwrap_or_default() {
-                if let Some(balance) = map.get(USDT_TRON) {
+                if let Some(balance) = map.get(&self.config.chain.usdt_tron) {
                     return Ok(balance.parse().unwrap_or(0));
                 }
             }
@@ -442,7 +473,7 @@ impl ChainClients {
             &self.http,
             &rpc,
             "eth_call",
-            serde_json::json!([{ "to": USDT_ETH, "data": data }, "latest"]),
+            serde_json::json!([{ "to": self.config.chain.usdt_eth, "data": data }, "latest"]),
         )
         .await?;
         parse_hex_u128(&result)
@@ -497,7 +528,7 @@ impl ChainClients {
                 .query(&[
                     ("only_confirmed", "true"),
                     ("only_to", "true"),
-                    ("contract_address", USDT_TRON),
+                    ("contract_address", self.config.chain.usdt_tron.as_str()),
                     ("limit", "50"),
                 ]),
         )
@@ -614,6 +645,7 @@ async fn json_rpc<T: DeserializeOwned>(
 /// rather than trusted from the provider.
 fn eth_usdt_transfers(
     logs: Vec<EthLog>,
+    usdt_contract: &str,
     recipient_topic: &str,
     current_block: u64,
 ) -> Result<Vec<DetectedOnChainTransfer>> {
@@ -623,7 +655,7 @@ fn eth_usdt_transfers(
         let is_usdt_transfer_to_recipient = log
             .address
             .as_deref()
-            .is_some_and(|contract| contract.eq_ignore_ascii_case(USDT_ETH))
+            .is_some_and(|contract| contract.eq_ignore_ascii_case(usdt_contract))
             // ERC-20 Transfer: event signature, from, to (data = value).
             && matches!(
                 topics.as_slice(),
@@ -671,13 +703,17 @@ fn finalized_successful_signatures(infos: Vec<SolanaSignatureInfo>) -> Vec<Strin
 /// USDT transfers to `address` in a Helius-parsed transaction; none when
 /// the transaction failed. Solana needs one finalized confirmation
 /// (`domain::required_confirmations`), which `commitment: finalized` gives.
-fn helius_usdt_transfers(parsed: HeliusTransaction, address: &str) -> Vec<DetectedOnChainTransfer> {
+fn helius_usdt_transfers(
+    parsed: HeliusTransaction,
+    usdt_mint: &str,
+    address: &str,
+) -> Vec<DetectedOnChainTransfer> {
     if parsed.transaction_error.is_some() {
         return vec![];
     }
     let mut out = Vec::new();
     for transfer in parsed.token_transfers.unwrap_or_default() {
-        if transfer.mint.as_deref() != Some(USDT_SOLANA) {
+        if transfer.mint.as_deref() != Some(usdt_mint) {
             continue;
         }
         let destination = transfer
@@ -852,6 +888,7 @@ struct HeliusRawAmount {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use config::{USDT_ETH, USDT_SOLANA};
 
     #[test]
     fn confirmations_count_the_inclusion_block() {
@@ -918,7 +955,7 @@ mod tests {
             eth_log(&USDT_ETH.to_lowercase(), &[TRANSFER_TOPIC, from, &to.to_uppercase().replace("0X", "0x")], false),
         );
         let logs: Vec<EthLog> = serde_json::from_str(&logs).unwrap();
-        let transfers = eth_usdt_transfers(logs, &to, 0x14a3c2f + 11).unwrap();
+        let transfers = eth_usdt_transfers(logs, USDT_ETH, &to, 0x14a3c2f + 11).unwrap();
         assert_eq!(transfers.len(), 1);
         assert_eq!(transfers[0].amount_raw, "25000000");
         assert_eq!(transfers[0].confirmations, 12);
@@ -934,7 +971,7 @@ mod tests {
             r#"[{ "data": "0x01", "blockNumber": "0x1", "transactionHash": "0xab", "topics": null }]"#,
         )
         .unwrap();
-        assert!(eth_usdt_transfers(logs, &recipient_topic(), 10).unwrap().is_empty());
+        assert!(eth_usdt_transfers(logs, USDT_ETH, &recipient_topic(), 10).unwrap().is_empty());
     }
 
     #[test]
@@ -1039,7 +1076,7 @@ mod tests {
             token_transfer(usdc, ATA, "100"),
             token_transfer(USDT_SOLANA, "3Gf3hU7pTkTGo8vCgx6ruqBJ3DqDWSWCDWJ9eG5Uf9yB", "7"),
         );
-        let detected = helius_usdt_transfers(helius("null", &transfers), ATA);
+        let detected = helius_usdt_transfers(helius("null", &transfers), USDT_SOLANA, ATA);
         assert_eq!(detected.len(), 1);
         assert_eq!(detected[0].amount_raw, "25500000");
         assert_eq!(detected[0].confirmations, 1);
@@ -1049,7 +1086,7 @@ mod tests {
     fn failed_helius_transactions_credit_nothing() {
         let transfers = format!("[{}]", token_transfer(USDT_SOLANA, ATA, "25"));
         let failed = helius(r#"{ "InstructionError": [0, { "Custom": 1 }] }"#, &transfers);
-        assert!(helius_usdt_transfers(failed, ATA).is_empty());
+        assert!(helius_usdt_transfers(failed, USDT_SOLANA, ATA).is_empty());
     }
 
     #[test]

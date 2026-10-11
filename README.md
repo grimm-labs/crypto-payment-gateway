@@ -2,8 +2,9 @@
 
 [![CI](https://github.com/nejos97/crypto-payment-gateway/actions/workflows/ci.yml/badge.svg)](https://github.com/nejos97/crypto-payment-gateway/actions/workflows/ci.yml)
 
-Rust service for accepting USDT deposits on **Tron**, **Ethereum**, and **Solana**, and
-bitcoin payments **on-chain** and over **Lightning**.
+Rust service for accepting USDT deposits on **Tron**, **Ethereum**, and **Solana**, native
+**ETH** on Ethereum, and bitcoin payments **on-chain** and over **Lightning** — and for
+sending funds back out (**withdrawals**) on every one of them.
 
 ## Features
 
@@ -13,10 +14,17 @@ bitcoin payments **on-chain** and over **Lightning**.
   (deposit confirmed), `expired` — to every active endpoint **subscribed to that event**;
   endpoints are managed from the dashboard (**Webhooks**, admin), with per-endpoint delivery state
 - HD wallet derivation from `WALLET_MNEMONIC`
-- Multi-network support: Tron (TRC-20), Ethereum (ERC-20), Solana (SPL), Bitcoin (BIP84
-  on-chain) and Lightning (BOLT11 via the Breez SDK) — see [Bitcoin & Lightning](#bitcoin--lightning)
+- Multi-network support: Tron (TRC-20), Ethereum (ERC-20 and native ETH), Solana (SPL),
+  Bitcoin (BIP84 on-chain) and Lightning (BOLT11 via the Breez SDK) — see
+  [Bitcoin & Lightning](#bitcoin--lightning)
+- **Withdrawals** of every asset the gateway holds (USDT, ETH, BTC on-chain and over
+  Lightning, and the TRX/SOL gas reserves), from one **treasury** per network fed by
+  automatic **sweeps** — with limits, an address book, approval by a second admin, step-up
+  TOTP, idempotency, an audit trail and an emergency **outflow freeze** — see
+  [Withdrawals](#withdrawals) and the [operator runbook](#treasury-sweeps--withdrawals-operator-runbook)
 - **Admin dashboard** (`apps/dashboard`, React + shadcn/ui): wallet balances, payments,
-  webhook monitoring/retry, API key and staff management — served on its own port
+  withdrawals and approvals, treasury and sweeps, address book, webhook monitoring/retry,
+  API key and staff management — served on its own port
 - Merchant API protected by **API keys** (`x-api-key`) created from the dashboard;
   admin API (`/api/admin/v1`) protected by staff **JWT** (roles: admin / operator)
 
@@ -131,9 +139,23 @@ curl -X POST http://localhost:3000/api/v1/deposit-addresses \
 
 Bitcoin and Lightning take the amount **in satoshis** through `expected_amount_sats`
 (integer string, 1 – 2 100 000 000 000 000); `expected_amount` is rejected on those networks
-so `1500` can never be ambiguous between sats and BTC. The token must match the network
-(`USDT` on tron/ethereum/solana, `BTC` on bitcoin/lightning) — otherwise `400 "Token not
-supported on this network"`.
+so `1500` can never be ambiguous between sats and BTC. The token must be one the
+network receives (`USDT` on tron/ethereum/solana, native `ETH` on ethereum, `BTC` on
+bitcoin/lightning) — otherwise `400 "Token not supported on this network"`. TRX and SOL are
+gas assets, never accepted as payments.
+
+```bash
+# Native ETH: a decimal amount, up to 18 decimals (> 0, ≤ 100 000 ETH)
+curl -X POST http://localhost:3000/api/v1/deposit-addresses \
+  -H "Content-Type: application/json" -H "x-api-key: $API_KEY" \
+  -d '{ "network": "ethereum", "token": "ETH", "expected_amount": "0.05" }'
+```
+
+ETH payments are detected with Alchemy's `alchemy_getAssetTransfers` (external **and**
+internal transfers — a contract forwarding ETH counts; the transfers of one transaction to
+the address are summed) and confirmed at `ETH_CONFIRMATIONS` (12) like USDT. The amount comes
+from the exact `rawContract.value` (wei), never from a float. Webhooks keep their shape:
+`token: "ETH"`, `amount` rendered with 18 decimals, `amount_raw` in wei.
 
 ```bash
 # Lightning: returns a BOLT11 invoice in `address` (optional `description`, ≤ 128 chars)
@@ -145,10 +167,10 @@ curl -X POST http://localhost:3000/api/v1/deposit-addresses \
 Creation returns `503 "<network> is not configured"` when the network is disabled (missing
 provider key, Breez SDK not connected…) and a generic `500` when the Lightning SDK fails
 (details are only logged). The invoice expiry equals the payment's `expires_at`. Every
-response carries `expected_amount_raw` (base units: sats for BTC, 10⁻⁶ for USDT) next to
-`expected_amount`.
+response carries `expected_amount_raw` (base units: sats for BTC, 10⁻⁶ for USDT, wei for
+ETH) next to `expected_amount`.
 
-Limits: `expected_amount` must be > 0 and ≤ 10¹² USDT; an explicit `expires_at` must fall
+Limits: `expected_amount` must be > 0 and ≤ 10¹² USDT (10⁵ ETH); an explicit `expires_at` must fall
 between now + 1 min and now + 1440 min (the default comes from Settings). A key may hold at
 most 1 000 open (`pending`) payments and create 120 per minute (`429` beyond); every key is
 limited to 600 requests per minute, and invalid keys to 30 attempts per minute per IP.
@@ -192,56 +214,89 @@ curl -X POST http://localhost:3000/api/v1/deposits/<deposit_id>/webhooks/retry
 curl http://localhost:3000/api/v1/balances
 ```
 
-One entry per network. Bitcoin sums the confirmed balance of every issued address; Lightning
-reports the Breez/Spark wallet balance (`addresses_checked: 0`). BTC entries use
-`token: "BTC"` and are totalled in `total_btc` — never in `total_usdt`. The cached
-`/wallet-balances` payload has the same `total_btc` treatment.
+One entry **per (network, token)** — Ethereum appears twice (`USDT`, `ETH`), and the gas
+reserves show up as `TRX` (tron) and `SOL` (solana). Each entry is the **treasury plus the
+unswept deposit addresses**, broken out in `treasury_amount` / `deposits_amount` (raw
+variants alongside). Lightning reports the Breez/Spark wallet balance (`addresses_checked:
+0`). Totals never mix assets: `total_usdt`, `total_btc`, `total_eth`, and `total_trx` /
+`total_sol` for the gas reserves. The cached `/wallet-balances` payload (every derived
+index, synced hourly) has the same shape.
 
 Querying every issued address costs one provider call each, so the result is computed in
 the background and cached for 5 minutes (`updated_at`): when no fresh figure exists the call
 answers `503 "Balances are being computed — retry shortly"` with `Retry-After: 15`.
 
-### Pay a Lightning address (payout)
+### Withdrawals
 
 ```bash
-curl -X POST http://localhost:3000/api/v1/lightning/payments \
+curl -X POST http://localhost:3000/api/v1/withdrawals \
   -H "Content-Type: application/json" -H "x-api-key: $API_KEY" \
   -H "Idempotency-Key: $(uuidgen)" \
-  -d '{ "ln_address": "alice@example.com", "amount_sats": "10000", "comment": "withdrawal" }'
+  -d '{ "network": "tron", "token": "USDT", "amount": "250.00",
+        "destination": "TJDENsfBJs4RFETt1X1W8wMDc8M5XnJhCe", "reference": "payout-42" }'
 ```
 
-Sends from the Breez/Spark wallet to a Lightning address (`user@domain` only, user part
-`[a-z0-9-_.]`, public domain resolving to public addresses — no LNURL strings, invoices,
-on-chain addresses, IP literals or local names). Network fees are added on top of
-`amount_sats` (the recipient receives the amount).
+One API for every outgoing transfer: USDT (tron, ethereum, solana), ETH (ethereum), BTC
+on-chain (bitcoin) and over Lightning (lightning). The body takes `network`, `token`, an
+`amount` (decimal string, at most the token's decimals) — or `amount_sats` on
+bitcoin/lightning — and **exactly one** of `destination` / `address_book_entry_id`; optional
+`reference` (≤ 128 chars), `comment` (Lightning-address comment, ≤ 255 chars) and `metadata`
+(object, ≤ 4 KB). Network fees come on top, paid by the gateway in the network's gas asset
+(BTC on bitcoin/lightning): the recipient receives `amount`.
 
-- **Who**: a merchant key granted *Can send Lightning payments* (Dashboard → API Keys, off
-  by default; `403` otherwise — such a key must expire), or an **admin** from the dashboard
-  (Lightning page) with a **fresh TOTP code** (`totp_code` in the body; admins without 2FA
-  get `403`). Operators get `403`.
-- **Limits** (Dashboard → Settings, changing them needs a TOTP code): at most
-  `payout_max_sats` per payout (default 1 000 000) and `payout_daily_max_sats` over a rolling
-  24 h (default 10 000 000), counted over every gateway payout; `0` disables payouts.
-  Beyond: `422`. Plus 10 payout/quote calls per minute per caller.
-- **Idempotency**: the `Idempotency-Key` header (UUID) is **required**. It is bound to the
-  caller and to the parameters: replaying it with the same parameters answers `200` with
-  the original payment (nothing is sent again); with other parameters (or by another
-  caller) `422`; while the first request is still sending `409`. Keep the same key when you
-  retry after a network error.
-- **Response**: `202` with the payment (same shape as the history entries), usually
-  `status: "pending"`. Follow it with `GET /lightning/payments/{id}` and the
-  `payout_succeeded` / `payout_failed` webhooks.
-- **Errors**: `400` invalid input, `422` limits / key reuse, `503` Lightning not
-  configured, `502 "Payment failed"` for every payment failure (unreachable address, amount
-  outside the recipient's bounds, insufficient balance, routing failure…). The details are
-  only in the server logs. Every payout is recorded in the audit log.
+| Network | Destination |
+|---|---|
+| ethereum | a 20-byte address (lowercase or valid EIP-55); never the zero address or the USDT contract |
+| tron | a `T…` base58check address |
+| solana | a wallet (its USDT token account is created if missing; never a program-derived address) or an existing USDT token account |
+| bitcoin | any mainnet address type (P2WPKH, P2WSH, P2TR, P2SH, P2PKH), amount above its dust limit |
+| lightning | a Lightning address `user@domain` (public domain) or a BOLT11 invoice for exactly the amount, not expired (never one of the gateway's own) |
 
-`POST /lightning/payments/quote` (same body without the key, same callers) returns what the
-payout would cost without paying: `{ ln_address, amount_sats, fees_sats, total_sats }`
-(`502 "Could not get a quote"` on failure).
+Gateway-owned addresses (deposit addresses, treasuries, their token accounts) are refused.
 
-⚠️ The Lightning wallet may be shared with other Breez clients using the same seed: grant
-the payout permission sparingly.
+- **Who**: a merchant key whose *withdrawal policy* allows the token (and network) — set by
+  an admin in Dashboard → API Keys, for keys that expire — or an **admin** from the
+  dashboard with a fresh TOTP code. Operators never withdraw; TRX and SOL (gas reserves) are
+  admin-only. A key without a policy gets `403`.
+- **Destination policy**: an `open` key may send anywhere within its own per-token limits; a
+  `book` key only to active address-book entries (`GET /api/v1/address-book`). At or above
+  the asset's **approval threshold** any withdrawal waits for a second admin
+  (`pending_approval`, 72 h); an admin's must then go to an active address-book entry
+  (below it, anywhere).
+- **Limits**: per withdrawal and over a rolling 24 h, per asset (all networks together) and
+  per key; `0` disables. Funds: the treasury's confirmed balance minus what other
+  withdrawals reserve (and, for a gas asset, its reserve floor). Refusals are `422` with a
+  code first in the message: `limit_exceeded`, `key_limit_exceeded`,
+  `withdrawals_disabled`, `insufficient_funds`, `approval_threshold_requires_address_book`,
+  `destination_requires_address_book`, …
+- **Idempotency**: the `Idempotency-Key` header (UUID) is required and bound to the caller
+  and the parameters: a replay answers `200` with the stored withdrawal (nothing is sent
+  again), other parameters `422`.
+- **Response**: `202` with the withdrawal (`status` `queued` or `pending_approval`). It then
+  moves through `signed` → `broadcast` → `confirmed` (or `failed`, `cancelled`, `stuck`):
+  follow it with `GET /withdrawals/{id}` and the `withdrawal_*` webhooks. `503 "Outflows are
+  frozen"` while the outflow freeze holds, `503` when the network is not configured, `502`
+  when a provider cannot be reached (details only in the logs).
+
+| Method | Path | |
+|---|---|---|
+| POST | `/withdrawals` | Create (above) |
+| POST | `/withdrawals/quote` | Same body, no `Idempotency-Key`: `fee_estimate` / `fee_token`, `approval_required`, `destination_acceptable` for this key, `available` — nothing is reserved |
+| GET | `/withdrawals?status=&network=&token=&limit=&offset=` | This key's withdrawals only |
+| GET | `/withdrawals/{id}` | `404` for another key's |
+| POST | `/withdrawals/{id}/cancel` | Own withdrawal, while `pending_approval` / `queued` |
+| GET | `/address-book` | Active entries (`id`, `network`, `destination`, `label`) |
+
+Creation and quotes share a limit of 10 calls per minute per caller.
+
+**Deprecated: `POST /lightning/payments`** (and `/lightning/payments/quote`) keeps working for
+one release: it creates a Lightning withdrawal to `ln_address` (`amount_sats`, `comment`)
+under the same rules and answers the former shape plus `withdrawal_id`, with
+`Deprecation: true` and a `Sunset` header. Keys that could send payouts were migrated to an
+`open` policy for BTC on Lightning only, with the former payout limits as their key limits. An
+`Idempotency-Key` used before the upgrade is answered from the wallet, never paid again.
+Sends of the Lightning wallet the gateway did not make still fire `payout_succeeded` /
+`payout_failed`; its own fire `withdrawal_*`.
 
 ### Lightning wallet history
 
@@ -249,7 +304,8 @@ the payout permission sparingly.
 curl "http://localhost:3000/api/v1/lightning/payments?limit=50&offset=0" -H "x-api-key: $API_KEY"
 ```
 
-Requires a key with the payout permission (`403` otherwise; admin-only on the dashboard).
+Requires a key whose withdrawal policy allows BTC on Lightning (`403` otherwise; admin-only
+on the dashboard).
 Every payment of the Breez/Spark wallet, newest first — received and sent, completed,
 pending or failed, **including funds unrelated to gateway invoices** (anything else using
 the same seed shows up too). Each entry carries `direction`, `status`, `amount` (BTC) /
@@ -281,10 +337,12 @@ token (outside a 30 s grace for concurrent tabs) revokes the whole session. A se
 most `REFRESH_TOKEN_TTL_DAYS` from the login (never extended). Access tokens are bound to
 their session: logout, password change, 2FA reset and deactivation revoke them at once.
 
-**Step-up.** Sensitive admin actions need a fresh TOTP code in the body (`totp_code`): payouts,
-creating a key with `can_send` or granting it, changing the payout limits, creating staff,
-changing a member's role / activation / password, resetting their 2FA. An admin without 2FA
-gets `403` on those (the rest of the dashboard works).
+**Step-up.** Sensitive admin actions need a fresh TOTP code in the body (`totp_code`):
+creating, approving, rejecting, cancelling, bumping or abandoning a withdrawal; granting a key
+a withdrawal policy; the asset settings (limits, thresholds, caps, sweeps); address-book
+changes; lifting the outflow freeze; running sweeps; creating staff, changing a member's role
+/ activation / password, resetting their 2FA. An admin without 2FA gets `403` on those (the
+rest of the dashboard works).
 
 **Rate limits** (`429` + `Retry-After`): login 20/15 min per IP and 10/15 min per account,
 setup 10/h per IP, refresh 60/min per IP, 10 wrong TOTP codes and 5 wrong current passwords
@@ -298,29 +356,50 @@ per account per 15 min.
 | POST | `/auth/logout-all` · `/auth/password` · GET `/auth/me` | JWT | Revoke every own session; change own password (`current_password`, `new_password`, `totp_code` when 2FA is on — revokes every session); profile |
 | POST | `/auth/totp/setup` (`password`), `/auth/totp/enable` (`code`), `/auth/totp/disable` (`password` + `code`) | JWT | Own 2FA management |
 | GET/POST/PATCH | `/staff`, `/staff/{id}`, `/staff/{id}/totp/reset` | admin | List/create/update staff (roles `admin` / `operator`, activation, password — 12 to 128 characters); the last active admin cannot be demoted |
-| GET/POST/PATCH/DELETE | `/api-keys`, `/api-keys/{id}` | admin | List/create/revoke merchant API keys (secret shown once; optional `expires_in_days` 30/90/180/365, omit for no expiry — expired keys get status `expired` and stop working); `can_send` (create or PATCH) grants the Lightning payout permission — only to keys that expire |
-| GET/PATCH | `/settings` | admin | Read/update system settings (`deposit_expiry_minutes` 1–1440, `api_key_prefix` ≤ 5 alphanum, `api_traffic_retention_days` 1–3650 or `null` = keep forever, `payout_max_sats` / `payout_daily_max_sats` (0 = payouts disabled); PATCH is partial) |
-| GET/POST/PATCH/DELETE | `/webhook-endpoints`, `/webhook-endpoints/{id}` | admin | Manage outgoing webhook endpoints (subscribed `events` — `pending`/`paid`/`expired`/`payout_succeeded`/`payout_failed` — required signing `secret`, activate/deactivate; delete only when unused) |
+| GET/POST/PATCH/DELETE | `/api-keys`, `/api-keys/{id}` | admin | List/create/revoke merchant API keys (secret shown once; optional `expires_in_days` 30/90/180/365, omit for no expiry — expired keys get status `expired` and stop working); PATCH sets the withdrawal grant: `withdrawal_policy` (`none` / `book` / `open`), `withdrawal_tokens` (`USDT` / `BTC` / `ETH`), `withdrawal_networks` (`null` = all of them), `withdrawal_limits` (per token, required for `open`) — only on keys that expire, TOTP unless `none` |
+| GET/PATCH | `/settings` | admin | Read/update system settings (`deposit_expiry_minutes` 1–1440, `api_key_prefix` ≤ 5 alphanum, `api_traffic_retention_days` 1–3650 or `null` = keep forever; PATCH is partial) |
+| GET · PATCH | `/settings/assets` | JWT · admin | Per-asset limits (per withdrawal, rolling 24 h), approval threshold, hot-wallet cap, gas reserve floor and alert threshold, and per-(network, token) sweep minimums and switches — decimal token amounts, `0` disables |
+| GET/POST/PATCH/DELETE | `/webhook-endpoints`, `/webhook-endpoints/{id}` | admin | Manage outgoing webhook endpoints (subscribed `events` — see [Webhook events](#webhook-events--payloads) — required signing `secret`, activate/deactivate; delete only when unused) |
 | GET | `/webhooks?status=&limit=&offset=` | JWT | Latest delivery per event key, joined with deposit (if any) + address |
 | POST | `/webhooks/retry-failed`, `/webhook-deliveries/{id}/retry`, `/deposits/{id}/webhooks/retry` | admin | Bulk-requeue failed deliveries (still subscribed endpoints only); replay one delivery row; replay a deposit's `paid` webhook |
-| GET | `/audit-log?action=&limit=&offset=` | admin | Append-only audit trail (actor, action, target, details, IP): setup, sessions, 2FA, staff, API keys, settings, webhook endpoints, payouts, webhook replays |
+| GET | `/audit-log?action=&limit=&offset=` | admin | Append-only audit trail (actor, action, target, details, IP): setup, sessions, 2FA, staff, API keys and their withdrawal grants, settings, webhook endpoints, withdrawals (requested → approved / rejected / cancelled → signed → broadcast → confirmed / failed / stuck, bumps, abandons), address book, sweeps and gas top-ups, outflow freeze, webhook replays |
+| GET · POST | `/withdrawals`, `/withdrawals/{id}` · `/withdrawals`, `/withdrawals/quote` | JWT · admin | List (`status`, `network`, `token`, `api_key_id`) and detail with every signed transaction (fee bumps included) · create (`totp_code`) and quote — the merchant body, gas assets included |
+| POST | `/withdrawals/{id}/approve`, `/reject`, `/cancel`, `/bump`, `/abandon` | admin | Approve as an admin other than the requester (a single active admin may approve their own 24 h after creation); cancel while `pending_approval` / `queued`; on a `stuck` one, bump (doubles its fee cap) or abandon (only once the network proves none of its transactions can land) |
+| GET · POST/DELETE | `/address-book` · `/address-book`, `/address-book/{id}` | JWT · admin | List · add (`network`, `destination`, `label`, `is_cold_storage`; usable 24 h later) / remove |
+| GET | `/treasury` | JWT | Per (network, token): treasury address, confirmed, reserved, available, unswept, unattributed, gas reserve and cap status, plus `outflows_frozen` |
+| GET · POST | `/sweeps` · `/sweeps/run` | JWT · admin | Sweep history · plan sweeps now (optional `network`) |
+| GET · POST · POST | `/outflows` · `/outflows/freeze` · `/outflows/unfreeze` | JWT · JWT · admin | Freeze state · freeze every outflow (any staff, no TOTP) · lift it (TOTP; impossible while `OUTFLOWS_FROZEN=true`) |
+| GET | `/alerts` | JWT | Gas reserve low, treasury cap exceeded, address-book entry added, withdrawal stuck |
+| GET | `/payout-requests` | admin | Former Lightning payout requests (read-only history) |
 | GET | `/stats` | JWT | Counters (addresses/deposits/webhooks by status) + confirmed volume |
 | GET | `/traffic/overview?surface=merchant\|admin\|all&window=15m\|1h\|24h` | JWT | API traffic aggregates: req/min, error rate, p50/p95 latency, per-bucket time series, top routes, top API keys |
 | GET | `/traffic/requests?surface=&status=2xx..5xx&route=&method=&api_key_id=&limit=&offset=` | JWT | Paginated request log (method, matched route, status, duration, key/staff identity, IP — no bodies, never the raw key) |
 | — | `/deposit-addresses*`, `/balances`, `/wallet-balances` | JWT | Same handlers as `/api/v1`, JWT-authenticated for the dashboard |
-| — | `/lightning/payments*` (history, quote, payout) | admin | Same handlers as `/api/v1`; the payout needs `totp_code` |
+| — | `/lightning/payments*` (history, deprecated payout alias and quote) | admin | Same handlers as `/api/v1`; the alias needs `totp_code` |
 
 ## Webhook events & payloads
 
-Webhook endpoints are managed in Dashboard → Webhooks (admin). Each endpoint subscribes to one or more payment events and only receives those:
+Webhook endpoints are managed in Dashboard → Webhooks (admin). Each endpoint subscribes to one or more events and only receives those:
 
 | Event | Fired when | `event_type` in payload |
 |---|---|---|
 | `pending` | A deposit address is created | `payment_pending` |
 | `paid` | A deposit is confirmed on-chain | `deposit_confirmed` |
 | `expired` | A pending address passes its expiry unpaid | `payment_expired` |
-| `payout_succeeded` | An outgoing Lightning wallet payment completed — **any** bitcoin send of the wallet, not only the gateway's own (token sends are not reported) | `payout_succeeded` |
-| `payout_failed` | An outgoing Lightning wallet payment failed | `payout_failed` |
+| `payout_succeeded` | An outgoing Lightning wallet payment the gateway did **not** make as a withdrawal completed (the wallet may be shared; token sends are not reported) | `payout_succeeded` |
+| `payout_failed` | Such a payment failed | `payout_failed` |
+| `withdrawal_pending_approval` | A withdrawal waits for a second admin | `withdrawal_pending_approval` |
+| `withdrawal_broadcast` | Its transaction reached the network (Lightning: the wallet accepted the send) | `withdrawal_broadcast` |
+| `withdrawal_confirmed` | It is confirmed (deposit thresholds; Lightning: settled) | `withdrawal_confirmed` |
+| `withdrawal_failed` | It failed (reverted, refused, abandoned…) | `withdrawal_failed` |
+| `withdrawal_cancelled` | It was cancelled or rejected, or its approval expired | `withdrawal_cancelled` |
+| `gas_reserve_low` | A treasury's gas asset fell below its alert threshold | `gas_reserve_low` |
+| `treasury_cap_exceeded` | An asset's treasuries hold more than its hot-wallet cap | `treasury_cap_exceeded` |
+| `address_book_entry_added` | A destination was added to the address book | `address_book_entry_added` |
+| `withdrawal_stuck` | A withdrawal reached its fee cap (or its expiry cannot be proven) | `withdrawal_stuck` |
+
+Sweeps and gas top-ups are not notified. Alerts are deduplicated: once a day per condition
+(gas reserve, cap) while it holds, once per subject for the others.
 
 Every payload also carries a top-level `event_id` (the delivery id — stable across retries
 of that delivery, identical to the `X-Webhook-Id` header; deduplicate on it) and
@@ -341,6 +420,24 @@ Payload:
   }
 }
 ```
+
+Withdrawal payload (the withdrawal's current state; `fee` / `fee_raw` once known):
+
+```json
+{
+  "event_type": "withdrawal_confirmed",
+  "data": {
+    "withdrawal_id": "uuid", "status": "confirmed", "network": "tron", "token": "USDT",
+    "amount": "250.000000", "amount_raw": "250000000", "fee": "6.773500", "fee_raw": "6773500",
+    "fee_token": "TRX", "destination": "TJDENsf…", "address_book_entry_id": null,
+    "tx_hash": "98f8aa28…", "confirmations": 19, "reference": "payout-42",
+    "requested_by": { "type": "api_key", "id": "uuid" }, "failure_reason": null
+  }
+}
+```
+
+Alert payload: `{ "event_type": "gas_reserve_low", "data": { "alert_id", "type", "network",
+"token", "details": { … } } }`.
 
 Payload on confirmed deposit (`paid`, unchanged historical shape):
 
@@ -448,7 +545,7 @@ before any secret is exposed). Per GitHub environment:
   dedicated deploy user in the `docker` group), `BITCOIN_ESPLORA_BASE_URL`,
   `TRUSTED_PROXIES` (defaults to the private docker ranges kamal-proxy lives in — a custom
   value must also list the server's public IP, which the dashboard's nginx reaches the API
-  through), `ALLOW_INSECURE_TRANSPORT`.
+  through), `ALLOW_INSECURE_TRANSPORT`, `OUTFLOWS_FROZEN` (`true` holds the outflow freeze).
 - Secrets: `SSH_PRIVATE_KEY`, `WALLET_MNEMONIC`, `DATABASE_URL`, `REDIS_URL`, `JWT_SECRET`;
   optional `SETUP_TOKEN` and provider keys `TRONGRID_API_KEY`, `ALCHEMY_API_KEY`,
   `HELIUS_API_KEY`, `BREEZ_API_KEY` (empty disables the network).
@@ -484,9 +581,12 @@ Treat production deployments accordingly:
 - Store the mnemonic in a secret manager or HSM/KMS — not in plain files on disk or in git
 - Plan key rotation before you accumulate significant balances
 - Never log the mnemonic; keep `.env` out of version control
-- Enable 2FA for every admin: payouts, payout rights, payout limits and staff management
-  require a fresh TOTP code
-- Keep the payout limits (Settings) as low as your use allows, and review the audit log
+- Enable 2FA for at least two admins: withdrawals, approvals, withdrawal grants, limits, the
+  address book and staff management require a fresh TOTP code, and approvals need a second
+  admin
+- Keep the withdrawal limits and hot-wallet caps (Settings → Assets) as low as your use
+  allows, move the excess to cold storage, and review the audit log
+- Know where the **Freeze** button is: any staff member stops every outflow at once
 
 [`.env.example`](.env.example) uses only the well-known BIP39 test vector (`abandon … about`): the service refuses it outside `APP_ENV=development`, and never connects the (mainnet) Lightning wallet with it.
 
@@ -498,7 +598,10 @@ append-only audit log. Known limits: no per-merchant data isolation (every key s
 payment), no reorg handling beyond confirmation thresholds, secrets (TOTP, webhook signing)
 stored in clear in the database, a single seed for on-chain and Lightning funds.
 
-Scope today: inbound USDT / BTC / Lightning deposit detection and webhooks. This is not a multi-tenant or non-custodial vault. See the [custody note](#custody-note) for Lightning funds.
+Scope today: inbound USDT / ETH / BTC / Lightning deposit detection and webhooks, and
+withdrawals from hot treasuries signed in-process. This is not a multi-tenant or
+non-custodial vault: compromising the API process means compromising every hot fund, bounded
+only by the guard rails above. See the [custody note](#custody-note) for Lightning funds.
 
 To report a vulnerability, use [GitHub Security Advisories](https://github.com/nejos97/crypto-payment-gateway/security/advisories/new) rather than a public issue when possible.
 
@@ -532,13 +635,19 @@ To report a vulnerability, use [GitHub Security Advisories](https://github.com/n
 | `BTC_CONFIRMATIONS` | No | `3` | Confirmations before a Bitcoin deposit is confirmed / paid (≥ 1; a warning below 3) |
 | `BREEZ_API_KEY` | No* | — | Breez SDK Spark API key ([breez.technology](https://breez.technology)). Unset disables Lightning |
 | `BREEZ_STORAGE_DIR` | No | `./.breez-data` | Breez SDK local storage (SQLite), resolved to an absolute path at startup. Must persist across restarts (docker compose mounts the `breez_data` volume) |
+| `OUTFLOWS_FROZEN` | No | `false` | `true` forces the [outflow freeze](#treasury-sweeps--withdrawals-operator-runbook): no withdrawal, sweep or gas top-up leaves the gateway, and the dashboard cannot lift it while set |
+| `CHAIN_MODE` | No | `mainnet` | `testnet` (development only) moves every network to its test chain — see [Testnet mode](#testnet-mode) |
+| `TESTNET_USDT_ETH_CONTRACT`, `TESTNET_USDT_TRON_CONTRACT`, `TESTNET_USDT_SOLANA_MINT` | With `CHAIN_MODE=testnet` | — | Test tokens standing in for USDT |
 
 \* Required for monitoring on the respective network.
 \** Required for the admin API and the dashboard.
 
 Advanced overrides (code defaults if unset): `POLLING_INTERVAL_SECONDS` (10), `ETH_CONFIRMATIONS` (12, minimum 12), `TRON_CONFIRMATIONS` (19, minimum 19), `AMOUNT_TOLERANCE_PERCENT` (1, between 0 and 5). An unparsable or out-of-range value fails startup instead of falling back to the default. Provider base URLs must use `https://` outside development.
 
-Webhook endpoints (Dashboard → Webhooks) and the default payment expiry (60 min, max 24 h; Dashboard → Settings) are **not** environment variables — they are stored in the database and managed from the dashboard (admin only).
+Webhook endpoints (Dashboard → Webhooks), the default payment expiry (60 min, max 24 h;
+Dashboard → Settings) and every withdrawal guard rail (limits, approval thresholds, caps, gas
+reserve thresholds, sweep minimums — Dashboard → Settings → Assets) are **not** environment
+variables — they are stored in the database and managed from the dashboard (admin only).
 
 ## Bitcoin & Lightning
 
@@ -551,7 +660,8 @@ confirmed); the amount of a transaction is the sum of its outputs to the address
 payment flips to `paid` and the `paid` webhook fires. One transaction paying several gateway
 addresses yields one deposit per address. No reorg rollback (3 confirmations is the
 mitigation) and no RBF tracking — a replaced mempool transaction never confirms and the
-payment expires normally.
+payment expires normally. Deposit addresses are never swept: Bitcoin withdrawals spend their
+confirmed UTXOs (and the treasury's change) directly.
 
 **Lightning (`lightning`).** Each payment is a fixed-amount BOLT11 invoice issued through the
 [Breez SDK Spark](https://sdk-doc-spark.breez.technology/) (seeded with `WALLET_MNEMONIC`);
@@ -567,10 +677,75 @@ Both reuse the existing `pending` / `paid` / `expired` webhooks unchanged (`netw
 ### Custody note
 
 On-chain BTC stays on addresses derived from `WALLET_MNEMONIC` — recoverable from the
-mnemonic alone, like USDT. Lightning funds live in the Breez/Spark wallet: recoverable from
+mnemonic alone, like USDT, ETH and the treasuries. Lightning funds live in the Breez/Spark wallet: recoverable from
 the same mnemonic **through the Spark SDK/protocol**, which is a different trust model
 (Spark L2). Enabling Lightning (`BREEZ_API_KEY`) must be an explicit, conscious operator
 choice.
+
+## Treasury, sweeps & withdrawals (operator runbook)
+
+Every on-chain withdrawal leaves from one **treasury** per network, derived from
+`WALLET_MNEMONIC` on paths no deposit index reaches: Ethereum and Tron `m/44'/60'/1'/0/0`
+(one key, two encodings), Bitcoin `m/84'/0'/1'/0/0` (also the change address), Solana
+`m/44'/501'/0'/1'` (its USDT sits on that owner's token account). The addresses are printed
+at boot and shown on Dashboard → Treasury. Transactions are built and signed inside the
+gateway, and each one is stored before it is broadcast: a restart re-broadcasts the same
+bytes, never a second payment.
+
+**Sweeps** (every 5 min, plus a daily rescan of every finished payment's address): the
+confirmed funds of paid or expired payments move to the treasury once above the per-(network,
+token) minimum (ETH 0.01 · USDT-ERC20 50 · USDT-TRC20 20 · USDT-SPL 1 by default). A USDT
+deposit address on Ethereum or Tron first receives an exact **gas top-up** from the treasury;
+on Solana the treasury pays the fee and the emptied token account is closed (its rent comes
+back; the first sweep creates the treasury's own USDT token account). Bitcoin is never swept. Funds that settled no payment are swept too and reported as
+*unattributed*.
+
+Before going live:
+
+1. **Fund the gas reserves** — ETH on the Ethereum treasury, TRX on the Tron treasury (its
+   first TRX transfer **activates** the account), SOL on the Solana treasury — above the
+   floors of Settings → Assets (defaults 0.05 ETH, 50 TRX, 0.1 SOL; alerts below 0.1 ETH,
+   200 TRX, 0.5 SOL). Under its floor a network stops top-ups and gas-asset withdrawals.
+2. Add at least one **cold-storage** entry to the address book (usable 24 h later). When an
+   asset's treasuries exceed its hot-wallet cap an alert fires, and Dashboard → Treasury
+   offers to send the excess to cold storage — a normal withdrawal (TOTP, approval above the
+   threshold).
+3. Enable **2FA for at least two admins** (approvals need a second admin; alone, the
+   requester may approve after 24 h).
+4. Review the default limits — per withdrawal / 24 h / approval at / cap: USDT 10 000 /
+   50 000 / 5 000 / 100 000 · ETH 5 / 20 / 2 / 50 · BTC 0.01 / 0.1 / 0.005 / 1 (the former
+   payout limits when they had been changed) · TRX 10 000 / 50 000 / 5 000 · SOL 50 / 200 /
+   20.
+5. Know the **Freeze** button (dashboard header): any staff member stops every withdrawal,
+   sweep and top-up at once; only an admin with a TOTP code lifts it, and
+   `OUTFLOWS_FROZEN=true` holds it from the environment. Quotes, approvals and cancellations
+   keep working while frozen; nothing is signed or broadcast.
+
+Sending uses the monitoring providers (TronGrid, Alchemy — on a plan serving
+`alchemy_getAssetTransfers` and wide `eth_getLogs` ranges —, Helius, Esplora): a network
+without its provider has its withdrawals and sweeps disabled.
+
+**Execution.** Withdrawals run asynchronously. Workers claim them, re-check the approval, the
+destination rules and the requesting key right before signing, and track each transaction to
+the deposit confirmation thresholds (Tron 19, Ethereum 12, Bitcoin 3, Solana finalized,
+Lightning settled). A stuck Ethereum or Bitcoin transaction is replaced with higher fees
+(+25 %, RBF on Bitcoin) up to 3 × its quote; beyond that the withdrawal is `stuck` (alert)
+and an admin bumps it (doubles the cap) or abandons it once the network proves it cannot
+land. Tron and Solana transactions are only signed again once their reference block or
+blockhash provably expired (a Tron one the node still knows 10 min later is `stuck`). A
+Lightning withdrawal is `broadcast` from the moment it is handed to the wallet and can no
+longer be cancelled. Tron transactions are built by TronGrid, then decoded and checked
+(owner, contract, recipient, amount, fee limit) before anything is signed.
+
+## Testnet mode
+
+`CHAIN_MODE=testnet` (refused unless `APP_ENV=development`) moves the provider defaults to
+Sepolia, Nile and Solana devnet — point `BITCOIN_ESPLORA_BASE_URL` at a testnet4 Esplora
+(`https://mempool.space/testnet4/api`) — checks those chains' identities at boot,
+derives Bitcoin addresses with coin type `1'` (`tb1…`, deposits and treasury alike) and
+connects Lightning to Spark regtest. There is no canonical testnet USDT: set
+`TESTNET_USDT_ETH_CONTRACT`, `TESTNET_USDT_TRON_CONTRACT` and `TESTNET_USDT_SOLANA_MINT` to
+the test tokens you use. Never point a testnet instance at a mainnet database.
 
 ## USDT contracts
 

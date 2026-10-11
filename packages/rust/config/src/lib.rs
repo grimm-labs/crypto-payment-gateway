@@ -81,16 +81,128 @@ const _: () = assert!(
 pub const LIGHTNING_PAYOUT_CATCH_UP_MARGIN_SECS: u64 = 24 * 60 * 60;
 pub const LIGHTNING_PAYOUT_WATERMARK_INTERVAL_SECS: u64 = 5 * 60;
 
-/// Lightning payout limits (`app_settings`, changed from the dashboard with
-/// a TOTP code). `0` disables payouts.
-pub const PAYOUT_MAX_SATS_DEFAULT: u64 = 1_000_000;
-pub const PAYOUT_DAILY_MAX_SATS_DEFAULT: u64 = 10_000_000;
-/// A payout request stuck PENDING longer than this (crash, timeout while
-/// the SDK was sending) may be retried with the same Idempotency-Key — the
-/// SDK answers a replayed key from its own storage, never sending twice.
-pub const PAYOUT_STALE_PENDING_SECS: i64 = 5 * 60;
-/// Upper bound on the whole payout call (address resolution + send).
+/// Upper bound on one Lightning SDK send or quote (address resolution +
+/// prepare + send).
 pub const PAYOUT_TIMEOUT_SECS: u64 = 60;
+
+// Withdrawals (spec §7). Limits, thresholds, caps and sweep minimums live in
+// `asset_settings` / `sweep_settings` (dashboard, TOTP); these are the fixed
+// rules around them.
+/// A withdrawal waiting for approval is cancelled (`expired`) after this.
+pub const WITHDRAWAL_APPROVAL_EXPIRY_SECS: i64 = 72 * 60 * 60;
+/// With a single active admin, the requester may approve their own
+/// withdrawal once this delay has passed.
+pub const WITHDRAWAL_SELF_APPROVAL_DELAY_SECS: i64 = 24 * 60 * 60;
+/// A new address-book entry becomes usable after this cooling-off delay.
+pub const ADDRESS_BOOK_COOLING_OFF_SECS: i64 = 24 * 60 * 60;
+/// The fee a withdrawal may end up paying (bumps included) is capped at
+/// this multiple of its quote; an admin bump doubles the cap.
+pub const WITHDRAWAL_FEE_CAP_MULTIPLIER: u128 = 3;
+/// Merchant `reference` (characters) and `metadata` (serialized bytes).
+pub const WITHDRAWAL_REFERENCE_MAX_CHARS: usize = 128;
+pub const WITHDRAWAL_METADATA_MAX_BYTES: usize = 4 * 1024;
+/// Lightning-address comment (characters).
+pub const WITHDRAWAL_COMMENT_MAX_CHARS: usize = 255;
+/// Address-book entry label (characters).
+pub const ADDRESS_BOOK_LABEL_MAX_CHARS: usize = 100;
+/// Treasury balances read from the chain are cached this long per (network,
+/// token); an admission that finds the cached figure insufficient re-reads.
+pub const TREASURY_BALANCE_CACHE_SECS: u64 = 30;
+/// Sweep loop period, and the period of the full rescan of every deposit
+/// address of a network (late payments, unattributed funds).
+pub const SWEEP_INTERVAL_SECS: u64 = 5 * 60;
+pub const SWEEP_FULL_RESCAN_INTERVAL_SECS: i64 = 24 * 60 * 60;
+/// Treasury monitor period (balances, gas reserves, caps → alerts).
+pub const TREASURY_MONITOR_INTERVAL_SECS: u64 = 5 * 60;
+/// Outbound engine period (claim queued work, track broadcast txs).
+pub const OUTBOUND_WORKER_INTERVAL_SECS: u64 = 5;
+/// A transaction stored SIGNED for longer than this without having been
+/// broadcast (crash between the two) is re-broadcast with the same bytes.
+pub const OUTBOUND_REBROADCAST_AFTER_SECS: i64 = 30;
+/// One alert per (type, network, token) per window while the condition
+/// holds.
+pub const ALERT_DEDUP_SECS: i64 = 24 * 60 * 60;
+/// Largest native-ETH `expected_amount` accepted on a deposit address.
+pub const ETH_MAX_EXPECTED_AMOUNT: i64 = 100_000;
+/// Ethereum: unconfirmed transactions per sending address, and blocks a
+/// transaction may wait before its fees are bumped.
+pub const ETH_MAX_IN_FLIGHT_PER_ADDRESS: i64 = 8;
+pub const ETH_STUCK_BLOCKS: u64 = 5;
+/// Ethereum: a transaction without a receipt is dead only once its nonce
+/// was used this many blocks deep — past reorgs and lagging RPC nodes.
+pub const ETH_NONCE_USED_DEPTH: u64 = 12;
+/// Fee bump of a replacement (Ethereum, Bitcoin RBF): +25 %, never less
+/// than the 10 % replacement minimum.
+pub const FEE_BUMP_PERCENT: u128 = 25;
+/// Bitcoin: blocks before an RBF bump, fee-estimate target, fee-rate bounds
+/// (sat/vB) and inputs per transaction.
+pub const BTC_STUCK_BLOCKS: u64 = 3;
+pub const BTC_FEE_TARGET_BLOCKS: u32 = 3;
+pub const BTC_MIN_FEE_RATE_SAT_VB: u64 = 1;
+pub const BTC_MAX_FEE_RATE_SAT_VB: u64 = 500;
+pub const BTC_MAX_INPUTS: usize = 200;
+/// Tron: the most a single contract call may burn (sun) — the cap of every
+/// computed `fee_limit`.
+pub const TRON_FEE_LIMIT_MAX_SUN: u64 = 100_000_000;
+
+/// Ethereum chain ids per mode.
+pub const ETHEREUM_MAINNET_CHAIN_ID: u64 = 1;
+pub const ETHEREUM_SEPOLIA_CHAIN_ID: u64 = 11_155_111;
+
+/// Which chains the gateway talks to. `Testnet` (Sepolia, Nile, devnet,
+/// testnet4, Spark regtest) is development-only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChainMode {
+    Mainnet,
+    Testnet,
+}
+
+impl ChainMode {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Mainnet => "mainnet",
+            Self::Testnet => "testnet",
+        }
+    }
+}
+
+impl std::str::FromStr for ChainMode {
+    type Err = ();
+
+    fn from_str(value: &str) -> std::result::Result<Self, ()> {
+        match value.to_ascii_lowercase().as_str() {
+            "mainnet" => Ok(Self::Mainnet),
+            "testnet" => Ok(Self::Testnet),
+            _ => Err(()),
+        }
+    }
+}
+
+/// Chain identities and token contracts of the selected mode, fixed at boot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChainParams {
+    pub mode: ChainMode,
+    pub eth_chain_id: u64,
+    pub usdt_eth: String,
+    pub usdt_tron: String,
+    pub usdt_solana_mint: String,
+}
+
+impl ChainParams {
+    pub fn mainnet() -> Self {
+        Self {
+            mode: ChainMode::Mainnet,
+            eth_chain_id: ETHEREUM_MAINNET_CHAIN_ID,
+            usdt_eth: USDT_ETH.into(),
+            usdt_tron: USDT_TRON.into(),
+            usdt_solana_mint: USDT_SOLANA.into(),
+        }
+    }
+
+    pub fn is_testnet(&self) -> bool {
+        self.mode == ChainMode::Testnet
+    }
+}
 
 // Webhook delivery worker.
 pub const WEBHOOK_HTTP_TIMEOUT_SECS: u64 = 10;
@@ -194,6 +306,12 @@ pub struct AppConfig {
     /// Escape hatch for Redis/Postgres without TLS outside development
     /// (`ALLOW_INSECURE_TRANSPORT=true`, warned loudly at boot).
     pub allow_insecure_transport: bool,
+    /// `CHAIN_MODE` (mainnet unless set to testnet in development) and the
+    /// identities/contracts it implies.
+    pub chain: ChainParams,
+    /// `OUTFLOWS_FROZEN=true` forces the outflow freeze: the dashboard
+    /// setting cannot lift it while set.
+    pub outflows_frozen: bool,
 }
 
 impl std::fmt::Debug for AppConfig {
@@ -231,6 +349,8 @@ impl std::fmt::Debug for AppConfig {
             .field("trusted_proxies", &self.trusted_proxies)
             .field("setup_token", &redact(&self.setup_token))
             .field("allow_insecure_transport", &self.allow_insecure_transport)
+            .field("chain", &self.chain)
+            .field("outflows_frozen", &self.outflows_frozen)
             .finish()
     }
 }
@@ -269,6 +389,24 @@ impl AppConfig {
         let wallet_mnemonic = vars.required("WALLET_MNEMONIC")?;
         let database_url = vars.required("DATABASE_URL")?;
         let redis_url = vars.required("REDIS_URL")?;
+        let chain = chain_params(&vars, development)?;
+        // Testnet mode points the default provider URLs at the test chains.
+        let testnet = chain.is_testnet();
+        let (trongrid, eth_rpc, helius_rpc, helius_api) = if testnet {
+            (
+                "https://nile.trongrid.io",
+                "https://eth-sepolia.g.alchemy.com/v2",
+                "https://devnet.helius-rpc.com",
+                "https://api-devnet.helius.xyz",
+            )
+        } else {
+            (
+                "https://api.trongrid.io",
+                "https://eth-mainnet.g.alchemy.com/v2",
+                "https://mainnet.helius-rpc.com",
+                "https://api.helius.xyz",
+            )
+        };
 
         let config = Self {
             port: vars.parse_or("PORT", 3000)?,
@@ -285,12 +423,10 @@ impl AppConfig {
             trongrid_api_key: vars.optional("TRONGRID_API_KEY"),
             alchemy_api_key: vars.optional("ALCHEMY_API_KEY"),
             helius_api_key: vars.optional("HELIUS_API_KEY"),
-            trongrid_base_url: vars.string_or("TRONGRID_BASE_URL", "https://api.trongrid.io"),
-            eth_rpc_base_url: vars
-                .string_or("ETH_RPC_BASE_URL", "https://eth-mainnet.g.alchemy.com/v2"),
-            helius_rpc_base_url: vars
-                .string_or("HELIUS_RPC_BASE_URL", "https://mainnet.helius-rpc.com"),
-            helius_api_base_url: vars.string_or("HELIUS_API_BASE_URL", "https://api.helius.xyz"),
+            trongrid_base_url: vars.string_or("TRONGRID_BASE_URL", trongrid),
+            eth_rpc_base_url: vars.string_or("ETH_RPC_BASE_URL", eth_rpc),
+            helius_rpc_base_url: vars.string_or("HELIUS_RPC_BASE_URL", helius_rpc),
+            helius_api_base_url: vars.string_or("HELIUS_API_BASE_URL", helius_api),
             jwt_secret: vars.optional("JWT_SECRET"),
             access_token_ttl_minutes: vars.parse_or("ACCESS_TOKEN_TTL_MINUTES", 15)?,
             refresh_token_ttl_days: vars.parse_or("REFRESH_TOKEN_TTL_DAYS", 30)?,
@@ -303,9 +439,22 @@ impl AppConfig {
             trusted_proxies: parse_cidr_list(&vars.optional("TRUSTED_PROXIES").unwrap_or_default())?,
             setup_token: vars.optional("SETUP_TOKEN"),
             allow_insecure_transport: vars.parse_or("ALLOW_INSECURE_TRANSPORT", false)?,
+            chain,
+            outflows_frozen: vars.parse_or("OUTFLOWS_FROZEN", false)?,
         };
         config.validate(development)?;
         Ok(config)
+    }
+
+    /// The USDT contract (Ethereum, Tron) or mint (Solana) of `network` in
+    /// the current mode; `None` on BTC networks.
+    pub fn usdt_contract(&self, network: domain::Network) -> Option<&str> {
+        match network {
+            domain::Network::Ethereum => Some(&self.chain.usdt_eth),
+            domain::Network::Tron => Some(&self.chain.usdt_tron),
+            domain::Network::Solana => Some(&self.chain.usdt_solana_mint),
+            domain::Network::Bitcoin | domain::Network::Lightning => None,
+        }
     }
 
     /// Insecure local conveniences are only tolerated here.
@@ -487,6 +636,33 @@ impl<F: Fn(&str) -> Option<String>> Vars<'_, F> {
                 .with_context(|| format!("{key} has an invalid value: {value}")),
         }
     }
+}
+
+/// `CHAIN_MODE` and, in testnet mode, the test-token contracts (required:
+/// there is no canonical testnet USDT). Testnet is development-only — a
+/// production instance must never confirm testnet "payments".
+fn chain_params<F: Fn(&str) -> Option<String>>(
+    vars: &Vars<'_, F>,
+    development: bool,
+) -> Result<ChainParams> {
+    let mode: ChainMode = vars.parse_or("CHAIN_MODE", ChainMode::Mainnet)?;
+    if mode == ChainMode::Mainnet {
+        return Ok(ChainParams::mainnet());
+    }
+    if !development {
+        bail!("CHAIN_MODE=testnet is only accepted with APP_ENV={DEVELOPMENT_ENV}");
+    }
+    let required = |key: &str| {
+        vars.optional(key)
+            .with_context(|| format!("{key} is required with CHAIN_MODE=testnet"))
+    };
+    Ok(ChainParams {
+        mode,
+        eth_chain_id: ETHEREUM_SEPOLIA_CHAIN_ID,
+        usdt_eth: required("TESTNET_USDT_ETH_CONTRACT")?,
+        usdt_tron: required("TESTNET_USDT_TRON_CONTRACT")?,
+        usdt_solana_mint: required("TESTNET_USDT_SOLANA_MINT")?,
+    })
 }
 
 /// Resolve against the current directory without requiring the path to
@@ -815,6 +991,61 @@ mod tests {
     fn postgres_sslmode_is_read_from_the_query() {
         assert_eq!(postgres_sslmode("postgres://h/db?a=1&sslmode=verify-full").as_deref(), Some("verify-full"));
         assert_eq!(postgres_sslmode("postgres://h/db"), None);
+    }
+
+    const TESTNET_CONTRACTS: [(&str, &str); 3] = [
+        ("TESTNET_USDT_ETH_CONTRACT", "0x7169D38820dfd117C3FA1f22a697dBA58d90BA06"),
+        ("TESTNET_USDT_TRON_CONTRACT", "TXYZopYRdj2D9XRtbG411XZZ3kM5VkAeBf"),
+        ("TESTNET_USDT_SOLANA_MINT", "Gh9ZwEmdLJ8DscKNTkTqPbNwLNNBjuSzaG9Vp2KGtKJr"),
+    ];
+
+    #[test]
+    fn chain_mode_defaults_to_mainnet() {
+        let config = config_with(&[]).unwrap();
+        assert_eq!(config.chain, ChainParams::mainnet());
+        assert_eq!(config.chain.eth_chain_id, 1);
+        assert_eq!(config.usdt_contract(domain::Network::Ethereum), Some(USDT_ETH));
+        assert_eq!(config.usdt_contract(domain::Network::Solana), Some(USDT_SOLANA));
+        assert_eq!(config.usdt_contract(domain::Network::Bitcoin), None);
+        assert_eq!(config.trongrid_base_url, "https://api.trongrid.io");
+        assert!(!config.outflows_frozen);
+    }
+
+    #[test]
+    fn testnet_mode_is_development_only_and_needs_its_contracts() {
+        let mut vars = vec![("CHAIN_MODE", "testnet")];
+        let err = config_with(&vars).unwrap_err();
+        assert!(format!("{err:#}").contains("TESTNET_USDT_ETH_CONTRACT"), "{err:#}");
+
+        vars.extend_from_slice(&TESTNET_CONTRACTS);
+        let config = config_with(&vars).unwrap();
+        assert!(config.chain.is_testnet());
+        assert_eq!(config.chain.eth_chain_id, ETHEREUM_SEPOLIA_CHAIN_ID);
+        assert_eq!(
+            config.usdt_contract(domain::Network::Tron),
+            Some("TXYZopYRdj2D9XRtbG411XZZ3kM5VkAeBf")
+        );
+        // Provider defaults follow the mode; explicit values still win.
+        assert_eq!(config.trongrid_base_url, "https://nile.trongrid.io");
+        assert_eq!(config.eth_rpc_base_url, "https://eth-sepolia.g.alchemy.com/v2");
+        vars.push(("TRONGRID_BASE_URL", "https://custom.example"));
+        assert_eq!(config_with(&vars).unwrap().trongrid_base_url, "https://custom.example");
+
+        let mut production: Vec<(&str, &str)> = vec![("CHAIN_MODE", "testnet")];
+        production.extend_from_slice(&TESTNET_CONTRACTS);
+        let err = production_with(&production).unwrap_err();
+        assert!(format!("{err:#}").contains("CHAIN_MODE=testnet"), "{err:#}");
+
+        let err = config_with(&[("CHAIN_MODE", "devnet")]).unwrap_err();
+        assert!(format!("{err:#}").contains("CHAIN_MODE"));
+    }
+
+    #[test]
+    fn outflows_frozen_env_forces_the_freeze() {
+        assert!(config_with(&[("OUTFLOWS_FROZEN", "true")]).unwrap().outflows_frozen);
+        assert!(!config_with(&[("OUTFLOWS_FROZEN", "")]).unwrap().outflows_frozen);
+        let err = config_with(&[("OUTFLOWS_FROZEN", "yes")]).unwrap_err();
+        assert!(format!("{err:#}").contains("OUTFLOWS_FROZEN"));
     }
 
     #[test]

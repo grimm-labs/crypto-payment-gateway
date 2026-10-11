@@ -11,7 +11,7 @@ use lightning_client::{LightningClient, LightningConfig};
 use redis::aio::ConnectionManager;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
-use wallet::WalletService;
+use wallet::{WalletChains, WalletService};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -59,10 +59,30 @@ async fn main() -> anyhow::Result<()> {
             "WALLET_MNEMONIC is a public BIP39 test vector — never send real funds to these addresses"
         );
     }
+    if config.chain.is_testnet() {
+        tracing::warn!(
+            "CHAIN_MODE=testnet — Sepolia, Nile, devnet, testnet4 and Spark regtest; never point this instance at a mainnet database"
+        );
+    }
+    if config.outflows_frozen {
+        tracing::warn!("OUTFLOWS_FROZEN=true — no withdrawal, sweep or gas top-up leaves the gateway");
+    }
 
-    let wallet = WalletService::from_mnemonic(&config.wallet_mnemonic)
-        .context("Invalid WALLET_MNEMONIC")?;
+    let wallet = WalletService::with_chains(
+        &config.wallet_mnemonic,
+        WalletChains {
+            bitcoin_testnet: config.chain.is_testnet(),
+            solana_usdt_mint: config.chain.usdt_solana_mint.clone(),
+        },
+    )
+    .context("Invalid WALLET_MNEMONIC")?;
     info!("Wallet mnemonic validated successfully");
+    // Public addresses: the operator funds the gas reserves there.
+    for network in jobs::treasury::TREASURY_NETWORKS {
+        if let Ok(address) = wallet.treasury_address(network) {
+            info!("{} treasury: {address}", network.as_api());
+        }
+    }
 
     let db = Db::connect(&config.database_url).await?;
     if let Err(err) = db.migrate().await {
@@ -89,7 +109,11 @@ async fn main() -> anyhow::Result<()> {
     // stays disabled. A transient failure (timeout, 429) only warns.
     for (network, result) in chain.verify_networks().await {
         match result {
-            Ok(()) => info!("{} provider verified on mainnet", network.as_api()),
+            Ok(()) => info!(
+                "{} provider verified on {}",
+                network.as_api(),
+                config.chain.mode.as_str()
+            ),
             Err(err) if err.downcast_ref::<chain::WrongChainError>().is_some() => {
                 tracing::error!("{} disabled — {err:#}", network.as_api());
                 chain.disable_network(network);
@@ -172,9 +196,9 @@ async fn connect_lightning(config: &AppConfig) -> Option<LightningClient> {
         tracing::warn!("BREEZ_API_KEY is not set — Lightning disabled");
         return None;
     };
-    // The SDK connects to mainnet: a public mnemonic would put the Spark
-    // wallet in everyone's hands.
-    if config::is_public_test_mnemonic(&config.wallet_mnemonic) {
+    // On mainnet a public mnemonic would put the Spark wallet in everyone's
+    // hands (testnet mode connects to Spark regtest).
+    if !config.chain.is_testnet() && config::is_public_test_mnemonic(&config.wallet_mnemonic) {
         tracing::error!(
             "WALLET_MNEMONIC is a public test vector — Lightning disabled (use your own mnemonic)"
         );
@@ -184,6 +208,7 @@ async fn connect_lightning(config: &AppConfig) -> Option<LightningClient> {
         api_key,
         mnemonic: config.wallet_mnemonic.clone(),
         storage_dir: config.breez_storage_dir.clone(),
+        testnet: config.chain.is_testnet(),
     })
     .await
     {

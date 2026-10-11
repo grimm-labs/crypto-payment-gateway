@@ -7,7 +7,7 @@
 # Required: GATEWAY_HOST (the environment's server, SSH target), APP_ENV, API_HOST,
 # DASHBOARD_HOST. A missing one stops kamal with a KeyError naming it.
 # Optional: SSH_USER (default root), ALLOW_INSECURE_TRANSPORT, TRUSTED_PROXIES,
-# BITCOIN_ESPLORA_BASE_URL, KAMAL_IMAGE, KAMAL_REGISTRY_USERNAME.
+# BITCOIN_ESPLORA_BASE_URL, OUTFLOWS_FROZEN, KAMAL_IMAGE, KAMAL_REGISTRY_USERNAME.
 # Requires Kamal >= 2.12 (ssh.forward_agent); CI pins the exact version.
 #
 # One image (docker/Dockerfile target "all") runs as two roles: `api` (the Rust
@@ -98,6 +98,9 @@ servers:
         ALLOW_INSECURE_TRANSPORT: '<%= ENV.fetch("ALLOW_INSECURE_TRANSPORT", "") %>'
         # Empty disables Bitcoin on-chain detection (e.g. https://mempool.space/api).
         BITCOIN_ESPLORA_BASE_URL: '<%= ENV.fetch("BITCOIN_ESPLORA_BASE_URL", "") %>'
+        # "true" forces the outflow freeze at boot (no withdrawal, sweep or gas
+        # top-up; the dashboard cannot lift it). Empty = the dashboard decides.
+        OUTFLOWS_FROZEN: '<%= ENV.fetch("OUTFLOWS_FROZEN", "") %>'
       secret:
         # The custodial HD seed: every deposit address and the Lightning wallet.
         - WALLET_MNEMONIC

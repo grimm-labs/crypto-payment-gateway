@@ -3,7 +3,9 @@ import { Navigate, Route, Routes } from "react-router-dom"
 import { AppLayout } from "@/components/layout/AppLayout"
 import { RequireAdmin, RequireAuth } from "@/lib/auth"
 import { AccountSecurityPage } from "@/pages/AccountSecurityPage"
+import { AddressBookPage } from "@/pages/AddressBookPage"
 import { ApiKeysPage } from "@/pages/ApiKeysPage"
+import { AssetSettingsPage } from "@/pages/AssetSettingsPage"
 import { AuditLogPage } from "@/pages/AuditLogPage"
 import { DeliveriesPage } from "@/pages/DeliveriesPage"
 import { LightningPage } from "@/pages/LightningPage"
@@ -15,8 +17,11 @@ import { SettingsPage } from "@/pages/SettingsPage"
 import { SetupPage } from "@/pages/SetupPage"
 import { StaffPage } from "@/pages/StaffPage"
 import { TrafficPage } from "@/pages/TrafficPage"
+import { TreasuryPage } from "@/pages/TreasuryPage"
 import { WalletsPage } from "@/pages/WalletsPage"
 import { WebhooksPage } from "@/pages/WebhooksPage"
+import { WithdrawalDetailPage } from "@/pages/WithdrawalDetailPage"
+import { WithdrawalsPage } from "@/pages/WithdrawalsPage"
 
 export default function App() {
   return (
@@ -31,6 +36,12 @@ export default function App() {
           <Route path="/deliveries" element={<DeliveriesPage />} />
           <Route path="/traffic" element={<TrafficPage />} />
           <Route path="/wallets" element={<WalletsPage />} />
+          {/* Read-only for operators, who may only freeze outflows. */}
+          <Route path="/withdrawals" element={<WithdrawalsPage />} />
+          <Route path="/withdrawals/:id" element={<WithdrawalDetailPage />} />
+          <Route path="/treasury" element={<TreasuryPage />} />
+          <Route path="/address-book" element={<AddressBookPage />} />
+          <Route path="/settings/assets" element={<AssetSettingsPage />} />
           <Route path="/account/security" element={<AccountSecurityPage />} />
           <Route path="/account/2fa" element={<Navigate to="/account/security" replace />} />
           <Route element={<RequireAdmin />}>

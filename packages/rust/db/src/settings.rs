@@ -1,8 +1,5 @@
 use anyhow::Result;
-use config::{
-    API_TRAFFIC_RETENTION_DEFAULT_DAYS, DEPOSIT_EXPIRY_DEFAULT_MINUTES, PAYOUT_DAILY_MAX_SATS_DEFAULT,
-    PAYOUT_MAX_SATS_DEFAULT, TOTP_ISSUER,
-};
+use config::{API_TRAFFIC_RETENTION_DEFAULT_DAYS, DEPOSIT_EXPIRY_DEFAULT_MINUTES, TOTP_ISSUER};
 
 use crate::Db;
 
@@ -10,8 +7,9 @@ pub const DEPOSIT_EXPIRY_SETTING: &str = "depositExpiryMinutes";
 pub const API_KEY_PREFIX_SETTING: &str = "apiKeyPrefix";
 pub const TOTP_ISSUER_SETTING: &str = "totpIssuer";
 pub const API_TRAFFIC_RETENTION_SETTING: &str = "apiTrafficRetentionDays";
-pub const PAYOUT_MAX_SETTING: &str = "payoutMaxSats";
-pub const PAYOUT_DAILY_MAX_SETTING: &str = "payoutDailyMaxSats";
+/// `"true"` while outflows are frozen (absent = not frozen). The
+/// `OUTFLOWS_FROZEN` env var forces the freeze on top of it.
+pub const OUTFLOWS_FROZEN_SETTING: &str = "outflowsFrozen";
 /// Stored value meaning "never purge the traffic log".
 pub const API_TRAFFIC_RETENTION_FOREVER: &str = "0";
 
@@ -82,26 +80,17 @@ impl Db {
         })
     }
 
-    /// Largest single Lightning payout, in sats (`0` = payouts disabled).
-    pub async fn payout_max_sats(&self) -> Result<u64> {
-        self.sats_setting(PAYOUT_MAX_SETTING, PAYOUT_MAX_SATS_DEFAULT).await
+    /// The outflow freeze as stored (the env override is the caller's).
+    /// Unreadable means frozen: failing closed is the only safe reading.
+    pub async fn outflows_frozen(&self) -> Result<bool> {
+        Ok(match self.get_setting(OUTFLOWS_FROZEN_SETTING).await?.as_deref() {
+            None | Some("false") => false,
+            Some(_) => true,
+        })
     }
 
-    /// Lightning payouts allowed over a rolling 24 h, in sats (`0` =
-    /// payouts disabled).
-    pub async fn payout_daily_max_sats(&self) -> Result<u64> {
-        self.sats_setting(PAYOUT_DAILY_MAX_SETTING, PAYOUT_DAILY_MAX_SATS_DEFAULT).await
-    }
-
-    /// A missing row means the code default; an unreadable one is an error
-    /// rather than a silently raised limit.
-    async fn sats_setting(&self, key: &str, default: u64) -> Result<u64> {
-        match self.get_setting(key).await? {
-            None => Ok(default),
-            Some(value) => value
-                .trim()
-                .parse::<u64>()
-                .map_err(|_| anyhow::anyhow!("app_settings.{key} is not a valid sats amount")),
-        }
+    pub async fn set_outflows_frozen(&self, frozen: bool) -> Result<()> {
+        self.set_setting(OUTFLOWS_FROZEN_SETTING, if frozen { "true" } else { "false" })
+            .await
     }
 }

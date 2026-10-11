@@ -6,7 +6,7 @@ use axum::http::header::AUTHORIZATION;
 use axum::http::request::Parts;
 use axum::middleware::Next;
 use axum::response::Response;
-use domain::StaffRole;
+use domain::{Network, StaffRole, Token, WithdrawalPolicy};
 use jobs::AppState;
 
 use crate::{rate_limit, session, traffic, ApiError};
@@ -26,8 +26,11 @@ pub struct CurrentStaff {
 #[derive(Debug, Clone)]
 pub struct CurrentApiKey {
     pub id: String,
-    /// May send Lightning payouts.
-    pub can_send: bool,
+    /// What the key may withdraw to (`None` = no withdrawals).
+    pub withdrawal_policy: WithdrawalPolicy,
+    pub withdrawal_tokens: Vec<Token>,
+    /// `None` = every network of the allowed tokens.
+    pub withdrawal_networks: Option<Vec<Network>>,
 }
 
 /// The client IP, resolved like the traffic log does (forwarding headers
@@ -103,7 +106,16 @@ pub async fn require_api_key(
 
     let current = CurrentApiKey {
         id: row.id.clone(),
-        can_send: row.can_send,
+        withdrawal_policy: row.withdrawal_policy(),
+        withdrawal_tokens: row
+            .withdrawal_tokens
+            .iter()
+            .filter_map(|t| Token::from_db(t).ok())
+            .collect(),
+        withdrawal_networks: row
+            .withdrawal_networks
+            .as_ref()
+            .map(|networks| networks.iter().filter_map(|n| Network::from_db(n).ok()).collect()),
     };
 
     // Fire-and-forget: never block the request on the usage timestamp.

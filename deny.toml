@@ -26,11 +26,12 @@ ignore = [
     # curve25519-dalek 3.2.0 (timing variability in Scalar sub) and
     # ed25519-dalek 1.0.1 (double public key signing oracle) only arrive through
     # solana-sdk 2.x -> solana-keypair -> ed25519-dalek-bip32 0.2. The gateway
-    # never signs Solana transactions: the wallet crate derives Solana addresses
-    # with ed25519-dalek 2.x and only uses solana-sdk's Pubkey/ATA helpers.
+    # never signs with ed25519-dalek 1.x (`solana_sdk::Keypair`): Solana
+    # signatures use ed25519-dalek 2 (wallet::Signer), and solana-sdk only
+    # builds messages and derives Pubkey/ATA addresses.
     # Drop when solana-sdk is replaced by the solana-pubkey/spl crates or upgraded.
-    { id = "RUSTSEC-2024-0344", reason = "curve25519-dalek 3.x via solana-sdk 2.x, never used to sign (wallet uses ed25519-dalek 2)" },
-    { id = "RUSTSEC-2022-0093", reason = "ed25519-dalek 1.x via solana-sdk 2.x (solana-keypair), never used to sign" },
+    { id = "RUSTSEC-2024-0344", reason = "curve25519-dalek 3.x via solana-sdk 2.x, never used to sign (Solana signatures use ed25519-dalek 2)" },
+    { id = "RUSTSEC-2022-0093", reason = "the gateway never signs with ed25519-dalek 1.x (solana_sdk::Keypair); Solana signatures use ed25519-dalek 2" },
 ]
 
 [licenses]

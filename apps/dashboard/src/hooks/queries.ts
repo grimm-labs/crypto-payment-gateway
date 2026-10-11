@@ -5,20 +5,20 @@ import {
   useQueryClient,
 } from "@tanstack/react-query"
 
-import { api, apiResponse } from "@/lib/api"
+import { api } from "@/lib/api"
 import { useAuth } from "@/lib/auth"
 import type {
   AdminStats,
   ApiKey,
+  ApiKeyWithdrawalGrant,
+  ApiKeyWithdrawalGrantUpdate,
   AppSettings,
   AppSettingsUpdate,
   AuditLogEntry,
   CreatedApiKey,
   DepositAddress,
   DepositAddressDetail,
-  LightningPayment,
   LightningPaymentsPage,
-  LightningQuote,
   Paginated,
   Staff,
   TotpSetup,
@@ -32,7 +32,7 @@ import type {
   WebhookEventType,
 } from "@/lib/types"
 
-function listParams(params: Record<string, string | number | undefined>): string {
+export function listParams(params: Record<string, string | number | undefined>): string {
   const query = new URLSearchParams()
   for (const [key, value] of Object.entries(params)) {
     if (value !== undefined && value !== "") query.set(key, String(value))
@@ -123,47 +123,6 @@ export function useLightningPayments(page: { limit: number; offset: number }) {
   })
 }
 
-export interface PayoutParams {
-  ln_address: string
-  /** Integer sats string; fees come on top. */
-  amount_sats: string
-  comment?: string
-}
-
-/** Fee quote for a payout — no TOTP, nothing is sent (admin only). */
-export function useLightningQuote() {
-  return useMutation({
-    mutationFn: (params: PayoutParams) =>
-      api<LightningQuote>("/lightning/payments/quote", { body: params }),
-  })
-}
-
-export interface PayoutPayload extends PayoutParams {
-  /** Step-up code — single use. */
-  totp_code: string
-  /** UUID — a replay with the same key and parameters never pays twice. */
-  idempotencyKey: string
-}
-
-/** Pay a Lightning address from the wallet (admin only). `replayed` = the
- *  API answered 200 with the payment an earlier request already made. */
-export function usePayLightningAddress() {
-  const queryClient = useQueryClient()
-  return useMutation({
-    mutationFn: async ({ idempotencyKey, ...body }: PayoutPayload) => {
-      const { status, data } = await apiResponse<LightningPayment>("/lightning/payments", {
-        body,
-        headers: { "Idempotency-Key": idempotencyKey },
-      })
-      return { payment: data, replayed: status === 200 }
-    },
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ["lightning-payments"] })
-      queryClient.invalidateQueries({ queryKey: ["wallet-balances"] })
-    },
-  })
-}
-
 export interface PaymentFilters {
   status?: string
   network?: string
@@ -190,7 +149,7 @@ export function usePayment(id: string | undefined) {
 export interface CreatePaymentPayload {
   network: string
   token: string
-  /** Decimal string — USDT networks only. */
+  /** Decimal string in token units — USDT and ETH. */
   expected_amount?: string
   /** Integer sats string — bitcoin/lightning only. */
   expected_amount_sats?: string
@@ -340,34 +299,35 @@ export function useToggleWebhookEndpoint() {
   })
 }
 
-export function useApiKeys() {
+/** Admin-only endpoint — pass `enabled: false` for non-admin viewers. */
+export function useApiKeys(enabled = true) {
   return useQuery({
     queryKey: ["api-keys"],
     queryFn: () => api<{ data: ApiKey[] }>("/api-keys"),
+    enabled,
   })
 }
 
+/** New keys cannot withdraw: the grant is set afterwards (useUpdateApiKeyGrant). */
 export function useCreateApiKey() {
   const queryClient = useQueryClient()
   return useMutation({
     mutationFn: (payload: {
       name: string
-      /** Required (30/90/180/365) when `can_send`. */
+      /** 30/90/180/365; null = never expires (such a key can never withdraw). */
       expires_in_days: number | null
-      can_send: boolean
-      /** Step-up code — required when `can_send`. */
-      totp_code?: string
     }) => api<CreatedApiKey>("/api-keys", { body: payload }),
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ["api-keys"] }),
   })
 }
 
-/** Grant (step-up code required) or withdraw a key's Lightning payout permission. */
-export function useUpdateApiKey() {
+/** Set a key's withdrawal grant (policy, tokens, networks, limits). A step-up
+ *  code is required unless the policy is set to none. */
+export function useUpdateApiKeyGrant() {
   const queryClient = useQueryClient()
   return useMutation({
-    mutationFn: ({ id, ...body }: { id: string; can_send: boolean; totp_code?: string }) =>
-      api<{ id: string; can_send: boolean }>(`/api-keys/${id}`, {
+    mutationFn: ({ id, ...body }: ApiKeyWithdrawalGrantUpdate & { id: string }) =>
+      api<ApiKeyWithdrawalGrant & { id: string }>(`/api-keys/${id}`, {
         method: "PATCH",
         body,
       }),
@@ -383,10 +343,12 @@ export function useRevokeApiKey() {
   })
 }
 
-export function useStaffList() {
+/** Admin-only endpoint — pass `enabled: false` for non-admin viewers. */
+export function useStaffList(enabled = true) {
   return useQuery({
     queryKey: ["staff"],
     queryFn: () => api<Paginated<Staff>>("/staff?limit=100"),
+    enabled,
   })
 }
 

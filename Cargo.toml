@@ -29,6 +29,7 @@ rand = "0.8"
 subtle = "2"
 base58 = "0.2"
 bs58 = "0.5"
+base64 = "0.22"
 chrono = { version = "0.4", features = ["serde"] }
 dotenvy = "0.15"
 hex = "0.4"
@@ -62,6 +63,16 @@ solana-sdk = "2.1"
 spl-associated-token-account = { version = "6", features = ["no-entrypoint"] }
 spl-token = { version = "7", features = ["no-entrypoint"] }
 bech32 = "0.11"
+# Transaction building, sighashes and address parsing (already in the lock via the Breez SDK).
+bitcoin = "0.32"
+# EIP-1559 encoding/hashing and ABI types (already in the lock via the Breez SDK).
+alloy-consensus = "1.8"
+alloy-primitives = "1.7"
+alloy-sol-types = "1.7"
+# Tron transaction protobufs, decoded and verified before signing.
+prost = "0.13"
+# BOLT11 parsing for Lightning withdrawal destinations.
+lightning-invoice = "0.34"
 ripemd = "0.1"
 ipnet = { version = "2", features = ["serde"] }
 mockall = "0.13"

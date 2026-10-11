@@ -6,18 +6,23 @@ license.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+async-trait.workspace = true
 auth = { workspace = true }
+base64.workspace = true
+bs58.workspace = true
 chain = { workspace = true }
 chrono.workspace = true
 config = { workspace = true }
 db = { workspace = true }
 domain = { workspace = true }
+hex.workspace = true
 lightning-client = { workspace = true }
 redis.workspace = true
 reqwest.workspace = true
 rust_decimal.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sqlx.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 uuid.workspace = true

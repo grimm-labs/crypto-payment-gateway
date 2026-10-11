@@ -30,6 +30,18 @@ pub(crate) async fn send_text(request: RequestBuilder) -> Result<String> {
     send(request).await?.text().await.map_err(redact)
 }
 
+/// Send the request and return the status and body of any HTTP answer, 2xx
+/// or not — for providers that explain a refusal in the body (Esplora
+/// broadcasts, 404 for unknown transactions). Transport errors are still
+/// errors, URL-free.
+#[allow(clippy::disallowed_methods)]
+pub(crate) async fn send_any(request: RequestBuilder) -> Result<(StatusCode, String)> {
+    let response = request.send().await.map_err(redact)?;
+    let status = response.status();
+    let body = response.text().await.map_err(redact)?;
+    Ok((status, body))
+}
+
 /// The HTTP status of a non-2xx answer behind `err` (through any context),
 /// `None` for transport or decoding errors. Works on the redacted errors:
 /// only the URL is dropped, the status is kept.

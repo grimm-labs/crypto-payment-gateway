@@ -8,6 +8,7 @@ license.workspace = true
 anyhow.workspace = true
 auth = { workspace = true }
 axum.workspace = true
+chain = { workspace = true }
 chrono.workspace = true
 config = { workspace = true }
 db = { workspace = true }

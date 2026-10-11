@@ -16,10 +16,11 @@ use serde_json::{json, Value};
 
 use crate::middleware::{require_admin, require_jwt, ClientIp, CurrentStaff};
 use crate::session::{self, set_cookie_header};
+use crate::withdrawals as w;
 use crate::{
-    create_deposit_address, create_lightning_payout, get_balances, get_deposit_address,
-    get_lightning_payment, get_wallet_balances, list_deposit_addresses, list_lightning_payments,
-    quote_lightning_payout, rate_limit, retry_deposit_webhook, ApiError, ListQuery,
+    create_deposit_address, get_balances, get_deposit_address, get_lightning_payment,
+    get_wallet_balances, list_deposit_addresses, list_lightning_payments, rate_limit,
+    retry_deposit_webhook, ApiError, ListQuery,
 };
 
 /// Everything the dashboard calls lives under `/api/admin/v1`. Only
@@ -61,11 +62,25 @@ pub fn admin_router(state: &AppState) -> Router<AppState> {
         )
         .route(
             "/lightning/payments",
-            get(list_lightning_payments).post(create_lightning_payout),
+            get(list_lightning_payments).post(w::create_lightning_payout),
         )
-        .route("/lightning/payments/quote", post(quote_lightning_payout))
+        .route("/lightning/payments/quote", post(w::quote_lightning_payout))
         .route("/lightning/payments/{id}", get(get_lightning_payment))
+        .route("/payout-requests", get(w::list_payout_requests))
         .route("/audit-log", get(list_audit_log))
+        // Withdrawals: ADMIN (TOTP checked per action).
+        .route("/withdrawals", post(w::create_withdrawal))
+        .route("/withdrawals/quote", post(w::quote_withdrawal))
+        .route("/withdrawals/{id}/approve", post(w::approve_withdrawal))
+        .route("/withdrawals/{id}/reject", post(w::reject_withdrawal))
+        .route("/withdrawals/{id}/cancel", post(w::cancel_withdrawal))
+        .route("/withdrawals/{id}/bump", post(w::bump_withdrawal))
+        .route("/withdrawals/{id}/abandon", post(w::abandon_withdrawal))
+        .route("/address-book", post(w::create_address_book_entry))
+        .route("/address-book/{id}", delete(w::delete_address_book_entry))
+        .route("/sweeps/run", post(w::run_sweeps))
+        .route("/outflows/unfreeze", post(w::unfreeze_outflows))
+        .route("/settings/assets", patch(w::update_asset_settings))
         .route_layer(axum::middleware::from_fn(require_admin));
 
     let authed = Router::new()
@@ -87,6 +102,17 @@ pub fn admin_router(state: &AppState) -> Router<AppState> {
         .route("/deposit-addresses/{id}", get(get_deposit_address))
         .route("/balances", get(get_balances))
         .route("/wallet-balances", get(get_wallet_balances))
+        // Read-only withdrawal views for every staff member; any staff
+        // member may freeze outflows (no TOTP: speed matters).
+        .route("/withdrawals", get(w::list_withdrawals))
+        .route("/withdrawals/{id}", get(w::get_withdrawal))
+        .route("/address-book", get(w::list_address_book))
+        .route("/treasury", get(w::get_treasury))
+        .route("/sweeps", get(w::list_sweeps))
+        .route("/alerts", get(w::list_alerts))
+        .route("/outflows", get(w::get_outflows))
+        .route("/outflows/freeze", post(w::freeze_outflows))
+        .route("/settings/assets", get(w::get_asset_settings))
         .merge(admin_only)
         .route_layer(axum::middleware::from_fn_with_state(
             state.clone(),
@@ -96,7 +122,7 @@ pub fn admin_router(state: &AppState) -> Router<AppState> {
     public.merge(authed)
 }
 
-fn staff_actor(staff: &CurrentStaff, ip: &ClientIp) -> Actor {
+pub(crate) fn staff_actor(staff: &CurrentStaff, ip: &ClientIp) -> Actor {
     Actor {
         audit: AuditActor::Staff(staff.id.clone()),
         ip: ip.0.clone(),
@@ -444,8 +470,9 @@ async fn verify_current_password(
     Ok(())
 }
 
-/// Step-up authentication for sensitive actions (payouts, granting payout
-/// rights, payout limits, staff management): a fresh TOTP code of the
+/// Step-up authentication for sensitive actions (withdrawals and their
+/// approval, withdrawal grants, asset limits, address book, staff
+/// management): a fresh TOTP code of the
 /// acting staff member. Admins without 2FA cannot perform them.
 pub(crate) async fn require_step_up(
     state: &AppState,
@@ -872,7 +899,12 @@ async fn list_api_keys(State(state): State<AppState>) -> Result<Json<Value>, Api
                 "last_used_at": k.last_used_at.map(|t| t.to_rfc3339()),
                 "revoked_at": k.revoked_at.map(|t| t.to_rfc3339()),
                 "expires_at": k.expires_at.map(|t| t.to_rfc3339()),
-                "can_send": k.can_send,
+                "withdrawal_policy": domain::WithdrawalPolicy::from_db(&k.withdrawal_policy).map(|p| p.as_api()).unwrap_or("none"),
+                "withdrawal_tokens": k.withdrawal_tokens,
+                "withdrawal_networks": k.withdrawal_networks.as_ref().map(|networks| {
+                    networks.iter().filter_map(|n| domain::Network::from_db(n).ok()).map(|n| n.as_api()).collect::<Vec<_>>()
+                }),
+                "withdrawal_limits": limits_json(&k.withdrawal_limits),
                 "created_at": k.created_at.to_rfc3339(),
             })
         })
@@ -880,17 +912,39 @@ async fn list_api_keys(State(state): State<AppState>) -> Result<Json<Value>, Api
     Ok(Json(json!({ "data": data })))
 }
 
+/// `[{token, max_per_withdrawal_raw, daily_max_raw}]` rendered with the
+/// token amounts next to the raw ones.
+fn limits_json(limits: &Value) -> Value {
+    let rows = limits.as_array().cloned().unwrap_or_default();
+    Value::Array(
+        rows.into_iter()
+            .map(|row| {
+                let token = row["token"].as_str().and_then(|t| domain::Token::from_db(t).ok());
+                let render = |raw: &Value| {
+                    match (token, raw.as_str().and_then(|r| r.parse::<u128>().ok())) {
+                        (Some(token), Some(raw)) => json!(domain::raw_u128_to_string(raw, token)),
+                        _ => Value::Null,
+                    }
+                };
+                json!({
+                    "token": token.map(|t| t.as_api()),
+                    "max_per_withdrawal": render(&row["max_per_withdrawal_raw"]),
+                    "max_per_withdrawal_raw": row["max_per_withdrawal_raw"],
+                    "daily_max": render(&row["daily_max_raw"]),
+                    "daily_max_raw": row["daily_max_raw"],
+                })
+            })
+            .collect(),
+    )
+}
+
 #[derive(Debug, Deserialize)]
 struct CreateApiKeyRequest {
     name: String,
     /// Days until expiry — one of 30/90/180/365; absent or null = no expiry
-    /// (refused with `can_send`).
+    /// (a key that may withdraw must expire). New keys cannot withdraw: the
+    /// grant is set afterwards (`PATCH /api-keys/{id}`, TOTP).
     expires_in_days: Option<i64>,
-    /// Grant the Lightning payout permission (default false).
-    #[serde(default)]
-    can_send: bool,
-    /// Required with `can_send`.
-    totp_code: Option<String>,
 }
 
 /// Longest API key name.
@@ -905,16 +959,6 @@ async fn create_api_key(
     let name = body.name.trim();
     if name.is_empty() || name.chars().count() > API_KEY_NAME_MAX_CHARS {
         return Err(ApiError::bad_request("Name is required (at most 100 characters)"));
-    }
-    // A key that can move funds must expire, and granting it is a step-up
-    // action (#40).
-    if body.can_send {
-        if body.expires_in_days.is_none() {
-            return Err(ApiError::bad_request(
-                "A key allowed to send payouts must have an expiry",
-            ));
-        }
-        require_step_up(&state, &current.id, body.totp_code.as_deref()).await?;
     }
     let expires_at = match body.expires_in_days {
         None => None,
@@ -938,7 +982,6 @@ async fn create_api_key(
             &material.sha256_hex,
             &current.id,
             expires_at,
-            body.can_send,
         )
         .await?;
 
@@ -950,7 +993,6 @@ async fn create_api_key(
         json!({
             "name": row.name,
             "prefix": row.prefix,
-            "can_send": row.can_send,
             "expires_at": row.expires_at.map(|t| t.to_rfc3339()),
         }),
     )
@@ -966,21 +1008,112 @@ async fn create_api_key(
             "key": material.full_key,
             "status": api_key_display_status(&row.status, row.expires_at),
             "expires_at": row.expires_at.map(|t| t.to_rfc3339()),
-            "can_send": row.can_send,
+            "withdrawal_policy": "none",
+            "withdrawal_tokens": Vec::<String>::new(),
+            "withdrawal_networks": Value::Null,
+            "withdrawal_limits": Vec::<Value>::new(),
             "created_at": row.created_at.to_rfc3339(),
         })),
     ))
 }
 
 #[derive(Debug, Deserialize)]
+struct WithdrawalLimitRequest {
+    token: String,
+    /// Token amounts (decimal strings); `0` disables.
+    max_per_withdrawal: String,
+    daily_max: String,
+}
+
+#[derive(Debug, Deserialize)]
 struct UpdateApiKeyRequest {
-    can_send: bool,
-    /// Required to grant the permission (withdrawing needs none).
+    /// `none` / `book` / `open`.
+    withdrawal_policy: String,
+    /// Subset of USDT, BTC, ETH.
+    #[serde(default)]
+    withdrawal_tokens: Vec<String>,
+    /// `null` = every network of the allowed tokens.
+    #[serde(default)]
+    withdrawal_networks: Option<Vec<String>>,
+    /// Mandatory for every token of an `open` key.
+    #[serde(default)]
+    withdrawal_limits: Vec<WithdrawalLimitRequest>,
+    /// Required when granting or raising anything (only a downgrade to
+    /// `none` needs none).
     totp_code: Option<String>,
 }
 
-/// Grant or withdraw a key's Lightning payout permission. Granting is a
-/// step-up action and only for keys that expire.
+/// Validate a withdrawal grant (no I/O).
+fn validate_grant(body: &UpdateApiKeyRequest) -> Result<db::WithdrawalGrant, ApiError> {
+    use domain::{Network, Token, WithdrawalPolicy};
+    let policy = WithdrawalPolicy::parse_api(&body.withdrawal_policy)
+        .map_err(|_| ApiError::bad_request("withdrawal_policy must be none, book or open"))?;
+    if policy == WithdrawalPolicy::None {
+        return Ok(db::WithdrawalGrant { policy, tokens: vec![], networks: None, limits: vec![] });
+    }
+    let mut tokens = Vec::new();
+    for token in &body.withdrawal_tokens {
+        let token = Token::parse_api(token).map_err(|_| ApiError::bad_request("Invalid withdrawal token"))?;
+        if token.is_gas_only() {
+            return Err(ApiError::bad_request("Gas assets (TRX, SOL) can only be withdrawn by an admin"));
+        }
+        if !tokens.contains(&token) {
+            tokens.push(token);
+        }
+    }
+    if tokens.is_empty() {
+        return Err(ApiError::bad_request("withdrawal_tokens is required (USDT, BTC, ETH)"));
+    }
+    let networks = match &body.withdrawal_networks {
+        None => None,
+        Some(list) => {
+            let mut networks = Vec::new();
+            for network in list {
+                let network = Network::parse_api(network).map_err(|_| ApiError::bad_request("Invalid withdrawal network"))?;
+                if !tokens.iter().any(|t| domain::is_withdrawable(network, *t)) {
+                    return Err(ApiError::new(
+                        StatusCode::BAD_REQUEST,
+                        format!("None of the allowed tokens is withdrawn on {}", network.as_api()),
+                    ));
+                }
+                if !networks.contains(&network) {
+                    networks.push(network);
+                }
+            }
+            if networks.is_empty() {
+                return Err(ApiError::bad_request("withdrawal_networks cannot be empty (null = all)"));
+            }
+            Some(networks)
+        }
+    };
+    let mut limits = Vec::new();
+    for limit in &body.withdrawal_limits {
+        let token = Token::parse_api(&limit.token).map_err(|_| ApiError::bad_request("Invalid limit token"))?;
+        if !tokens.contains(&token) {
+            return Err(ApiError::bad_request("A limit names a token the key may not withdraw"));
+        }
+        if limits.iter().any(|(t, _, _)| *t == token) {
+            return Err(ApiError::bad_request("One limit per token"));
+        }
+        limits.push((
+            token,
+            w::parse_limit(&limit.max_per_withdrawal, token)?,
+            w::parse_limit(&limit.daily_max, token)?,
+        ));
+    }
+    if policy == WithdrawalPolicy::Open {
+        if let Some(missing) = tokens.iter().find(|t| !limits.iter().any(|(l, _, _)| l == *t)) {
+            return Err(ApiError::new(
+                StatusCode::BAD_REQUEST,
+                format!("An open key needs a {} limit", missing.as_api()),
+            ));
+        }
+    }
+    Ok(db::WithdrawalGrant { policy, tokens, networks, limits })
+}
+
+/// Set a key's withdrawal grant. Anything but a downgrade to `none` is a
+/// step-up action, and only keys with an expiry may withdraw.
 async fn update_api_key(
     State(state): State<AppState>,
     Extension(current): Extension<CurrentStaff>,
@@ -991,26 +1124,47 @@ async fn update_api_key(
     let Some(key) = state.db.find_api_key(&id).await? else {
         return Err(ApiError::not_found(format!("API key not found: {id}")));
     };
-    if body.can_send {
+    let grant = validate_grant(&body)?;
+    if grant.policy != domain::WithdrawalPolicy::None {
         if key.expires_at.is_none() {
             return Err(ApiError::bad_request(
-                "Only keys with an expiry can be allowed to send payouts",
+                "Only keys with an expiry can be allowed to withdraw",
             ));
         }
         require_step_up(&state, &current.id, body.totp_code.as_deref()).await?;
     }
-    if !state.db.set_api_key_can_send(&id, body.can_send).await? {
+    let before_limits = state.db.api_key_withdrawal_limits(&id).await?;
+    if !state.db.set_api_key_withdrawal_grant(&id, &grant).await? {
         return Err(ApiError::not_found(format!("API key not found: {id}")));
     }
+    let tokens: Vec<&str> = grant.tokens.iter().map(|t| t.as_api()).collect();
+    let networks: Option<Vec<&str>> = grant.networks.as_ref().map(|n| n.iter().map(|n| n.as_api()).collect());
+    let limits: Vec<Value> = grant
+        .limits
+        .iter()
+        .map(|(token, max, daily)| json!({ "token": token.as_api(), "max_per_withdrawal_raw": max.to_string(), "daily_max_raw": daily.to_string() }))
+        .collect();
     jobs::audit::record(
         &state,
         &staff_actor(&current, &client_ip),
-        "api_key.updated",
+        "api_key.withdrawal_policy_updated",
         Some(("api_key", &id)),
-        json!({ "can_send": { "from": key.can_send, "to": body.can_send } }),
+        json!({
+            "policy": { "from": key.withdrawal_policy().as_api(), "to": grant.policy.as_api() },
+            "tokens": tokens,
+            "networks": networks,
+            "limits": limits,
+            "previous_limits": before_limits.iter().map(|l| json!({ "token": l.token, "max_per_withdrawal_raw": l.max_per_withdrawal_raw.0.to_string(), "daily_max_raw": l.daily_max_raw.0.to_string() })).collect::<Vec<_>>(),
+        }),
     )
     .await;
-    Ok(Json(json!({ "id": id, "can_send": body.can_send })))
+    Ok(Json(json!({
+        "id": id,
+        "withdrawal_policy": grant.policy.as_api(),
+        "withdrawal_tokens": tokens,
+        "withdrawal_networks": networks,
+        "withdrawal_limits": limits,
+    })))
 }
 
 async fn revoke_api_key(
@@ -1048,16 +1202,11 @@ struct UpdateSettingsRequest {
     /// Absent = untouched; explicit `null` = keep forever.
     #[serde(default, deserialize_with = "deserialize_some")]
     api_traffic_retention_days: Option<Option<i64>>,
-    /// Lightning payout limits in sats (`0` disables payouts); changing
-    /// either needs `totp_code`.
-    payout_max_sats: Option<u64>,
-    payout_daily_max_sats: Option<u64>,
-    totp_code: Option<String>,
 }
 
 /// Distinguishes a missing JSON field (`None`) from an explicit `null`
 /// (`Some(None)`) — serde collapses both to `None` on a plain `Option`.
-fn deserialize_some<'de, D, T>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+pub(crate) fn deserialize_some<'de, D, T>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
 where
     D: Deserializer<'de>,
     T: Deserialize<'de>,
@@ -1074,19 +1223,7 @@ async fn update_settings(
     client_ip: ClientIp,
     Json(body): Json<UpdateSettingsRequest>,
 ) -> Result<Json<Value>, ApiError> {
-    // Validate everything before writing anything.
-    let payout_limits_changed =
-        body.payout_max_sats.is_some() || body.payout_daily_max_sats.is_some();
-    for value in [body.payout_max_sats, body.payout_daily_max_sats].into_iter().flatten() {
-        if value > domain::BTC_MAX_SATS {
-            return Err(ApiError::bad_request(
-                "Payout limits must be between 0 and 2100000000000000 sats",
-            ));
-        }
-    }
-    if payout_limits_changed {
-        require_step_up(&state, &current.id, body.totp_code.as_deref()).await?;
-    }
+    // Withdrawal limits live in `/settings/assets` (TOTP).
     let before = settings_json(&state).await?.0;
 
     if let Some(minutes) = body.deposit_expiry_minutes {
@@ -1147,19 +1284,6 @@ async fn update_settings(
             .await?;
     }
 
-    if let Some(sats) = body.payout_max_sats {
-        state
-            .db
-            .set_setting(db::PAYOUT_MAX_SETTING, &sats.to_string())
-            .await?;
-    }
-    if let Some(sats) = body.payout_daily_max_sats {
-        state
-            .db
-            .set_setting(db::PAYOUT_DAILY_MAX_SETTING, &sats.to_string())
-            .await?;
-    }
-
     let after = settings_json(&state).await?;
     jobs::audit::record(
         &state,
@@ -1177,17 +1301,12 @@ async fn settings_json(state: &AppState) -> Result<Json<Value>, ApiError> {
     let api_key_prefix = state.db.api_key_prefix().await?;
     let totp_issuer = state.db.totp_issuer().await?;
     let api_traffic_retention_days = state.db.api_traffic_retention_days().await?;
-    let payout_max_sats = state.db.payout_max_sats().await?;
-    let payout_daily_max_sats = state.db.payout_daily_max_sats().await?;
     Ok(Json(json!({
         "deposit_expiry_minutes": minutes,
         "api_key_prefix": api_key_prefix,
         "totp_issuer": totp_issuer,
         // null = indefinite (never purged).
         "api_traffic_retention_days": api_traffic_retention_days,
-        // 0 = payouts disabled.
-        "payout_max_sats": payout_max_sats,
-        "payout_daily_max_sats": payout_daily_max_sats,
     })))
 }
 
@@ -1381,8 +1500,12 @@ fn parse_events(events: &[String]) -> Result<Vec<WebhookEventType>, ApiError> {
     let mut parsed: Vec<WebhookEventType> = Vec::new();
     for value in events {
         let event = WebhookEventType::parse_api(value).map_err(|_| {
-            ApiError::bad_request(
-                "Invalid event: expected pending, paid, expired, payout_succeeded or payout_failed",
+            ApiError::new(
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "Invalid event: expected one of {}",
+                    WebhookEventType::ALL.iter().map(|e| e.as_api()).collect::<Vec<_>>().join(", ")
+                ),
             )
         })?;
         if !parsed.contains(&event) {
@@ -1390,9 +1513,7 @@ fn parse_events(events: &[String]) -> Result<Vec<WebhookEventType>, ApiError> {
         }
     }
     if parsed.is_empty() {
-        return Err(ApiError::bad_request(
-            "At least one event is required (pending, paid, expired, payout_succeeded or payout_failed)",
-        ));
+        return Err(ApiError::bad_request("At least one event is required"));
     }
     Ok(parsed)
 }
@@ -1636,6 +1757,9 @@ async fn list_webhooks(
                 "deposit_address_id": w.deposit_address_id,
                 // SDK payment id — payout deliveries only.
                 "lightning_payment_id": w.lightning_payment_id,
+                // Withdrawal / alert deliveries only.
+                "withdrawal_id": w.withdrawal_id,
+                "alert_id": w.alert_id,
                 // NULL on deliveries from before per-endpoint tracking.
                 "webhook_endpoint_id": w.webhook_endpoint_id,
                 "endpoint_url": w.endpoint_url,
@@ -1647,10 +1771,17 @@ async fn list_webhooks(
                     (None, None) => "unknown",
                 },
                 // Deposit amount for paid events, expected amount for address
-                // events, the sent amount for payouts.
+                // events, the sent amount for payouts and withdrawals.
                 "amount": w.amount.or(w.expected_amount)
                     .map(|a| a.normalize().to_string())
-                    .or_else(|| w.payout_amount.clone()),
+                    .or_else(|| w.payout_amount.clone())
+                    .or_else(|| match (&w.withdrawal_amount_raw, &w.withdrawal_token) {
+                        (Some(raw), Some(token)) => Some(domain::raw_u128_to_string(
+                            raw.parse().unwrap_or(0),
+                            domain::Token::from_db(token).unwrap_or(domain::Token::Usdt),
+                        )),
+                        _ => None,
+                    }),
                 "deposit_status": w.deposit_status.as_deref().map(|s| {
                     domain::DepositStatus::from_db(s).map(|s| s.as_api()).unwrap_or("detected")
                 }),
