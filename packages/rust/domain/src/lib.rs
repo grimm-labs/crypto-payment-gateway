@@ -609,7 +609,11 @@ pub fn decimal_str_to_raw(value: &str, token: Token) -> Result<String, DomainErr
         .parse::<Decimal>()
         .or_else(|_| Decimal::from_scientific(value))
         .map_err(|_| DomainError::InvalidAmount(value.to_string()))?;
-    Ok(decimal_to_raw(round_to_token(amount, token), token))
+    // Provider data: an absurd value is an error, never an overflow panic.
+    round_to_token(amount, token)
+        .checked_mul(Decimal::from(10u64.pow(token.decimals())))
+        .map(|scaled| scaled.trunc().normalize().to_string())
+        .ok_or_else(|| DomainError::InvalidAmount(value.to_string()))
 }
 
 /// Round to the token's decimals the way a Postgres `NUMERIC(_, decimals)`
@@ -673,6 +677,62 @@ pub fn required_confirmations(network: Network, tron: i32, eth: i32, btc: i32) -
     }
 }
 
+/// Whether `ip` is a globally routable unicast address — the only kind the
+/// gateway may connect to on a caller's behalf (webhook endpoints, Lightning
+/// addresses). Loopback, private, link-local (cloud metadata), CGNAT,
+/// unique-local, multicast, documentation, benchmarking and reserved ranges
+/// are refused, as are IPv4-mapped/NAT64 forms of them.
+pub fn is_public_ip(ip: std::net::IpAddr) -> bool {
+    use std::net::IpAddr;
+    match ip {
+        IpAddr::V4(v4) => is_public_ipv4(v4),
+        IpAddr::V6(v6) => {
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return is_public_ipv4(v4);
+            }
+            let segments = v6.segments();
+            // NAT64 (64:ff9b::/96) embeds an IPv4 destination.
+            if segments[..6] == [0x64, 0xff9b, 0, 0, 0, 0] {
+                let [a, b] = segments[6].to_be_bytes();
+                let [c, d] = segments[7].to_be_bytes();
+                return is_public_ipv4(std::net::Ipv4Addr::new(a, b, c, d));
+            }
+            !(v6.is_unspecified()
+                || v6.is_loopback()
+                || v6.is_multicast()
+                // IPv4-compatible (deprecated) ::/96
+                || segments[..6] == [0, 0, 0, 0, 0, 0]
+                // unique local fc00::/7
+                || (segments[0] & 0xfe00) == 0xfc00
+                // link-local fe80::/10
+                || (segments[0] & 0xffc0) == 0xfe80
+                // site-local (deprecated) fec0::/10
+                || (segments[0] & 0xffc0) == 0xfec0
+                // documentation 2001:db8::/32
+                || (segments[0] == 0x2001 && segments[1] == 0x0db8)
+                // discard-only 100::/64
+                || segments[..4] == [0x100, 0, 0, 0])
+        }
+    }
+}
+
+fn is_public_ipv4(ip: std::net::Ipv4Addr) -> bool {
+    let [a, b, c, _] = ip.octets();
+    !(a == 0                                   // "this network"
+        || a == 10                             // private
+        || a == 127                            // loopback
+        || (a == 100 && (64..=127).contains(&b)) // CGNAT 100.64/10
+        || (a == 169 && b == 254)              // link-local / cloud metadata
+        || (a == 172 && (16..=31).contains(&b)) // private
+        || (a == 192 && b == 0 && c == 0)      // IETF protocol assignments
+        || (a == 192 && b == 0 && c == 2)      // TEST-NET-1
+        || (a == 192 && b == 168)              // private
+        || (a == 198 && (18..=19).contains(&b)) // benchmarking
+        || (a == 198 && b == 51 && c == 100)   // TEST-NET-2
+        || (a == 203 && b == 0 && c == 113)    // TEST-NET-3
+        || a >= 224) // multicast, reserved, broadcast
+}
+
 fn trim_decimal(value: Decimal) -> String {
     let s = value.normalize().to_string();
     if s.contains('.') {
@@ -686,6 +746,28 @@ fn trim_decimal(value: Decimal) -> String {
 mod tests {
     use super::*;
     use rust_decimal_macros::dec;
+
+    #[test]
+    fn huge_provider_amounts_are_errors_not_panics() {
+        assert!(decimal_str_to_raw("1e27", Token::Usdt).is_err());
+        assert_eq!(decimal_str_to_raw("25.5", Token::Usdt).unwrap(), "25500000");
+    }
+
+    #[test]
+    fn only_globally_routable_ips_are_public() {
+        for ip in [
+            "0.0.0.0", "10.1.2.3", "127.0.0.1", "100.64.0.1", "169.254.169.254",
+            "172.16.0.1", "172.31.255.255", "192.0.0.1", "192.0.2.1", "192.168.1.1",
+            "198.18.0.1", "198.51.100.7", "203.0.113.9", "224.0.0.1", "255.255.255.255",
+            "::", "::1", "::ffff:127.0.0.1", "::ffff:169.254.169.254", "64:ff9b::a9fe:a9fe",
+            "fc00::1", "fd12:3456::1", "fe80::1", "ff02::1", "2001:db8::1", "::127.0.0.1",
+        ] {
+            assert!(!is_public_ip(ip.parse().unwrap()), "{ip} must not be public");
+        }
+        for ip in ["1.1.1.1", "8.8.8.8", "172.32.0.1", "100.128.0.1", "2606:4700::1111", "::ffff:8.8.8.8"] {
+            assert!(is_public_ip(ip.parse().unwrap()), "{ip} must be public");
+        }
+    }
 
     #[test]
     fn amount_within_tolerance() {

@@ -50,13 +50,41 @@ pub fn verify_password(password: &str, hash: &str) -> bool {
         .is_ok()
 }
 
+/// Verify against `hash`, or — when there is no account — against a fixed
+/// dummy hash, so both paths run one full argon2 verification and the
+/// response time does not reveal whether the account exists. Always
+/// `false` without a hash.
+pub fn verify_password_constant_time(password: &str, hash: Option<&str>) -> bool {
+    static DUMMY_HASH: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    match hash {
+        Some(hash) => verify_password(password, hash),
+        None => {
+            let dummy = DUMMY_HASH.get_or_init(|| {
+                hash_password("timing-equalization-dummy-password").unwrap_or_default()
+            });
+            let _ = verify_password(password, dummy);
+            false
+        }
+    }
+}
+
+/// `iss` / `aud` of staff access tokens — checked on decode, so a token
+/// minted for another purpose with the same secret is refused.
+pub const JWT_ISSUER: &str = "crypto-payment-gateway";
+pub const JWT_AUDIENCE: &str = "admin-api";
+
 /// JWT claims for staff access tokens. `role` uses the API casing
-/// (`admin` / `operator`).
+/// (`admin` / `operator`); `sid` is the session (refresh-token family) the
+/// token belongs to — revoking the session revokes the token immediately.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Claims {
     pub sub: String,
     pub email: String,
     pub role: String,
+    pub sid: String,
+    pub iss: String,
+    pub aud: String,
+    pub jti: String,
     pub iat: i64,
     pub exp: i64,
 }
@@ -66,6 +94,7 @@ pub fn issue_access_token(
     staff_id: &str,
     email: &str,
     role: StaffRole,
+    session_id: &str,
     ttl_minutes: i64,
 ) -> Result<String, AuthError> {
     let now = Utc::now().timestamp();
@@ -73,6 +102,10 @@ pub fn issue_access_token(
         sub: staff_id.to_string(),
         email: email.to_string(),
         role: role.as_api().to_string(),
+        sid: session_id.to_string(),
+        iss: JWT_ISSUER.to_string(),
+        aud: JWT_AUDIENCE.to_string(),
+        jti: random_alphanumeric(16),
         iat: now,
         exp: now + ttl_minutes * 60,
     };
@@ -85,13 +118,24 @@ pub fn issue_access_token(
 }
 
 pub fn decode_access_token(secret: &str, token: &str) -> Result<Claims, AuthError> {
+    let mut validation = Validation::new(Algorithm::HS256);
+    validation.set_issuer(&[JWT_ISSUER]);
+    validation.set_audience(&[JWT_AUDIENCE]);
+    validation.set_required_spec_claims(&["exp", "iss", "aud", "sub"]);
     jsonwebtoken::decode::<Claims>(
         token,
         &DecodingKey::from_secret(secret.as_bytes()),
-        &Validation::new(Algorithm::HS256),
+        &validation,
     )
     .map(|data| data.claims)
     .map_err(|_| AuthError::InvalidToken)
+}
+
+/// Opaque random identifier (session ids): 32 random bytes, hex.
+pub fn generate_session_id() -> String {
+    let mut bytes = [0u8; 32];
+    OsRng.fill_bytes(&mut bytes);
+    hex::encode(bytes)
 }
 
 pub fn sha256_hex(input: &str) -> String {
@@ -165,11 +209,25 @@ pub fn constant_time_eq_hex(a: &str, b: &str) -> bool {
 /// (`sha256=<hex>`). Receivers recompute it over the raw body and compare
 /// constant-time.
 pub fn webhook_signature(secret: &str, body: &[u8]) -> String {
+    format!("sha256={}", hmac_sha256_hex(secret, &[body]))
+}
+
+/// `X-Webhook-Signature-V2` value: `t=<unix seconds>,v1=<hex>` where the
+/// HMAC-SHA256 covers `"<t>.<body>"` (Stripe-style). Binding the timestamp
+/// lets receivers reject replays older than their tolerance window.
+pub fn webhook_signature_v2(secret: &str, timestamp: i64, body: &[u8]) -> String {
+    let t = timestamp.to_string();
+    format!("t={t},v1={}", hmac_sha256_hex(secret, &[t.as_bytes(), b".", body]))
+}
+
+fn hmac_sha256_hex(secret: &str, parts: &[&[u8]]) -> String {
     use hmac::{Hmac, Mac};
     let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes())
         .expect("HMAC accepts keys of any length");
-    mac.update(body);
-    format!("sha256={}", hex::encode(mac.finalize().into_bytes()))
+    for part in parts {
+        mac.update(part);
+    }
+    hex::encode(mac.finalize().into_bytes())
 }
 
 /// TOTP parameters follow the authenticator-app defaults (Google
@@ -280,19 +338,61 @@ mod tests {
     #[test]
     fn jwt_roundtrip() {
         let token =
-            issue_access_token("test-secret", "staff-1", "a@b.c", StaffRole::Admin, 15).unwrap();
+            issue_access_token("test-secret", "staff-1", "a@b.c", StaffRole::Admin, "sid-1", 15)
+                .unwrap();
         let claims = decode_access_token("test-secret", &token).unwrap();
         assert_eq!(claims.sub, "staff-1");
         assert_eq!(claims.email, "a@b.c");
         assert_eq!(claims.role, "admin");
+        assert_eq!(claims.sid, "sid-1");
+        assert_eq!(claims.iss, JWT_ISSUER);
+        assert_eq!(claims.aud, JWT_AUDIENCE);
+        assert_eq!(claims.jti.len(), 16);
         assert!(decode_access_token("other-secret", &token).is_err());
     }
 
     #[test]
     fn jwt_expired_is_rejected() {
-        let token =
-            issue_access_token("test-secret", "staff-1", "a@b.c", StaffRole::Operator, -5).unwrap();
+        let token = issue_access_token(
+            "test-secret",
+            "staff-1",
+            "a@b.c",
+            StaffRole::Operator,
+            "sid-1",
+            -5,
+        )
+        .unwrap();
         assert!(decode_access_token("test-secret", &token).is_err());
+    }
+
+    #[test]
+    fn jwt_without_issuer_or_audience_is_rejected() {
+        #[derive(Serialize)]
+        struct Legacy<'a> {
+            sub: &'a str,
+            email: &'a str,
+            role: &'a str,
+            sid: &'a str,
+            jti: &'a str,
+            iat: i64,
+            exp: i64,
+        }
+        let now = Utc::now().timestamp();
+        let legacy = jsonwebtoken::encode(
+            &Header::new(Algorithm::HS256),
+            &Legacy { sub: "s", email: "e", role: "admin", sid: "x", jti: "j", iat: now, exp: now + 600 },
+            &EncodingKey::from_secret(b"test-secret"),
+        )
+        .unwrap();
+        assert!(decode_access_token("test-secret", &legacy).is_err());
+    }
+
+    #[test]
+    fn constant_time_verification_rejects_missing_accounts() {
+        let hash = hash_password("s3cret-password").unwrap();
+        assert!(verify_password_constant_time("s3cret-password", Some(&hash)));
+        assert!(!verify_password_constant_time("s3cret-password", None));
+        assert!(!verify_password_constant_time("timing-equalization-dummy-password", None));
     }
 
     #[test]
@@ -431,6 +531,21 @@ mod tests {
             webhook_signature("Jefe", b"what do ya want for nothing?"),
             "sha256=5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"
         );
+    }
+
+    #[test]
+    fn webhook_signature_v2_binds_the_timestamp() {
+        let body = br#"{"event_type":"deposit_confirmed"}"#;
+        let sig = webhook_signature_v2("secret-a", 1_700_000_000, body);
+        // HMAC over "<t>.<body>".
+        let mut signed = b"1700000000.".to_vec();
+        signed.extend_from_slice(body);
+        assert_eq!(
+            sig,
+            format!("t=1700000000,v1={}", hmac_sha256_hex("secret-a", &[&signed]))
+        );
+        assert_ne!(sig, webhook_signature_v2("secret-a", 1_700_000_001, body));
+        assert_ne!(sig, webhook_signature_v2("secret-b", 1_700_000_000, body));
     }
 
     #[test]

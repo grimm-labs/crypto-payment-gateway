@@ -241,6 +241,15 @@ impl From<Payment> for WalletPayment {
     }
 }
 
+/// What a payout would cost, from the recipient's actual invoice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PayoutQuote {
+    /// What the recipient receives.
+    pub amount_sats: u64,
+    /// Network fee, paid on top.
+    pub fees_sats: u64,
+}
+
 /// A page of the wallet history, newest first. The SDK reports no total, so
 /// paging is driven by `has_more`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -402,9 +411,53 @@ impl LightningClient {
         // to retry with a fresh key — paying twice.
         if let Some(key) = &idempotency_key {
             if let Some(existing) = self.get_payment(key).await? {
+                // Keys share the wallet's payment id space: a key naming a
+                // receive (or someone else's payment) is not a replay.
+                if existing.direction != PaymentDirection::Send {
+                    anyhow::bail!("Idempotency key collides with a non-send payment");
+                }
                 return Ok(existing);
             }
         }
+        let prepare_response = self
+            .prepare_lightning_address(address, amount_sats, comment)
+            .await?;
+        let response = self
+            .ops
+            .lnurl_pay(LnurlPayRequest {
+                prepare_response,
+                idempotency_key,
+            })
+            .await
+            .context("Breez lnurl_pay failed")?;
+        Ok(WalletPayment::from(response.payment))
+    }
+
+    /// Resolve the address and fetch the recipient's invoice for
+    /// `amount_sats`, without paying: the fee the payout would cost.
+    pub async fn quote_lightning_address(
+        &self,
+        address: &str,
+        amount_sats: u64,
+        comment: Option<String>,
+    ) -> Result<PayoutQuote> {
+        let prepared = self
+            .prepare_lightning_address(address, amount_sats, comment)
+            .await?;
+        Ok(PayoutQuote {
+            amount_sats: prepared.amount_sats,
+            fees_sats: prepared.fee_sats,
+        })
+    }
+
+    /// `user@domain` only (anything else the SDK parses is refused), fees on
+    /// top of `amount_sats`.
+    async fn prepare_lightning_address(
+        &self,
+        address: &str,
+        amount_sats: u64,
+        comment: Option<String>,
+    ) -> Result<PrepareLnurlPayResponse> {
         let pay_request = match self
             .ops
             .parse(address)
@@ -414,8 +467,7 @@ impl LightningClient {
             InputType::LightningAddress(details) => details.pay_request,
             _ => anyhow::bail!("Input is not a Lightning address"),
         };
-        let prepare_response = self
-            .ops
+        self.ops
             .prepare_lnurl_pay(PrepareLnurlPayRequest {
                 amount: u128::from(amount_sats),
                 pay_request,
@@ -427,16 +479,7 @@ impl LightningClient {
                 fee_policy: None,
             })
             .await
-            .context("Breez prepare_lnurl_pay failed")?;
-        let response = self
-            .ops
-            .lnurl_pay(LnurlPayRequest {
-                prepare_response,
-                idempotency_key,
-            })
-            .await
-            .context("Breez lnurl_pay failed")?;
-        Ok(WalletPayment::from(response.payment))
+            .context("Breez prepare_lnurl_pay failed")
     }
 
     /// One wallet payment by SDK id; `None` when the wallet has no such
@@ -1116,6 +1159,45 @@ mod tests {
             .unwrap();
         assert_eq!(replayed.id, "6f1c7a8e-2f43-4d55-9a8b-1c2d3e4f5a6b");
         assert_eq!(replayed.status, WalletPaymentStatus::Completed);
+    }
+
+    #[tokio::test]
+    async fn an_idempotency_key_naming_a_receive_is_not_a_replay() {
+        let mut ops = MockLightningOps::new();
+        ops.expect_get_payment().times(1).returning(|_| {
+            Ok(GetPaymentResponse {
+                payment: received("6f1c7a8e-2f43-4d55-9a8b-1c2d3e4f5a6b", "lnbc1incoming"),
+            })
+        });
+        // Nothing may be resolved, prepared or sent.
+        let client = LightningClient::new(Arc::new(ops));
+        let err = client
+            .pay_lightning_address(
+                "alice@example.com",
+                1_000,
+                None,
+                Some("6f1c7a8e-2f43-4d55-9a8b-1c2d3e4f5a6b".into()),
+            )
+            .await
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("non-send"));
+    }
+
+    #[tokio::test]
+    async fn a_quote_prepares_without_paying() {
+        let mut ops = MockLightningOps::new();
+        ops.expect_parse().times(1).returning(|_| Ok(lightning_address_input()));
+        ops.expect_prepare_lnurl_pay()
+            .withf(|request| request.amount == 150_000 && request.fee_policy.is_none())
+            .times(1)
+            .returning(|request| Ok(prepared(150_000, 7, request.comment)));
+        // No `lnurl_pay` expectation: a quote never sends.
+        let client = LightningClient::new(Arc::new(ops));
+        let quote = client
+            .quote_lightning_address("alice@example.com", 150_000, None)
+            .await
+            .unwrap();
+        assert_eq!(quote, PayoutQuote { amount_sats: 150_000, fees_sats: 7 });
     }
 
     #[tokio::test]
