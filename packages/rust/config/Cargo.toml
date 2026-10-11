@@ -10,3 +10,4 @@ dotenvy.workspace = true
 ipnet.workspace = true
 serde.workspace = true
 thiserror.workspace = true
+zeroize.workspace = true
