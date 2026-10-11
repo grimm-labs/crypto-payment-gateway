@@ -5,9 +5,11 @@ use std::time::Duration;
 use anyhow::Result;
 use chain::ChainClients;
 use config::{
-    AppConfig, ADDRESS_REQUEST_DELAY_MS, API_KEY_EXPIRY_SWEEP_INTERVAL_SECS,
+    AppConfig, ADDRESS_EXPIRY_GRACE_SECS, ADDRESS_REQUEST_DELAY_MS,
+    API_KEY_EXPIRY_SWEEP_INTERVAL_SECS, DETECTED_DEPOSIT_HOLD_SECS,
     LIGHTNING_PAYOUT_CATCH_UP_MARGIN_SECS, LIGHTNING_PAYOUT_WATERMARK_INTERVAL_SECS,
-    WALLET_BALANCE_SYNC_INTERVAL_SECS, WEBHOOK_MAX_ATTEMPTS, WEBHOOK_RETRY_DELAYS_SECS,
+    LIVE_BALANCES_CACHE_SECS, WALLET_BALANCE_SYNC_INTERVAL_SECS, WEBHOOK_CLAIM_LEASE_SECS,
+    WEBHOOK_DELIVERY_CONCURRENCY, WEBHOOK_MAX_ATTEMPTS, WEBHOOK_RETRY_DELAYS_SECS,
 };
 use db::Db;
 use db::DepositAddressRow;
@@ -26,14 +28,28 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, error, info, warn};
 use wallet::WalletService;
 
+pub mod audit;
+pub mod payouts;
 pub mod traffic;
+pub mod webhook_client;
+pub use audit::Actor;
+pub use payouts::{quote_payout, request_payout, PayoutCommand, PayoutError, PayoutOutcome};
 pub use traffic::TrafficRecorder;
+pub use webhook_client::{check_webhook_host_resolves_publicly, validate_webhook_url, WebhookClient};
 
 /// Legacy LIST queue, only drained at startup (pre-backoff deploys).
 const LEGACY_WEBHOOK_LIST_KEY: &str = "queue:webhook-delivery";
 /// ZSET scored by next-attempt epoch seconds. New suffix on purpose: a Redis
 /// key cannot change type in place (WRONGTYPE against the old LIST).
 const WEBHOOK_ZSET_KEY: &str = "zset:webhook-delivery";
+/// Members claimed by a worker, scored by lease expiry: a worker that dies
+/// mid-delivery leaves its member here, and it goes back to the queue once
+/// the lease expires (at-least-once). A member is never claimed twice at
+/// the same time, even across overlapping containers during a deploy.
+const WEBHOOK_INFLIGHT_KEY: &str = "zset:webhook-inflight";
+/// Cached `/balances` result and the lock of whoever recomputes it.
+const LIVE_BALANCES_KEY: &str = "live-balances";
+const LIVE_BALANCES_LOCK_KEY: &str = "live-balances:lock";
 const WALLET_BALANCES_KEY: &str = "wallet-balances";
 /// Unix seconds up to which finished wallet sends have been notified.
 const PAYOUT_WATERMARK_KEY: &str = "lightning:payout-watermark";
@@ -50,6 +66,10 @@ pub struct AppState {
     /// Breez SDK client; `None` = Lightning disabled (no key, or connect
     /// failed at boot).
     pub lightning: Option<LightningClient>,
+    /// Outgoing webhook client (SSRF-hardened outside development).
+    pub webhooks: WebhookClient,
+    /// First-admin bootstrap token, set at boot while no staff exists.
+    pub setup_token: Option<Arc<String>>,
 }
 
 impl AppState {
@@ -106,6 +126,11 @@ pub async fn process_detected_transfer(state: &AppState, transfer: DetectedTrans
     }
 
     let amount = raw_to_decimal(&transfer.amount_raw, token)?;
+    // Zero-value transfers ("address poisoning") never settle anything.
+    if amount.is_zero() {
+        debug!("Ignoring zero-amount transfer {} to address {}", transfer.tx_hash, address.id);
+        return Ok(());
+    }
     let amount_str = amount.normalize().to_string();
     let is_confirmed = transfer.confirmations >= required;
 
@@ -244,18 +269,6 @@ async fn reconcile_lightning(state: &AppState, pending: &[DepositAddressRow]) ->
     Ok(())
 }
 
-/// Boot-time reconciliation, run before any expiry sweep: also covers
-/// invoices whose deadline passed while the gateway was down. A settled
-/// payment always predates the deadline (the BOLT11 expires at the same
-/// instant), so such an invoice is paid, not expired.
-pub async fn reconcile_lightning_backlog(state: &AppState) -> Result<()> {
-    if state.lightning.is_none() {
-        return Ok(());
-    }
-    let unsettled = state.db.unsettled_addresses(Network::Lightning).await?;
-    reconcile_lightning(state, &unsettled).await
-}
-
 /// A wallet history entry, linked to the gateway payment (deposit address)
 /// whose invoice it settled — `None` for funds unrelated to the gateway.
 #[derive(Debug, Clone)]
@@ -335,27 +348,6 @@ impl From<anyhow::Error> for LightningError {
     }
 }
 
-/// Pay a Lightning address from the wallet (fees on top). Returns the send
-/// as accepted — usually pending; its outcome arrives as a payout webhook.
-pub async fn send_payout(
-    state: &AppState,
-    ln_address: &str,
-    amount_sats: u64,
-    comment: Option<String>,
-    idempotency_key: Option<String>,
-) -> Result<WalletPayment, LightningError> {
-    let lightning = state.lightning.as_ref().ok_or(LightningError::Disabled)?;
-    let payment = lightning
-        .pay_lightning_address(ln_address, amount_sats, comment, idempotency_key)
-        .await?;
-    info!(
-        "Lightning payout {} accepted: {amount_sats} sats to {ln_address} ({})",
-        payment.id,
-        payment.status.as_api()
-    );
-    Ok(payment)
-}
-
 /// One wallet payment (any direction) linked to its gateway invoice, if any.
 pub async fn lightning_payment_entry(
     state: &AppState,
@@ -402,6 +394,11 @@ pub async fn notify_payout(state: &AppState, payment: &WalletPayment) -> Result<
     let Some(event) = payout_event_for(payment) else {
         return Ok(0);
     };
+    // `|` separates queue member fields: such an id could never be decoded.
+    if payment.id.is_empty() || payment.id.contains('|') {
+        error!("Payout webhook skipped — unexpected payment id shape {:?}", payment.id);
+        return Ok(0);
+    }
     let mut queued = 0;
     for endpoint in state.db.active_webhook_endpoints_for_event(event).await? {
         if state
@@ -482,10 +479,26 @@ pub async fn notify_address_event(
     Ok(endpoints.len())
 }
 
-/// Expire past-deadline addresses and queue the EXPIRED webhook for each
-/// newly expired one. Returns the number of addresses expired.
-pub async fn expire_addresses_and_notify(state: &AppState) -> Result<u64> {
-    let expired_ids = state.db.expire_stale_addresses().await?;
+/// Expire `network`'s addresses whose deadline (plus the grace period) has
+/// passed — never one with a DETECTED deposit still confirming — and queue
+/// the EXPIRED webhook for each newly expired one. Called by the network's
+/// monitor loop right *after* a polling pass, so every address gets a last
+/// poll before it expires. Returns the number of addresses expired.
+/// `polled`: see `Db::expire_stale_addresses`.
+pub async fn expire_addresses_and_notify(
+    state: &AppState,
+    network: Network,
+    polled: Option<&[String]>,
+) -> Result<u64> {
+    let expired_ids = state
+        .db
+        .expire_stale_addresses(
+            network,
+            ADDRESS_EXPIRY_GRACE_SECS,
+            DETECTED_DEPOSIT_HOLD_SECS,
+            polled,
+        )
+        .await?;
     for address_id in &expired_ids {
         if let Err(err) =
             notify_address_event(state, address_id, WebhookEventType::Expired).await
@@ -526,6 +539,35 @@ pub fn decode_queue_member(member: &str) -> Option<(WebhookEventType, &str, &str
             Some((event, subject, endpoint))
         }
         _ => None,
+    }
+}
+
+/// What a webhook queue member turned out to be.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueueMember<'a> {
+    Delivery {
+        event: WebhookEventType,
+        subject_id: &'a str,
+        endpoint_id: &'a str,
+    },
+    /// Bare deposit id written before per-endpoint deliveries.
+    Legacy(&'a str),
+    /// Undecodable: dropped (re-queueing it would loop forever).
+    Malformed,
+}
+
+pub fn classify_queue_member(member: &str) -> QueueMember<'_> {
+    if let Some((event, subject_id, endpoint_id)) = decode_queue_member(member) {
+        return QueueMember::Delivery {
+            event,
+            subject_id,
+            endpoint_id,
+        };
+    }
+    if !member.is_empty() && !member.contains('|') && !member.chars().any(char::is_whitespace) {
+        QueueMember::Legacy(member)
+    } else {
+        QueueMember::Malformed
     }
 }
 
@@ -579,6 +621,9 @@ pub enum RetriggerError {
     /// Target endpoint is inactive or no longer subscribed to the event.
     EndpointNotEligible,
     NoActiveEndpoints,
+    /// No FAILED delivery to replay (merchant replays never resend a
+    /// delivered webhook).
+    NothingToRetry,
     Other(anyhow::Error),
 }
 
@@ -617,6 +662,48 @@ pub async fn retrigger_webhook(state: &AppState, deposit_id: &str) -> Result<(),
         endpoints.len()
     );
     Ok(())
+}
+
+/// Merchant replay of a confirmed deposit's webhooks: only the deliveries
+/// that ended FAILED, and only towards endpoints still active and
+/// subscribed to PAID — a delivered webhook is never sent again from the
+/// merchant API. Returns the number of deliveries re-queued.
+pub async fn retrigger_failed_deposit_webhooks(
+    state: &AppState,
+    deposit_id: &str,
+) -> Result<usize, RetriggerError> {
+    let deposit = state
+        .db
+        .find_deposit(deposit_id)
+        .await?
+        .ok_or(RetriggerError::DepositNotFound)?;
+    if deposit.status != DepositStatus::Confirmed.as_db() {
+        return Err(RetriggerError::DepositNotConfirmed);
+    }
+    let eligible: Vec<String> = state
+        .db
+        .active_webhook_endpoints_for_event(WebhookEventType::Paid)
+        .await?
+        .into_iter()
+        .map(|endpoint| endpoint.id)
+        .collect();
+    let mut retried = 0;
+    for delivery in state.db.failed_paid_deliveries(&deposit.id).await? {
+        let Some(endpoint_id) = delivery.webhook_endpoint_id.as_deref() else {
+            continue;
+        };
+        if !eligible.iter().any(|id| id == endpoint_id) {
+            continue;
+        }
+        state.db.reset_webhook_delivery_by_id(&delivery.id).await?;
+        enqueue_webhook(state, WebhookEventType::Paid, &deposit.id, endpoint_id).await?;
+        retried += 1;
+    }
+    if retried == 0 {
+        return Err(RetriggerError::NothingToRetry);
+    }
+    info!("Merchant replay re-queued {retried} failed webhook(s) for deposit {deposit_id}");
+    Ok(retried)
 }
 
 /// Manual replay of one delivery row (any event type): reset it to PENDING /
@@ -762,7 +849,7 @@ pub async fn deliver_webhook(
 ) -> Result<DeliveryOutcome> {
     // Reload the endpoint on every attempt so a deactivation or an event
     // unsubscription takes effect immediately: the queued member is consumed
-    // without being rescheduled.
+    // without being rescheduled, and its PENDING row is closed.
     let endpoint = match state.db.find_webhook_endpoint(endpoint_id).await? {
         Some(endpoint) if endpoint.is_active && endpoint.accepts_event(event) => endpoint,
         _ => {
@@ -770,24 +857,124 @@ pub async fn deliver_webhook(
                 "Webhook delivery skipped for {} {subject_id} — endpoint {endpoint_id} is inactive, gone or unsubscribed",
                 event.as_api()
             );
+            close_undeliverable(
+                state,
+                event,
+                subject_id,
+                endpoint_id,
+                "Endpoint inactive, unsubscribed or deleted",
+            )
+            .await?;
             return Ok(DeliveryOutcome::Skipped);
         }
     };
-    let webhook_url = &endpoint.url;
     let subject_label = match event {
         WebhookEventType::Paid => format!("deposit {subject_id}"),
         event if event.is_payout() => format!("payout {subject_id} ({})", event.as_api()),
         _ => format!("address {subject_id} ({})", event.as_api()),
     };
 
-    let (delivery, payload) = match event {
+    let Some((delivery, mut payload, occurred_at)) =
+        prepare_delivery(state, event, subject_id, endpoint_id).await?
+    else {
+        // The subject is gone (or Lightning is off): retrying forever would
+        // only spin. Payout webhooks are re-queued by the boot catch-up.
+        error!("Webhook delivery dropped for {subject_label} — subject not found");
+        close_undeliverable(state, event, subject_id, endpoint_id, "Subject not found").await?;
+        return Ok(DeliveryOutcome::Skipped);
+    };
+
+    if delivery.status == WebhookDeliveryStatus::Delivered.as_db() {
+        return Ok(DeliveryOutcome::Delivered);
+    }
+
+    // Envelope: a stable id receivers deduplicate on (the delivery row is
+    // reused across retries) and when the event happened (deliveries are
+    // not ordered).
+    if let Some(object) = payload.as_object_mut() {
+        object.insert("event_id".into(), serde_json::json!(delivery.id));
+        object.insert("occurred_at".into(), serde_json::json!(occurred_at.to_rfc3339()));
+    }
+
+    // Serialize exactly once: the signature must cover the exact bytes sent.
+    let body = serde_json::to_vec(&payload)?;
+    let request = match state.webhooks.post(&endpoint.url) {
+        Ok(request) => request,
+        Err(reason) => {
+            // Stored before the URL rules were tightened: never sent.
+            warn!("Webhook to endpoint {endpoint_id} not sent: {reason}");
+            return record_failed_attempt(state, &delivery, None, reason, payload, &subject_label)
+                .await;
+        }
+    };
+    let timestamp = chrono::Utc::now().timestamp();
+    let mut request = request
+        .header("Content-Type", "application/json")
+        .header("X-Webhook-Id", &delivery.id)
+        .header("X-Webhook-Timestamp", timestamp.to_string());
+    if let Some(secret) = endpoint.secret.as_deref().filter(|s| !s.is_empty()) {
+        request = request
+            .header("X-Webhook-Signature", auth::webhook_signature(secret, &body))
+            .header(
+                "X-Webhook-Signature-V2",
+                auth::webhook_signature_v2(secret, timestamp, &body),
+            );
+    }
+    match request.body(body).send().await {
+        // Redirects are not followed: a 3xx lands in the failure branch.
+        Ok(resp) if resp.status().is_success() => {
+            let status = resp.status().as_u16() as i32;
+            state
+                .db
+                .update_webhook_delivery(
+                    &delivery.id,
+                    WebhookDeliveryStatus::Delivered,
+                    delivery.attempts + 1,
+                    Some(status),
+                    None,
+                    Some(payload),
+                )
+                .await?;
+            info!("Webhook delivered for {subject_label}");
+            Ok(DeliveryOutcome::Delivered)
+        }
+        Ok(resp) => {
+            let status = resp.status().as_u16() as i32;
+            record_failed_attempt(
+                state,
+                &delivery,
+                Some(status),
+                format!("HTTP {status}"),
+                payload,
+                &subject_label,
+            )
+            .await
+        }
+        // `without_url`: the endpoint URL (query tokens…) must not land in
+        // `lastError`, which the dashboard displays.
+        Err(err) => {
+            let error = err.without_url().to_string();
+            record_failed_attempt(state, &delivery, None, error, payload, &subject_label).await
+        }
+    }
+}
+
+/// The delivery row, its payload and when the event happened — `None` when
+/// the subject no longer exists.
+async fn prepare_delivery(
+    state: &AppState,
+    event: WebhookEventType,
+    subject_id: &str,
+    endpoint_id: &str,
+) -> Result<Option<(db::WebhookDeliveryRow, serde_json::Value, chrono::DateTime<chrono::Utc>)>> {
+    match event {
         WebhookEventType::Paid => {
             let Some(deposit) = state.db.find_deposit(subject_id).await? else {
-                anyhow::bail!("Deposit not found: {subject_id}");
+                return Ok(None);
             };
             let Some(address) = state.db.find_deposit_address(&deposit.deposit_address_id).await?
             else {
-                anyhow::bail!("Deposit address not found for deposit {subject_id}");
+                return Ok(None);
             };
             let delivery = state
                 .db
@@ -811,120 +998,108 @@ pub async fn deliver_webhook(
                     "status": "confirmed",
                 },
             });
-            (delivery, payload)
+            let occurred_at = deposit.confirmed_at.unwrap_or(deposit.detected_at);
+            Ok(Some((delivery, payload, occurred_at)))
         }
         WebhookEventType::Pending | WebhookEventType::Expired => {
             let Some(address) = state.db.find_deposit_address(subject_id).await? else {
-                anyhow::bail!("Deposit address not found: {subject_id}");
+                return Ok(None);
             };
             let delivery = state
                 .db
                 .get_or_create_address_webhook_delivery(subject_id, event, endpoint_id)
                 .await?;
-            (delivery, address_event_payload(event, &address)?)
+            let occurred_at = match event {
+                WebhookEventType::Pending => address.created_at,
+                _ => address.updated_at,
+            };
+            Ok(Some((delivery, address_event_payload(event, &address)?, occurred_at)))
         }
         WebhookEventType::PayoutSucceeded | WebhookEventType::PayoutFailed => {
             let Some(lightning) = &state.lightning else {
                 // Dropped rather than retried forever: once Lightning is back,
-                // the boot catch-up re-queues it (no delivery row exists yet).
+                // the boot catch-up re-queues it.
                 warn!("Payout webhook {subject_id} dropped — Lightning is not configured");
-                return Ok(DeliveryOutcome::Skipped);
+                return Ok(None);
             };
             let Some(payment) = lightning.get_payment(subject_id).await? else {
-                warn!("Payout webhook skipped — wallet has no payment {subject_id}");
-                return Ok(DeliveryOutcome::Skipped);
+                return Ok(None);
             };
             let delivery = state
                 .db
                 .get_or_create_payout_webhook_delivery(subject_id, event, endpoint_id)
                 .await?;
-            (delivery, payout_payload(event, &payment))
+            let occurred_at = i64::try_from(payment.timestamp)
+                .ok()
+                .and_then(|ts| chrono::DateTime::from_timestamp(ts, 0))
+                .unwrap_or_else(chrono::Utc::now);
+            Ok(Some((delivery, payout_payload(event, &payment), occurred_at)))
         }
-    };
-
-    if delivery.status == WebhookDeliveryStatus::Delivered.as_db() {
-        return Ok(DeliveryOutcome::Delivered);
     }
+}
 
-    // Serialize exactly once: the signature must cover the exact bytes sent.
-    let body = serde_json::to_vec(&payload)?;
-    let client = reqwest::Client::new();
-    let mut request = client
-        .post(webhook_url)
-        .timeout(Duration::from_secs(10))
-        .header("Content-Type", "application/json");
-    if let Some(secret) = endpoint.secret.as_deref().filter(|s| !s.is_empty()) {
-        request = request.header("X-Webhook-Signature", auth::webhook_signature(secret, &body));
-    }
-    match request.body(body).send().await {
-        Ok(resp) => {
-            let status = resp.status().as_u16() as i32;
-            if resp.status().is_success() {
-                state
-                    .db
-                    .update_webhook_delivery(
-                        &delivery.id,
-                        WebhookDeliveryStatus::Delivered,
-                        delivery.attempts + 1,
-                        Some(status),
-                        None,
-                        Some(payload.clone()),
-                    )
-                    .await?;
-                info!("Webhook delivered for {subject_label}");
-                Ok(DeliveryOutcome::Delivered)
-            } else {
-                let attempts = delivery.attempts + 1;
-                let final_status = if attempts >= WEBHOOK_MAX_ATTEMPTS as i32 {
-                    WebhookDeliveryStatus::Failed
-                } else {
-                    WebhookDeliveryStatus::Pending
-                };
-                state
-                    .db
-                    .update_webhook_delivery(
-                        &delivery.id,
-                        final_status,
-                        attempts,
-                        Some(status),
-                        Some(format!("HTTP {status}")),
-                        Some(payload.clone()),
-                    )
-                    .await?;
-                if attempts < WEBHOOK_MAX_ATTEMPTS as i32 {
-                    warn!("Webhook HTTP {status} for {subject_label} (attempt {attempts})");
-                    return Ok(DeliveryOutcome::RetryAt { attempts });
-                }
-                error!("Webhook delivery failed after {attempts} attempts for {subject_label}");
-                Ok(DeliveryOutcome::Failed)
-            }
-        }
-        Err(err) => {
-            let attempts = delivery.attempts + 1;
-            let final_status = if attempts >= WEBHOOK_MAX_ATTEMPTS as i32 {
+/// One failed HTTP attempt: PENDING with a retry scheduled while budget
+/// remains, FAILED afterwards. Only the last error is kept.
+async fn record_failed_attempt(
+    state: &AppState,
+    delivery: &db::WebhookDeliveryRow,
+    status: Option<i32>,
+    error: String,
+    payload: serde_json::Value,
+    subject_label: &str,
+) -> Result<DeliveryOutcome> {
+    let attempts = delivery.attempts + 1;
+    let exhausted = attempts >= WEBHOOK_MAX_ATTEMPTS as i32;
+    state
+        .db
+        .update_webhook_delivery(
+            &delivery.id,
+            if exhausted {
                 WebhookDeliveryStatus::Failed
             } else {
                 WebhookDeliveryStatus::Pending
-            };
+            },
+            attempts,
+            status,
+            Some(error.clone()),
+            Some(payload),
+        )
+        .await?;
+    if exhausted {
+        error!("Webhook delivery failed after {attempts} attempts for {subject_label}");
+        return Ok(DeliveryOutcome::Failed);
+    }
+    warn!("Webhook attempt {attempts} failed for {subject_label}: {error}");
+    Ok(DeliveryOutcome::RetryAt { attempts })
+}
+
+/// Close the existing PENDING row of a delivery that will never be sent.
+async fn close_undeliverable(
+    state: &AppState,
+    event: WebhookEventType,
+    subject_id: &str,
+    endpoint_id: &str,
+    reason: &str,
+) -> Result<()> {
+    let row = match event {
+        WebhookEventType::Paid => state.db.find_webhook_delivery(subject_id, endpoint_id).await?,
+        event if event.is_payout() => {
             state
                 .db
-                .update_webhook_delivery(
-                    &delivery.id,
-                    final_status,
-                    attempts,
-                    None,
-                    Some(err.to_string()),
-                    Some(payload.clone()),
-                )
-                .await?;
-            if attempts < WEBHOOK_MAX_ATTEMPTS as i32 {
-                warn!("Webhook error for {subject_label} (attempt {attempts}): {err}");
-                return Ok(DeliveryOutcome::RetryAt { attempts });
-            }
-            error!("Webhook delivery failed after {attempts} attempts for {subject_label}");
-            Ok(DeliveryOutcome::Failed)
+                .find_payout_webhook_delivery(subject_id, event, endpoint_id)
+                .await?
         }
+        event => {
+            state
+                .db
+                .find_address_webhook_delivery(subject_id, event, endpoint_id)
+                .await?
+        }
+    };
+    if let Some(row) = row {
+        state.db.fail_pending_webhook_delivery(&row.id, reason).await?;
     }
+    Ok(())
 }
 
 /// Payload of an address-scoped event. Mirrors the PAID payload's naming:
@@ -966,16 +1141,16 @@ pub fn spawn_workers(
         info!("API_TRAFFIC_ENABLED=false — API traffic log disabled");
     }
 
+    // One loop per network, enabled or not: a disabled network still gets
+    // its (hard-stop) expiry sweep.
     let poll_secs = state.config.polling_interval_seconds.max(1);
-    for network in CHAIN_NETWORKS {
+    for network in Network::ALL {
         let s = state.clone();
         tokio::spawn(async move { monitor_loop(s, network, poll_secs).await });
     }
     if let Some(lightning) = state.lightning.clone() {
         let s = state.clone();
         tokio::spawn(async move { lightning_event_loop(s, lightning).await });
-        let s = state.clone();
-        tokio::spawn(async move { monitor_loop(s, Network::Lightning, poll_secs).await });
     }
     let s4 = state.clone();
     tokio::spawn(async move { webhook_loop(s4).await });
@@ -1074,6 +1249,8 @@ async fn payout_watermark_loop(state: AppState, lightning: LightningClient, mut 
 
 async fn monitor_loop(state: AppState, network: Network, poll_secs: u64) {
     let mut interval = tokio::time::interval(Duration::from_secs(poll_secs));
+    // A pass longer than the interval must not trigger a burst of passes.
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         interval.tick().await;
         if let Err(err) = poll_network(&state, network).await {
@@ -1082,6 +1259,10 @@ async fn monitor_loop(state: AppState, network: Network, poll_secs: u64) {
     }
 }
 
+/// Poll `network`'s open payments, then expire the stale ones: the sweep
+/// runs only after the poll, so a payment always gets a last look before
+/// it expires (no boot-time race either — the first pass of every loop
+/// polls before it expires anything).
 async fn poll_network(state: &AppState, network: Network) -> Result<()> {
     if !state.is_network_enabled(network) {
         debug!(
@@ -1089,18 +1270,22 @@ async fn poll_network(state: &AppState, network: Network) -> Result<()> {
             network,
             state.network_disabled_message(network)
         );
+        // Nothing can be polled: only the hard stop applies, so payments
+        // made while the network was down are still reconciled once it is
+        // back (within the hold window).
+        expire_addresses_and_notify(state, network, Some(&[])).await?;
         return Ok(());
     }
 
-    let _ = expire_addresses_and_notify(state).await?;
     let addresses = state.db.pending_addresses(network).await?;
-    if addresses.is_empty() {
+    if network == Network::Lightning {
+        // A failed reconciliation returns early: nothing expires unpolled.
+        reconcile_lightning(state, &addresses).await?;
+        expire_addresses_and_notify(state, network, None).await?;
         return Ok(());
     }
-    if network == Network::Lightning {
-        return reconcile_lightning(state, &addresses).await;
-    }
 
+    let mut polled = Vec::with_capacity(addresses.len());
     for (i, address) in addresses.iter().enumerate() {
         if i > 0 {
             tokio::time::sleep(Duration::from_millis(ADDRESS_REQUEST_DELAY_MS)).await;
@@ -1116,6 +1301,7 @@ async fn poll_network(state: &AppState, network: Network) -> Result<()> {
 
         match transfers {
             Ok(transfers) => {
+                let mut processed = true;
                 for t in transfers {
                     if let Err(err) = process_detected_transfer(
                         state,
@@ -1128,8 +1314,12 @@ async fn poll_network(state: &AppState, network: Network) -> Result<()> {
                     )
                     .await
                     {
+                        processed = false;
                         error!("process transfer error for {}: {err:#}", address.id);
                     }
+                }
+                if processed {
+                    polled.push(address.id.clone());
                 }
             }
             Err(err) => {
@@ -1137,90 +1327,189 @@ async fn poll_network(state: &AppState, network: Network) -> Result<()> {
             }
         }
     }
+    expire_addresses_and_notify(state, network, Some(&polled)).await?;
     Ok(())
 }
+
+/// Claim up to ARGV[3] due members: each moves from the queue to the
+/// in-flight set (score = lease expiry). A member still leased elsewhere
+/// is left in the queue — it is never delivered twice concurrently.
+const CLAIM_SCRIPT: &str = r"
+local due = redis.call('ZRANGEBYSCORE', KEYS[1], '-inf', ARGV[1], 'LIMIT', 0, tonumber(ARGV[3]) * 4)
+local claimed = {}
+for _, member in ipairs(due) do
+  if #claimed >= tonumber(ARGV[3]) then break end
+  local lease = redis.call('ZSCORE', KEYS[2], member)
+  if (not lease) or tonumber(lease) <= tonumber(ARGV[1]) then
+    redis.call('ZREM', KEYS[1], member)
+    redis.call('ZADD', KEYS[2], ARGV[2], member)
+    table.insert(claimed, member)
+  end
+end
+return claimed
+";
+
+/// Release a claimed member; ARGV[2] (when not empty) reschedules it, keeping
+/// an earlier score if the member was re-enqueued meanwhile.
+const RELEASE_SCRIPT: &str = r"
+redis.call('ZREM', KEYS[2], ARGV[1])
+if ARGV[2] ~= '' then
+  local current = redis.call('ZSCORE', KEYS[1], ARGV[1])
+  if (not current) or tonumber(current) > tonumber(ARGV[2]) then
+    redis.call('ZADD', KEYS[1], ARGV[2], ARGV[1])
+  end
+end
+return 1
+";
+
+/// Members whose lease expired (worker died mid-delivery) go back to the
+/// queue, due now.
+const REQUEUE_EXPIRED_SCRIPT: &str = r"
+local expired = redis.call('ZRANGEBYSCORE', KEYS[2], '-inf', ARGV[1])
+for _, member in ipairs(expired) do
+  redis.call('ZREM', KEYS[2], member)
+  local current = redis.call('ZSCORE', KEYS[1], member)
+  if (not current) or tonumber(current) > tonumber(ARGV[1]) then
+    redis.call('ZADD', KEYS[1], ARGV[1], member)
+  end
+end
+return #expired
+";
 
 async fn webhook_loop(state: AppState) {
     if let Err(err) = drain_legacy_webhook_queue(&state).await {
         warn!("legacy webhook queue drain failed: {err:#}");
     }
 
-    let key = state.config.redis_key(WEBHOOK_ZSET_KEY);
-    let mut interval = tokio::time::interval(Duration::from_secs(2));
+    let queue = state.config.redis_key(WEBHOOK_ZSET_KEY);
+    let inflight = state.config.redis_key(WEBHOOK_INFLIGHT_KEY);
+    let claim = redis::Script::new(CLAIM_SCRIPT);
+    let release = redis::Script::new(RELEASE_SCRIPT);
+    let requeue = redis::Script::new(REQUEUE_EXPIRED_SCRIPT);
+    let mut interval = tokio::time::interval(Duration::from_secs(1));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         interval.tick().await;
         let mut redis = state.redis.clone();
         let now = chrono::Utc::now().timestamp();
 
-        let due: Vec<String> = match redis
-            .zrangebyscore_limit(&key, "-inf", now, 0, 1)
+        match requeue
+            .key(&queue)
+            .key(&inflight)
+            .arg(now)
+            .invoke_async::<i64>(&mut redis)
             .await
         {
-            Ok(v) => v,
+            Ok(0) => {}
+            Ok(count) => warn!("{count} webhook delivery lease(s) expired — re-queued"),
             Err(err) => {
-                error!("webhook queue read error: {err}");
+                error!("webhook lease recovery error: {err}");
+                continue;
+            }
+        }
+
+        let claimed: Vec<String> = match claim
+            .key(&queue)
+            .key(&inflight)
+            .arg(now)
+            .arg(now + WEBHOOK_CLAIM_LEASE_SECS)
+            .arg(WEBHOOK_DELIVERY_CONCURRENCY)
+            .invoke_async(&mut redis)
+            .await
+        {
+            Ok(claimed) => claimed,
+            Err(err) => {
+                error!("webhook queue claim error: {err}");
                 continue;
             }
         };
-        let Some(member) = due.into_iter().next() else {
-            continue;
-        };
-        if let Err(err) = redis.zrem::<_, _, ()>(&key, &member).await {
-            error!("webhook queue remove error: {err}");
+        if claimed.is_empty() {
             continue;
         }
 
-        let Some((event, subject_id, endpoint_id)) = decode_queue_member(&member) else {
-            // Legacy member (bare deposit id, pre-multi-endpoint deploy):
-            // fan it out to the current active PAID-subscribed endpoints.
+        let mut deliveries = tokio::task::JoinSet::new();
+        for member in claimed {
+            let state = state.clone();
+            deliveries.spawn(async move {
+                let next = process_queue_member(&state, &member).await;
+                (member, next)
+            });
+        }
+        while let Some(joined) = deliveries.join_next().await {
+            // A panicked task keeps its lease: the member comes back later.
+            let Ok((member, next)) = joined else { continue };
+            let next = next.map(|score| score.to_string()).unwrap_or_default();
+            if let Err(err) = release
+                .key(&queue)
+                .key(&inflight)
+                .arg(&member)
+                .arg(next)
+                .invoke_async::<i64>(&mut redis)
+                .await
+            {
+                error!("webhook queue release error for {member}: {err}");
+            }
+        }
+    }
+}
+
+/// Deliver one claimed member. Returns when to try it again (`None` = done).
+async fn process_queue_member(state: &AppState, member: &str) -> Option<i64> {
+    let retry_after = |secs: u64| chrono::Utc::now().timestamp() + secs as i64;
+    match classify_queue_member(member) {
+        QueueMember::Malformed => {
+            error!("Dropping malformed webhook queue member {member:?}");
+            None
+        }
+        QueueMember::Legacy(deposit_id) => {
+            // Pre-multi-endpoint member: fan it out to the current active
+            // PAID-subscribed endpoints (as decodable members).
             match state
                 .db
                 .active_webhook_endpoints_for_event(WebhookEventType::Paid)
                 .await
             {
-                Ok(endpoints) if endpoints.is_empty() => {
-                    warn!("Dropping legacy webhook queue member {member} — no active endpoints");
-                }
                 Ok(endpoints) => {
-                    info!("Fanning out legacy webhook queue member {member} to {} endpoint(s)", endpoints.len());
+                    if endpoints.is_empty() {
+                        warn!("Dropping legacy webhook queue member {deposit_id} — no active endpoints");
+                    }
                     for endpoint in endpoints {
                         if let Err(err) =
-                            enqueue_webhook(&state, WebhookEventType::Paid, &member, &endpoint.id)
-                                .await
+                            enqueue_webhook(state, WebhookEventType::Paid, deposit_id, &endpoint.id).await
                         {
-                            error!("legacy member fan-out error for {member}: {err:#}");
+                            error!("legacy member fan-out error for {deposit_id}: {err:#}");
                         }
                     }
+                    None
                 }
                 Err(err) => {
-                    warn!("legacy member fan-out read error for {member}, rescheduling: {err:#}");
-                    let score = now + WEBHOOK_RETRY_DELAYS_SECS[0] as i64;
-                    let _: Result<(), _> = redis.zadd(&key, &member, score).await;
+                    warn!("legacy member fan-out read error for {deposit_id}, rescheduling: {err:#}");
+                    Some(retry_after(WEBHOOK_RETRY_DELAYS_SECS[0]))
                 }
-            }
-            continue;
-        };
-
-        match deliver_webhook(&state, event, subject_id, endpoint_id).await {
-            Ok(DeliveryOutcome::RetryAt { attempts }) => {
-                if let Some(delay) = next_retry_delay_secs(attempts) {
-                    let score = now + delay as i64;
-                    if let Err(err) = redis.zadd::<_, _, _, ()>(&key, &member, score).await {
-                        error!("webhook retry schedule error for {member}: {err}");
-                    } else {
-                        info!("Webhook attempt {} for {} {subject_id} (endpoint {endpoint_id}) rescheduled in {delay}s", attempts + 1, event.as_api());
-                    }
-                }
-            }
-            Ok(_) => {}
-            Err(err) => {
-                // Infrastructure error (DB unreachable, row missing): retry
-                // after the first backoff gap rather than spinning.
-                warn!("webhook delivery error for {member}, rescheduling: {err:#}");
-                let score = now + WEBHOOK_RETRY_DELAYS_SECS[0] as i64;
-                let _: Result<(), _> = redis.zadd(&key, &member, score).await;
             }
         }
+        QueueMember::Delivery {
+            event,
+            subject_id,
+            endpoint_id,
+        } => match deliver_webhook(state, event, subject_id, endpoint_id).await {
+            Ok(DeliveryOutcome::RetryAt { attempts }) => {
+                let delay = next_retry_delay_secs(attempts)?;
+                info!(
+                    "Webhook attempt {} for {} {subject_id} (endpoint {endpoint_id}) rescheduled in {delay}s",
+                    attempts + 1,
+                    event.as_api()
+                );
+                Some(retry_after(delay))
+            }
+            Ok(_) => None,
+            Err(err) => {
+                // Infrastructure error (DB unreachable…): retry after the
+                // first backoff gap rather than spinning.
+                warn!("webhook delivery error for {member}, rescheduling: {err:#}");
+                Some(retry_after(WEBHOOK_RETRY_DELAYS_SECS[0]))
+            }
+        },
     }
 }
 
@@ -1281,8 +1570,9 @@ pub fn token_totals<'a>(entries: impl IntoIterator<Item = (&'a str, &'a str)>) -
     for (token, amount_raw) in entries {
         let raw = amount_raw.parse::<u128>().unwrap_or(0);
         match Token::parse_api(token) {
-            Ok(Token::Usdt) => totals.usdt_raw += raw,
-            Ok(Token::Btc) => totals.btc_raw += raw,
+            // A hostile provider must not overflow the totals.
+            Ok(Token::Usdt) => totals.usdt_raw = totals.usdt_raw.saturating_add(raw),
+            Ok(Token::Btc) => totals.btc_raw = totals.btc_raw.saturating_add(raw),
             Err(_) => {}
         }
     }
@@ -1361,7 +1651,7 @@ async fn sync_network(state: &AppState, network: Network) -> Result<NetworkWalle
         }
         let address = state.wallet.derive_address(network, index as u32)?;
         match fetch_address_balance(state, network, &address).await {
-            Ok(bal) => total_raw += bal,
+            Ok(bal) => total_raw = total_raw.saturating_add(bal),
             Err(err) => warn!(
                 "Failed to fetch wallet balance for {network_name} index {index}: {err:#}"
             ),
@@ -1445,7 +1735,53 @@ pub async fn get_cached_wallet_balances(state: &AppState) -> Result<WalletBalanc
     })
 }
 
-pub async fn get_live_balances(state: &AppState) -> Result<BalancesResponse> {
+/// Live balances of every issued address. Querying all of them costs one
+/// provider call per address, so the result is cached for
+/// `LIVE_BALANCES_CACHE_SECS` and recomputed in the background by a single
+/// caller (Redis lock). `None` = being computed, ask again shortly.
+pub async fn get_live_balances(state: &AppState) -> Result<Option<BalancesResponse>> {
+    let cache_key = state.config.redis_key(LIVE_BALANCES_KEY);
+    let lock_key = state.config.redis_key(LIVE_BALANCES_LOCK_KEY);
+    let mut redis = state.redis.clone();
+    let cached: Option<String> = redis.get(&cache_key).await?;
+    if let Some(cached) = cached {
+        return Ok(Some(serde_json::from_str(&cached)?));
+    }
+
+    // The lock outlives any sane computation; it is released when done.
+    let acquired: Option<String> = redis::cmd("SET")
+        .arg(&lock_key)
+        .arg(1)
+        .arg("NX")
+        .arg("EX")
+        .arg(LIVE_BALANCES_CACHE_SECS * 4)
+        .query_async(&mut redis)
+        .await?;
+    if acquired.is_some() {
+        let state = state.clone();
+        tokio::spawn(async move {
+            let mut redis = state.redis.clone();
+            match compute_live_balances(&state).await {
+                Ok(balances) => match serde_json::to_string(&balances) {
+                    Ok(json) => {
+                        if let Err(err) = redis
+                            .set_ex::<_, _, ()>(&cache_key, json, LIVE_BALANCES_CACHE_SECS)
+                            .await
+                        {
+                            error!("live balances cache write failed: {err}");
+                        }
+                    }
+                    Err(err) => error!("live balances serialization failed: {err}"),
+                },
+                Err(err) => error!("live balances computation failed: {err:#}"),
+            }
+            let _: Result<(), _> = redis.del(&lock_key).await;
+        });
+    }
+    Ok(None)
+}
+
+async fn compute_live_balances(state: &AppState) -> Result<BalancesResponse> {
     let mut networks = Vec::new();
     for network in CHAIN_NETWORKS {
         networks.push(live_network_balance(state, network).await?);
@@ -1457,6 +1793,7 @@ pub async fn get_live_balances(state: &AppState) -> Result<BalancesResponse> {
         total_usdt: totals.total_usdt(),
         total_btc: totals.total_btc(),
         networks,
+        updated_at: chrono::Utc::now().to_rfc3339(),
     })
 }
 
@@ -1477,9 +1814,12 @@ async fn live_network_balance(state: &AppState, network: Network) -> Result<Netw
 
     let addresses = state.db.addresses_for_network(network).await?;
     let mut total_raw: u128 = 0;
-    for address in &addresses {
+    for (i, address) in addresses.iter().enumerate() {
+        if i > 0 {
+            tokio::time::sleep(Duration::from_millis(ADDRESS_REQUEST_DELAY_MS)).await;
+        }
         match fetch_address_balance(state, network, address).await {
-            Ok(bal) => total_raw += bal,
+            Ok(bal) => total_raw = total_raw.saturating_add(bal),
             Err(err) => warn!("Failed to fetch {network_name} balance for {address}: {err:#}"),
         }
     }
@@ -1558,15 +1898,17 @@ pub struct WalletBalancesResponse {
     pub updated_at: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct BalancesResponse {
     pub total_usdt: String,
     /// Sum of the bitcoin + lightning entries; never folded into USDT.
     pub total_btc: String,
     pub networks: Vec<NetworkBalance>,
+    /// When this (cached) figure was computed.
+    pub updated_at: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct NetworkBalance {
     pub network: String,
     pub token: String,
@@ -1595,6 +1937,7 @@ mod tests {
             status: status.as_db().into(),
             expires_at: now,
             metadata: serde_json::json!({}),
+            api_key_id: None,
             created_at: now,
             updated_at: now,
         }
@@ -1681,7 +2024,7 @@ mod tests {
         let row = invoice_row(Network::Lightning, DepositAddressStatus::Pending);
         let from_event = lightning_transfer(&settled("pay-abc"), Some(&row)).unwrap();
         let from_poll =
-            reconciled_transfers(&[settled("pay-abc"), settled("pay-abc")], &[row.clone()]);
+            reconciled_transfers(&[settled("pay-abc"), settled("pay-abc")], std::slice::from_ref(&row));
         assert_eq!(from_poll.len(), 2);
         for transfer in from_poll {
             assert_eq!(
@@ -1848,6 +2191,24 @@ mod tests {
                 decode_queue_member(&member),
                 Some((event, "addr-123", "ep-456"))
             );
+        }
+    }
+
+    #[test]
+    fn queue_members_are_classified_without_looping_on_garbage() {
+        assert_eq!(
+            classify_queue_member("dep-1|ep-1"),
+            QueueMember::Delivery {
+                event: WebhookEventType::Paid,
+                subject_id: "dep-1",
+                endpoint_id: "ep-1"
+            }
+        );
+        assert_eq!(classify_queue_member("a1b2c3-uuid"), QueueMember::Legacy("a1b2c3-uuid"));
+        // Anything with a separator that does not decode is dropped, never
+        // fanned out again (that re-enqueued an undecodable member forever).
+        for member in ["", "|", "dep|", "BOGUS|addr|ep", "a|b|c|d", "with space"] {
+            assert_eq!(classify_queue_member(member), QueueMember::Malformed, "{member:?}");
         }
     }
 
