@@ -5,17 +5,20 @@ import {
   useQueryClient,
 } from "@tanstack/react-query"
 
-import { api } from "@/lib/api"
+import { api, apiResponse } from "@/lib/api"
+import { useAuth } from "@/lib/auth"
 import type {
   AdminStats,
   ApiKey,
   AppSettings,
   AppSettingsUpdate,
+  AuditLogEntry,
   CreatedApiKey,
   DepositAddress,
   DepositAddressDetail,
   LightningPayment,
   LightningPaymentsPage,
+  LightningQuote,
   Paginated,
   Staff,
   TotpSetup,
@@ -111,7 +114,7 @@ export function useLiveBalances() {
   })
 }
 
-/** The whole Lightning wallet history, newest first. */
+/** The whole Lightning wallet history, newest first (admin only). */
 export function useLightningPayments(page: { limit: number; offset: number }) {
   return useQuery({
     queryKey: ["lightning-payments", page],
@@ -120,24 +123,40 @@ export function useLightningPayments(page: { limit: number; offset: number }) {
   })
 }
 
-export interface PayoutPayload {
+export interface PayoutParams {
   ln_address: string
   /** Integer sats string; fees come on top. */
   amount_sats: string
   comment?: string
-  /** UUID — a replay with the same key never pays twice. */
+}
+
+/** Fee quote for a payout — no TOTP, nothing is sent (admin only). */
+export function useLightningQuote() {
+  return useMutation({
+    mutationFn: (params: PayoutParams) =>
+      api<LightningQuote>("/lightning/payments/quote", { body: params }),
+  })
+}
+
+export interface PayoutPayload extends PayoutParams {
+  /** Step-up code — single use. */
+  totp_code: string
+  /** UUID — a replay with the same key and parameters never pays twice. */
   idempotencyKey: string
 }
 
-/** Pay a Lightning address from the wallet (admin only). */
+/** Pay a Lightning address from the wallet (admin only). `replayed` = the
+ *  API answered 200 with the payment an earlier request already made. */
 export function usePayLightningAddress() {
   const queryClient = useQueryClient()
   return useMutation({
-    mutationFn: ({ idempotencyKey, ...body }: PayoutPayload) =>
-      api<LightningPayment>("/lightning/payments", {
+    mutationFn: async ({ idempotencyKey, ...body }: PayoutPayload) => {
+      const { status, data } = await apiResponse<LightningPayment>("/lightning/payments", {
         body,
         headers: { "Idempotency-Key": idempotencyKey },
-      }),
+      })
+      return { payment: data, replayed: status === 200 }
+    },
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["lightning-payments"] })
       queryClient.invalidateQueries({ queryKey: ["wallet-balances"] })
@@ -279,12 +298,9 @@ export function useCreateWebhookEndpoint() {
     }: {
       url: string
       events: WebhookEventType[]
-      /** Optional signing secret; omitted = unsigned deliveries. */
-      secret?: string
-    }) =>
-      api<WebhookEndpoint>("/webhook-endpoints", {
-        body: { url, events, ...(secret ? { secret } : {}) },
-      }),
+      /** Signing secret (16–128 printable chars) — required. */
+      secret: string
+    }) => api<WebhookEndpoint>("/webhook-endpoints", { body: { url, events, secret } }),
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ["webhook-endpoints"] }),
   })
 }
@@ -298,7 +314,7 @@ export function useUpdateWebhookEndpoint() {
     }: {
       id: string
       events?: WebhookEventType[]
-      /** Non-empty = rotate the signing secret; empty string = remove it. */
+      /** Rotates the signing secret — it can no longer be removed. */
       secret?: string
     }) =>
       api<WebhookEndpoint>(`/webhook-endpoints/${id}`, {
@@ -334,20 +350,26 @@ export function useApiKeys() {
 export function useCreateApiKey() {
   const queryClient = useQueryClient()
   return useMutation({
-    mutationFn: (payload: { name: string; expires_in_days: number | null; can_send: boolean }) =>
-      api<CreatedApiKey>("/api-keys", { body: payload }),
+    mutationFn: (payload: {
+      name: string
+      /** Required (30/90/180/365) when `can_send`. */
+      expires_in_days: number | null
+      can_send: boolean
+      /** Step-up code — required when `can_send`. */
+      totp_code?: string
+    }) => api<CreatedApiKey>("/api-keys", { body: payload }),
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ["api-keys"] }),
   })
 }
 
-/** Grant or withdraw a key's Lightning payout permission. */
+/** Grant (step-up code required) or withdraw a key's Lightning payout permission. */
 export function useUpdateApiKey() {
   const queryClient = useQueryClient()
   return useMutation({
-    mutationFn: ({ id, can_send }: { id: string; can_send: boolean }) =>
+    mutationFn: ({ id, ...body }: { id: string; can_send: boolean; totp_code?: string }) =>
       api<{ id: string; can_send: boolean }>(`/api-keys/${id}`, {
         method: "PATCH",
-        body: { can_send },
+        body,
       }),
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ["api-keys"] }),
   })
@@ -374,6 +396,8 @@ export interface CreateStaffPayload {
   first_name: string
   last_name: string
   role: string
+  /** Step-up code. */
+  totp_code: string
 }
 
 export function useCreateStaff() {
@@ -391,14 +415,19 @@ export interface UpdateStaffPayload {
   role?: string
   is_active?: boolean
   password?: string
+  /** Step-up code — required when role, is_active or password is present. */
+  totp_code?: string
 }
 
 export function useUpdateStaff() {
   const queryClient = useQueryClient()
+  const { syncStaff } = useAuth()
   return useMutation({
     mutationFn: ({ id, ...payload }: UpdateStaffPayload) =>
       api<Staff>(`/staff/${id}`, { method: "PATCH", body: payload }),
-    onSuccess: () => {
+    onSuccess: (staff) => {
+      // No-op unless the member edited is the signed-in one.
+      syncStaff(staff)
       queryClient.invalidateQueries({ queryKey: ["staff"] })
       // Deactivating a member revokes every API key they created.
       queryClient.invalidateQueries({ queryKey: ["api-keys"] })
@@ -413,17 +442,21 @@ export function useMe() {
   })
 }
 
+/** Starts a 2FA enrollment — re-confirms the password first. */
 export function useTotpSetup() {
   return useMutation({
-    mutationFn: () => api<TotpSetup>("/auth/totp/setup", { method: "POST" }),
+    mutationFn: (password: string) => api<TotpSetup>("/auth/totp/setup", { body: { password } }),
   })
 }
 
 export function useEnableTotp() {
   const queryClient = useQueryClient()
+  const { syncStaff } = useAuth()
   return useMutation({
     mutationFn: (code: string) => api<Staff>("/auth/totp/enable", { body: { code } }),
-    onSuccess: () => {
+    onSuccess: (staff) => {
+      // Step-up fields read 2FA state from the signed-in profile.
+      syncStaff(staff)
       queryClient.invalidateQueries({ queryKey: ["me"] })
       queryClient.invalidateQueries({ queryKey: ["staff"] })
     },
@@ -432,9 +465,12 @@ export function useEnableTotp() {
 
 export function useDisableTotp() {
   const queryClient = useQueryClient()
+  const { syncStaff } = useAuth()
   return useMutation({
-    mutationFn: (code: string) => api<Staff>("/auth/totp/disable", { body: { code } }),
-    onSuccess: () => {
+    mutationFn: (payload: { password: string; code: string }) =>
+      api<Staff>("/auth/totp/disable", { body: payload }),
+    onSuccess: (staff) => {
+      syncStaff(staff)
       queryClient.invalidateQueries({ queryKey: ["me"] })
       queryClient.invalidateQueries({ queryKey: ["staff"] })
     },
@@ -444,7 +480,23 @@ export function useDisableTotp() {
 export function useResetStaffTotp() {
   const queryClient = useQueryClient()
   return useMutation({
-    mutationFn: (id: string) => api<Staff>(`/staff/${id}/totp/reset`, { method: "POST" }),
+    mutationFn: ({ id, totp_code }: { id: string; totp_code: string }) =>
+      api<Staff>(`/staff/${id}/totp/reset`, { body: { totp_code } }),
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ["staff"] }),
+  })
+}
+
+export interface AuditLogFilters {
+  /** Free text, e.g. `payout.sent`. */
+  action?: string
+  limit: number
+  offset: number
+}
+
+export function useAuditLog(filters: AuditLogFilters) {
+  return useQuery({
+    queryKey: ["audit-log", filters],
+    queryFn: () => api<Paginated<AuditLogEntry>>(`/audit-log${listParams({ ...filters })}`),
+    placeholderData: keepPreviousData,
   })
 }

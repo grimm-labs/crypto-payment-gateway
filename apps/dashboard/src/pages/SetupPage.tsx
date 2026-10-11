@@ -14,14 +14,18 @@ import {
 } from "@/components/ui/card"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
+import { ApiError } from "@/lib/api"
 import { useAuth } from "@/lib/auth"
+import { errorMessage } from "@/lib/errors"
+import { passwordSchema } from "@/lib/validation"
 
 const schema = z
   .object({
+    setup_token: z.string().trim().min(1, "Setup token is required"),
     first_name: z.string().trim().min(1, "First name is required"),
     last_name: z.string().trim().min(1, "Last name is required"),
     email: z.string().trim().email("Invalid email address"),
-    password: z.string().min(8, "At least 8 characters"),
+    password: passwordSchema,
     confirm_password: z.string(),
   })
   .refine((data) => data.password === data.confirm_password, {
@@ -43,6 +47,7 @@ export function SetupPage() {
   async function onSubmit(values: FormValues) {
     try {
       await completeSetup({
+        setup_token: values.setup_token,
         email: values.email,
         password: values.password,
         first_name: values.first_name,
@@ -51,7 +56,11 @@ export function SetupPage() {
       toast.success("Admin account created — welcome!")
       navigate("/", { replace: true })
     } catch (error) {
-      toast.error(error instanceof Error ? error.message : "Setup failed")
+      toast.error(errorMessage(error, "Setup failed"))
+      // 409: another admin completed the setup meanwhile — sign in instead.
+      if (error instanceof ApiError && error.statusCode === 409) {
+        navigate("/login", { replace: true })
+      }
     }
   }
 
@@ -69,6 +78,21 @@ export function SetupPage() {
         </CardHeader>
         <CardContent>
           <form onSubmit={form.handleSubmit(onSubmit)} className="space-y-4">
+            <div className="space-y-2">
+              <Label htmlFor="setup_token">Setup token</Label>
+              <Input
+                id="setup_token"
+                className="font-mono text-xs"
+                autoComplete="off"
+                spellCheck={false}
+                {...form.register("setup_token")}
+              />
+              <FieldError message={errors.setup_token?.message} />
+              <p className="text-xs text-muted-foreground">
+                Printed in the API logs at boot, or set with the{" "}
+                <code>SETUP_TOKEN</code> environment variable.
+              </p>
+            </div>
             <div className="grid grid-cols-2 gap-4">
               <div className="space-y-2">
                 <Label htmlFor="first_name">First name</Label>
@@ -95,6 +119,9 @@ export function SetupPage() {
                 {...form.register("password")}
               />
               <FieldError message={errors.password?.message} />
+              {!errors.password && (
+                <p className="text-xs text-muted-foreground">12 to 128 characters.</p>
+              )}
             </div>
             <div className="space-y-2">
               <Label htmlFor="confirm_password">Confirm password</Label>

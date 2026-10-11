@@ -5,6 +5,7 @@ import {
   KeyRoundIcon,
   LayoutDashboardIcon,
   ReceiptTextIcon,
+  ScrollTextIcon,
   SendIcon,
   SettingsIcon,
   ShieldCheckIcon,
@@ -30,14 +31,16 @@ import {
   SidebarMenuItem,
 } from "@/components/ui/sidebar"
 import { useAuth } from "@/lib/auth"
+import { ACCOUNT_SECURITY_PATH } from "@/lib/errors"
 
-const NAV_MAIN: NavItem[] = [
+const NAV_MAIN: Array<NavItem & { adminOnly?: boolean }> = [
   { title: "Overview", url: "/", icon: <LayoutDashboardIcon /> },
   { title: "Payments", url: "/payments", icon: <ReceiptTextIcon /> },
   { title: "Deliveries", url: "/deliveries", icon: <SendIcon /> },
   { title: "Traffic", url: "/traffic", icon: <ActivityIcon /> },
   { title: "Wallets", url: "/wallets", icon: <WalletIcon /> },
-  { title: "Lightning", url: "/lightning", icon: <ZapIcon /> },
+  // The wallet history is admin-only on the API.
+  { title: "Lightning", url: "/lightning", icon: <ZapIcon />, adminOnly: true },
 ]
 
 const NAV_ADMIN: NavItem[] = [
@@ -45,16 +48,19 @@ const NAV_ADMIN: NavItem[] = [
   { title: "Webhooks", url: "/webhooks", icon: <WebhookIcon /> },
   { title: "Staff", url: "/staff", icon: <UsersIcon /> },
   { title: "Settings", url: "/settings", icon: <SettingsIcon /> },
+  { title: "Audit log", url: "/audit-log", icon: <ScrollTextIcon /> },
 ]
 
 // Visible to every role — each staff member manages their own account here.
 const NAV_ACCOUNT: NavItem[] = [
-  { title: "2FA", url: "/account/2fa", icon: <ShieldCheckIcon /> },
+  { title: "Security", url: ACCOUNT_SECURITY_PATH, icon: <ShieldCheckIcon /> },
 ]
 
 export function AppSidebar({ ...props }: React.ComponentProps<typeof Sidebar>) {
   const { staff } = useAuth()
   const location = useLocation()
+  const isAdmin = staff?.role === "admin"
+  const mainItems = NAV_MAIN.filter((item) => isAdmin || !item.adminOnly)
 
   return (
     <Sidebar collapsible="offcanvas" {...props}>
@@ -74,8 +80,8 @@ export function AppSidebar({ ...props }: React.ComponentProps<typeof Sidebar>) {
         </SidebarMenu>
       </SidebarHeader>
       <SidebarContent>
-        <NavMain items={NAV_MAIN} />
-        {staff?.role === "admin" && (
+        <NavMain items={mainItems} />
+        {isAdmin && (
           <SidebarGroup>
             <SidebarGroupLabel>Administration</SidebarGroupLabel>
             <SidebarGroupContent>

@@ -60,8 +60,8 @@ export function LoginForm({
       await loginTotp(mfaToken, values.code)
       navigate("/", { replace: true })
     } catch (error) {
-      // 401 here covers expired challenges and the 5-wrong-codes limit —
-      // "Back to sign in" restarts from the password step.
+      // 401 here covers expired challenges and the 5-wrong-codes limit,
+      // 429 the rate limit — "Back to sign in" restarts from the password step.
       toast.error(error instanceof Error ? error.message : "Verification failed")
     }
   }

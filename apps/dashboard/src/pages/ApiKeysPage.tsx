@@ -5,6 +5,7 @@ import { toast } from "sonner"
 import { CopyButton } from "@/components/shared/CopyButton"
 import { QueryError } from "@/components/shared/QueryError"
 import { StatusBadge } from "@/components/shared/StatusBadge"
+import { StepUpCodeField, StepUpDialog } from "@/components/shared/StepUpCodeField"
 import {
   AlertDialog,
   AlertDialogAction,
@@ -52,6 +53,7 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table"
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip"
 import {
   useApiKeys,
   useCreateApiKey,
@@ -60,24 +62,44 @@ import {
   useUpdateApiKey,
   useUpdateSettings,
 } from "@/hooks/queries"
+import { toastError } from "@/lib/errors"
 import { formatDate } from "@/lib/format"
-import type { CreatedApiKey } from "@/lib/types"
+import type { ApiKey, CreatedApiKey } from "@/lib/types"
+import { isTotpCode } from "@/lib/validation"
+
+const NO_EXPIRY_SEND_TOOLTIP = "Only keys with an expiry can be allowed to send payouts"
 
 export function ApiKeysPage() {
   const keys = useApiKeys()
   const revokeKey = useRevokeApiKey()
   const updateKey = useUpdateApiKey()
+  // Granting the payout permission needs a step-up code: confirm in a
+  // dialog. The key stays set while the dialog animates out.
+  const [granting, setGranting] = useState<ApiKey | null>(null)
+  const [grantOpen, setGrantOpen] = useState(false)
 
-  async function handleCanSend(id: string, name: string, canSend: boolean) {
+  function openGrant(key: ApiKey) {
+    setGranting(key)
+    setGrantOpen(true)
+  }
+
+  async function grantCanSend(key: ApiKey, code: string) {
     try {
-      await updateKey.mutateAsync({ id, can_send: canSend })
-      toast.success(
-        canSend
-          ? `“${name}” can now send Lightning payments`
-          : `“${name}” can no longer send payments`,
-      )
+      await updateKey.mutateAsync({ id: key.id, can_send: true, totp_code: code })
+      toast.success(`“${key.name}” can now send Lightning payments`)
+      setGrantOpen(false)
     } catch (error) {
-      toast.error(error instanceof Error ? error.message : "Update failed")
+      toastError(error, "Update failed")
+    }
+  }
+
+  // Withdrawing the permission needs no code.
+  async function withdrawCanSend(key: ApiKey) {
+    try {
+      await updateKey.mutateAsync({ id: key.id, can_send: false })
+      toast.success(`“${key.name}” can no longer send payments`)
+    } catch (error) {
+      toastError(error, "Update failed")
     }
   }
 
@@ -86,7 +108,7 @@ export function ApiKeysPage() {
       await revokeKey.mutateAsync(id)
       toast.success("API key revoked")
     } catch (error) {
-      toast.error(error instanceof Error ? error.message : "Revocation failed")
+      toastError(error, "Revocation failed")
     }
   }
 
@@ -149,11 +171,11 @@ export function ApiKeysPage() {
                     {key.expires_at ? formatDate(key.expires_at) : "Never"}
                   </TableCell>
                   <TableCell>
-                    <Switch
-                      checked={key.can_send}
-                      disabled={key.status !== "active" || updateKey.isPending}
-                      aria-label={`Allow ${key.name} to send Lightning payments`}
-                      onCheckedChange={(checked) => handleCanSend(key.id, key.name, checked)}
+                    <CanSendSwitch
+                      apiKey={key}
+                      pending={updateKey.isPending}
+                      onGrant={() => openGrant(key)}
+                      onWithdraw={() => withdrawCanSend(key)}
                     />
                   </TableCell>
                   <TableCell className="text-muted-foreground">
@@ -198,8 +220,54 @@ export function ApiKeysPage() {
         </div>
       )}
 
+      <StepUpDialog
+        open={grantOpen}
+        onOpenChange={setGrantOpen}
+        title={`Allow “${granting?.name ?? ""}” to send payouts?`}
+        description="The key will be able to pay any Lightning address from the wallet, within the payout limits set in Settings, until it expires or the permission is withdrawn."
+        confirmLabel="Allow payouts"
+        pending={updateKey.isPending}
+        onConfirm={(code) => (granting ? grantCanSend(granting, code) : Promise.resolve())}
+      />
+
       <ApiKeyPrefixCard />
     </div>
+  )
+}
+
+function CanSendSwitch({
+  apiKey,
+  pending,
+  onGrant,
+  onWithdraw,
+}: {
+  apiKey: ApiKey
+  pending: boolean
+  onGrant: () => void
+  onWithdraw: () => void
+}) {
+  // A key without expiry may still have its (legacy) permission withdrawn,
+  // never granted.
+  const blocked = !apiKey.can_send && apiKey.expires_at === null
+  const toggle = (
+    <Switch
+      checked={apiKey.can_send}
+      disabled={apiKey.status !== "active" || pending || blocked}
+      aria-label={`Allow ${apiKey.name} to send Lightning payments`}
+      onCheckedChange={(checked) => (checked ? onGrant() : onWithdraw())}
+    />
+  )
+  if (!blocked || apiKey.status !== "active") return toggle
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>
+        {/* Disabled controls swallow pointer events: the wrapper carries the tooltip. */}
+        <span tabIndex={0} className="inline-flex">
+          {toggle}
+        </span>
+      </TooltipTrigger>
+      <TooltipContent>{NO_EXPIRY_SEND_TOOLTIP}</TooltipContent>
+    </Tooltip>
   )
 }
 
@@ -225,7 +293,7 @@ function ApiKeyPrefixCard() {
           : "API key prefix removed — new keys have no tag",
       )
     } catch (error) {
-      toast.error(error instanceof Error ? error.message : "Update failed")
+      toastError(error, "Update failed")
     }
   }
 
@@ -281,29 +349,47 @@ const EXPIRY_CHOICES = [
   { value: "365", label: "1 year", days: 365 },
 ] as const
 
+/** Expiry preselected when "can send" is ticked on a never-expiring draft. */
+const DEFAULT_SEND_EXPIRY = "30"
+
 function CreateApiKeyDialog() {
   const [open, setOpen] = useState(false)
   const [name, setName] = useState("")
   const [expiry, setExpiry] = useState<string>("never")
   const [canSend, setCanSend] = useState(false)
+  const [code, setCode] = useState("")
   const [created, setCreated] = useState<CreatedApiKey | null>(null)
   const createKey = useCreateApiKey()
+
+  const choice = EXPIRY_CHOICES.find((c) => c.value === expiry)
+  // A key allowed to send payouts must expire and needs a step-up code.
+  const ready =
+    name.trim() !== "" && (!canSend || ((choice?.days ?? null) !== null && isTotpCode(code)))
+
+  function handleCanSend(checked: boolean) {
+    setCanSend(checked)
+    setCode("")
+    if (checked && expiry === "never") setExpiry(DEFAULT_SEND_EXPIRY)
+  }
 
   async function handleCreate() {
     if (!name.trim()) {
       toast.error("Name is required")
       return
     }
-    const choice = EXPIRY_CHOICES.find((c) => c.value === expiry)
+    if (!ready) return
     try {
       const key = await createKey.mutateAsync({
         name: name.trim(),
         expires_in_days: choice?.days ?? null,
         can_send: canSend,
+        ...(canSend ? { totp_code: code.trim() } : {}),
       })
       setCreated(key)
     } catch (error) {
-      toast.error(error instanceof Error ? error.message : "Creation failed")
+      toastError(error, "Creation failed")
+    } finally {
+      setCode("")
     }
   }
 
@@ -314,6 +400,7 @@ function CreateApiKeyDialog() {
       setName("")
       setExpiry("never")
       setCanSend(false)
+      setCode("")
     }
   }
 
@@ -381,30 +468,40 @@ function CreateApiKeyDialog() {
                     <SelectValue />
                   </SelectTrigger>
                   <SelectContent>
-                    {EXPIRY_CHOICES.map((choice) => (
-                      <SelectItem key={choice.value} value={choice.value}>
-                        {choice.label}
+                    {EXPIRY_CHOICES.map((option) => (
+                      <SelectItem
+                        key={option.value}
+                        value={option.value}
+                        disabled={canSend && option.days === null}
+                      >
+                        {option.label}
                       </SelectItem>
                     ))}
                   </SelectContent>
                 </Select>
                 <p className="text-xs text-muted-foreground">
-                  An expired key stops working immediately and cannot be reactivated.
+                  {canSend
+                    ? "A key allowed to send payouts must expire."
+                    : "An expired key stops working immediately and cannot be reactivated."}
                 </p>
               </div>
               <div className="flex items-start gap-3">
-                <Switch id="key-can-send" checked={canSend} onCheckedChange={setCanSend} />
+                <Switch id="key-can-send" checked={canSend} onCheckedChange={handleCanSend} />
                 <div className="grid gap-0.5 leading-none">
                   <Label htmlFor="key-can-send">Can send Lightning payments</Label>
                   <p className="text-xs text-muted-foreground">
-                    Lets this key pay any Lightning address from the wallet, with no
-                    amount limit. Leave off unless the integration needs it.
+                    Lets this key pay any Lightning address from the wallet, within
+                    the payout limits set in Settings. Leave off unless the
+                    integration needs it.
                   </p>
                 </div>
               </div>
+              {canSend && (
+                <StepUpCodeField id="key-create-code" value={code} onChange={setCode} />
+              )}
             </div>
             <DialogFooter>
-              <Button onClick={handleCreate} disabled={createKey.isPending}>
+              <Button onClick={handleCreate} disabled={!ready || createKey.isPending}>
                 {createKey.isPending ? "Creating…" : "Create key"}
               </Button>
             </DialogFooter>

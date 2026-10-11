@@ -9,10 +9,12 @@ const TITLES: Array<[string, string]> = [
   ["/traffic", "Traffic"],
   ["/webhooks", "Webhooks"],
   ["/wallets", "Wallets"],
+  ["/lightning", "Lightning"],
   ["/api-keys", "API Keys"],
   ["/staff", "Staff"],
   ["/settings", "Settings"],
-  ["/account", "Account"],
+  ["/audit-log", "Audit log"],
+  ["/account", "Account security"],
 ]
 
 export function SiteHeader() {

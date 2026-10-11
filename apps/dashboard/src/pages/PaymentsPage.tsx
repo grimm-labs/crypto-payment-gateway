@@ -39,6 +39,7 @@ import {
   TableRow,
 } from "@/components/ui/table"
 import { useCreatePayment, usePayments } from "@/hooks/queries"
+import { toastError } from "@/lib/errors"
 import {
   formatAmount,
   formatDate,
@@ -185,6 +186,9 @@ export function PaymentsPage() {
 /** Total bitcoin supply, in sats. */
 const MAX_SATS = "2100000000000000"
 const DESCRIPTION_MAX_CHARS = 128
+/** API bounds for an explicit expiry, relative to now. */
+const EXPIRY_MIN_MS = 60_000
+const EXPIRY_MAX_MS = 1440 * 60_000
 
 function isValidSats(value: string): boolean {
   if (!/^[1-9]\d*$/.test(value)) return false
@@ -225,12 +229,26 @@ const createSchema = z
           message: "Whole number of sats, at least 1",
         })
       }
-    } else if (!/^\d+(\.\d{1,6})?$/.test(values.expected_amount)) {
+    } else if (
+      !/^\d+(\.\d{1,6})?$/.test(values.expected_amount) ||
+      // String check, no float parsing: some non-zero digit.
+      !/[1-9]/.test(values.expected_amount)
+    ) {
       ctx.addIssue({
         code: z.ZodIssueCode.custom,
         path: ["expected_amount"],
         message: "Positive amount, up to 6 decimals",
       })
+    }
+    if (values.expires_at) {
+      const delta = new Date(values.expires_at).getTime() - Date.now()
+      if (Number.isNaN(delta) || delta < EXPIRY_MIN_MS || delta > EXPIRY_MAX_MS) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ["expires_at"],
+          message: "Between 1 minute and 24 hours from now",
+        })
+      }
     }
     if ((values.description?.length ?? 0) > DESCRIPTION_MAX_CHARS) {
       ctx.addIssue({
@@ -280,7 +298,7 @@ function CreatePaymentDialog() {
       setCreated(payment)
       toast.success("Deposit address created")
     } catch (error) {
-      toast.error(error instanceof Error ? error.message : "Creation failed")
+      toastError(error, "Creation failed")
     }
   }
 
@@ -414,9 +432,14 @@ function CreatePaymentDialog() {
               <div className="space-y-2">
                 <Label htmlFor="expires_at">Expires at (optional)</Label>
                 <Input id="expires_at" type="datetime-local" {...form.register("expires_at")} />
-                <p className="text-xs text-muted-foreground">
-                  Defaults to the configured expiry (30 min).
-                </p>
+                {errors.expires_at ? (
+                  <p className="text-xs text-destructive">{errors.expires_at.message}</p>
+                ) : (
+                  <p className="text-xs text-muted-foreground">
+                    Between 1 minute and 24 hours from now. Defaults to the
+                    configured payment expiry.
+                  </p>
+                )}
               </div>
               <div className="space-y-2">
                 <Label htmlFor="metadata">Metadata JSON (optional)</Label>

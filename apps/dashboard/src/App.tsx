@@ -4,6 +4,7 @@ import { AppLayout } from "@/components/layout/AppLayout"
 import { RequireAdmin, RequireAuth } from "@/lib/auth"
 import { AccountSecurityPage } from "@/pages/AccountSecurityPage"
 import { ApiKeysPage } from "@/pages/ApiKeysPage"
+import { AuditLogPage } from "@/pages/AuditLogPage"
 import { DeliveriesPage } from "@/pages/DeliveriesPage"
 import { LightningPage } from "@/pages/LightningPage"
 import { LoginPage } from "@/pages/LoginPage"
@@ -30,13 +31,16 @@ export default function App() {
           <Route path="/deliveries" element={<DeliveriesPage />} />
           <Route path="/traffic" element={<TrafficPage />} />
           <Route path="/wallets" element={<WalletsPage />} />
-          <Route path="/lightning" element={<LightningPage />} />
-          <Route path="/account/2fa" element={<AccountSecurityPage />} />
+          <Route path="/account/security" element={<AccountSecurityPage />} />
+          <Route path="/account/2fa" element={<Navigate to="/account/security" replace />} />
           <Route element={<RequireAdmin />}>
+            {/* The wallet history is admin-only on the API too. */}
+            <Route path="/lightning" element={<LightningPage />} />
             <Route path="/api-keys" element={<ApiKeysPage />} />
             <Route path="/webhooks" element={<WebhooksPage />} />
             <Route path="/staff" element={<StaffPage />} />
             <Route path="/settings" element={<SettingsPage />} />
+            <Route path="/audit-log" element={<AuditLogPage />} />
           </Route>
         </Route>
       </Route>

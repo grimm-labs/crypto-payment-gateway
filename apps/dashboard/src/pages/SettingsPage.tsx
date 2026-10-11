@@ -1,8 +1,9 @@
 import { useEffect, useState } from "react"
-import { Activity, ShieldCheck } from "lucide-react"
+import { Activity, ShieldCheck, Zap } from "lucide-react"
 import { toast } from "sonner"
 
 import { QueryError } from "@/components/shared/QueryError"
+import { StepUpCodeField } from "@/components/shared/StepUpCodeField"
 import { Button } from "@/components/ui/button"
 import {
   Card,
@@ -23,6 +24,10 @@ import {
 import { Skeleton } from "@/components/ui/skeleton"
 import { Switch } from "@/components/ui/switch"
 import { useSettings, useUpdateSettings } from "@/hooks/queries"
+import { toastError } from "@/lib/errors"
+import { satsToBtc } from "@/lib/format"
+import type { AppSettingsUpdate } from "@/lib/types"
+import { isTotpCode } from "@/lib/validation"
 
 const EXPIRY_OPTIONS = [
   { value: 15, label: "15 minutes" },
@@ -40,11 +45,12 @@ export function SettingsPage() {
       <div>
         <h1 className="text-2xl font-semibold tracking-tight">Settings</h1>
         <p className="text-sm text-muted-foreground">
-          System configuration — payment expiry, two-factor authentication,
-          API traffic retention.
+          System configuration — payment expiry, Lightning payout limits,
+          two-factor authentication, API traffic retention.
         </p>
       </div>
       <PaymentExpiryCard />
+      <PayoutLimitsCard />
       <TotpIssuerCard />
       <TrafficRetentionCard />
     </div>
@@ -63,7 +69,7 @@ function TrafficRetentionCard() {
   const settings = useSettings()
   const updateSettings = useUpdateSettings()
   const [forever, setForever] = useState(false)
-  const [days, setDays] = useState("730")
+  const [days, setDays] = useState("90")
 
   useEffect(() => {
     if (!settings.data) return
@@ -89,7 +95,7 @@ function TrafficRetentionCard() {
           : `API traffic log is now kept ${value} day${value === 1 ? "" : "s"}`,
       )
     } catch (error) {
-      toast.error(error instanceof Error ? error.message : "Update failed")
+      toastError(error, "Update failed")
     }
   }
 
@@ -99,7 +105,7 @@ function TrafficRetentionCard() {
         <CardTitle>API traffic retention</CardTitle>
         <CardDescription>
           How long the request log behind the Traffic page is kept. Older
-          entries are deleted hourly in the background; 2 years by default.
+          entries are deleted hourly in the background; 90 days by default.
           Switch on “Keep forever” to never delete anything.
         </CardDescription>
       </CardHeader>
@@ -161,6 +167,156 @@ function TrafficRetentionCard() {
               </span>
             </div>
           </div>
+        )}
+      </CardContent>
+    </Card>
+  )
+}
+
+/** Total bitcoin supply in sats — the API's upper bound for both limits. */
+const MAX_LIMIT_SATS = 2_100_000_000_000_000
+
+function parseLimit(value: string): number | null {
+  const trimmed = value.trim()
+  if (!/^\d+$/.test(trimmed)) return null
+  const parsed = Number(trimmed)
+  return Number.isSafeInteger(parsed) && parsed <= MAX_LIMIT_SATS ? parsed : null
+}
+
+function limitHint(value: string): string {
+  const parsed = parseLimit(value)
+  if (parsed === null) return `Whole number of sats, 0 to ${MAX_LIMIT_SATS.toLocaleString()}`
+  if (parsed === 0) return "0 — payouts disabled"
+  return `≈ ${satsToBtc(String(parsed))} BTC`
+}
+
+function PayoutLimitsCard() {
+  const settings = useSettings()
+  const updateSettings = useUpdateSettings()
+  const [perPayout, setPerPayout] = useState("")
+  const [daily, setDaily] = useState("")
+  const [code, setCode] = useState("")
+
+  useEffect(() => {
+    if (!settings.data) return
+    setPerPayout(String(settings.data.payout_max_sats))
+    setDaily(String(settings.data.payout_daily_max_sats))
+  }, [settings.data])
+
+  const nextPerPayout = parseLimit(perPayout)
+  const nextDaily = parseLimit(daily)
+  const changes: AppSettingsUpdate = {}
+  if (nextPerPayout !== null && nextPerPayout !== settings.data?.payout_max_sats) {
+    changes.payout_max_sats = nextPerPayout
+  }
+  if (nextDaily !== null && nextDaily !== settings.data?.payout_daily_max_sats) {
+    changes.payout_daily_max_sats = nextDaily
+  }
+  const valid = nextPerPayout !== null && nextDaily !== null
+  const dirty = Object.keys(changes).length > 0
+  const disabled = settings.data
+    ? settings.data.payout_max_sats === 0 || settings.data.payout_daily_max_sats === 0
+    : false
+
+  async function save(event: React.FormEvent) {
+    event.preventDefault()
+    if (!valid || !dirty || !isTotpCode(code)) return
+    try {
+      const updated = await updateSettings.mutateAsync({ ...changes, totp_code: code.trim() })
+      toast.success(
+        updated.payout_max_sats === 0 || updated.payout_daily_max_sats === 0
+          ? "Lightning payouts are now disabled"
+          : "Payout limits updated",
+      )
+    } catch (error) {
+      toastError(error, "Update failed")
+    } finally {
+      // Single-use codes: every save asks for a fresh one.
+      setCode("")
+    }
+  }
+
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle>Lightning payouts</CardTitle>
+        <CardDescription>
+          Caps on what leaves the Lightning wallet — dashboard payouts and API
+          keys allowed to send alike. Amounts in sats, fees excluded. Set either
+          limit to 0 to disable payouts.
+        </CardDescription>
+      </CardHeader>
+      <CardContent>
+        {settings.isError ? (
+          <QueryError error={settings.error} />
+        ) : settings.isLoading ? (
+          <Skeleton className="h-40 w-full max-w-md" />
+        ) : (
+          <form onSubmit={save} className="max-w-md space-y-4">
+            <div className="grid gap-4 sm:grid-cols-2">
+              <div className="space-y-2">
+                <Label htmlFor="payout-max-sats">Per payout (sats)</Label>
+                <Input
+                  id="payout-max-sats"
+                  inputMode="numeric"
+                  value={perPayout}
+                  disabled={updateSettings.isPending}
+                  onChange={(event) => setPerPayout(event.target.value)}
+                  aria-invalid={nextPerPayout === null}
+                />
+                <p
+                  className={
+                    nextPerPayout === null
+                      ? "text-xs text-destructive"
+                      : "text-xs text-muted-foreground"
+                  }
+                >
+                  {limitHint(perPayout)}
+                </p>
+              </div>
+              <div className="space-y-2">
+                <Label htmlFor="payout-daily-max-sats">Per 24 hours (sats)</Label>
+                <Input
+                  id="payout-daily-max-sats"
+                  inputMode="numeric"
+                  value={daily}
+                  disabled={updateSettings.isPending}
+                  onChange={(event) => setDaily(event.target.value)}
+                  aria-invalid={nextDaily === null}
+                />
+                <p
+                  className={
+                    nextDaily === null
+                      ? "text-xs text-destructive"
+                      : "text-xs text-muted-foreground"
+                  }
+                >
+                  {limitHint(daily)}
+                </p>
+              </div>
+            </div>
+            {dirty && (
+              <StepUpCodeField
+                id="payout-limits-code"
+                value={code}
+                onChange={setCode}
+                disabled={updateSettings.isPending}
+              />
+            )}
+            <div className="flex items-center gap-3">
+              <Button
+                type="submit"
+                size="sm"
+                disabled={!valid || !dirty || !isTotpCode(code) || updateSettings.isPending}
+              >
+                {updateSettings.isPending ? "Saving…" : "Save"}
+              </Button>
+              <span className="flex items-center gap-2 text-sm text-muted-foreground">
+                <Zap className="size-3.5 shrink-0" />
+                {disabled ? "Payouts are currently disabled." : "Rolling 24 h window."}
+              </span>
+            </div>
+          </form>
         )}
       </CardContent>
     </Card>

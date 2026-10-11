@@ -11,9 +11,10 @@ export interface Staff {
   created_at: string
 }
 
+/** Every endpoint that opens a session. The refresh token travels only in
+ *  the HttpOnly `cpg_refresh` cookie — never in JSON. */
 export interface AuthResponse {
   access_token: string
-  refresh_token: string
   staff: Staff
 }
 
@@ -208,6 +209,15 @@ export interface LightningPayment {
   deposit_address_id: string | null
 }
 
+/** Fee quote shown on the payout review step. All values are integer sats strings. */
+export interface LightningQuote {
+  ln_address: string
+  amount_sats: string
+  fees_sats: string
+  /** amount + fees. */
+  total_sats: string
+}
+
 /** No total from the SDK: paging is driven by `has_more`. */
 export interface LightningPaymentsPage {
   data: LightningPayment[]
@@ -223,6 +233,10 @@ export interface AppSettings {
   totp_issuer: string
   /** Days the API traffic log is kept; null = forever. */
   api_traffic_retention_days: number | null
+  /** Max sats per Lightning payout (fees excluded); 0 = payouts disabled. */
+  payout_max_sats: number
+  /** Max sats sent over a rolling 24 h window; 0 = payouts disabled. */
+  payout_daily_max_sats: number
 }
 
 /** PATCH /settings is partial — only provided fields are updated. */
@@ -233,6 +247,10 @@ export type AppSettingsUpdate = Partial<{
   totp_issuer: string
   /** 1–3650 days, or null to keep forever. */
   api_traffic_retention_days: number | null
+  payout_max_sats: number
+  payout_daily_max_sats: number
+  /** Step-up code — required when a payout limit is present. */
+  totp_code: string
 }>
 
 /** `merchant` = /api/v1 (API keys), `admin` = dashboard calls, `all` = both. */
@@ -319,4 +337,21 @@ export interface WebhookEndpoint {
   created_by: string | null
   created_at: string
   updated_at: string
+}
+
+export type AuditActorType = "staff" | "api_key" | "system"
+
+export interface AuditLogEntry {
+  id: string
+  actor_type: AuditActorType
+  actor_id: string | null
+  /** Staff full name or API key name at the time of the action. */
+  actor_name: string | null
+  /** e.g. `payout.sent`, `staff.updated`. */
+  action: string
+  target_type: string | null
+  target_id: string | null
+  details: Record<string, unknown>
+  ip: string | null
+  created_at: string
 }

@@ -5,6 +5,7 @@ import { BrowserRouter } from "react-router-dom"
 
 import { Toaster } from "@/components/ui/sonner"
 import { TooltipProvider } from "@/components/ui/tooltip"
+import { ApiError } from "@/lib/api"
 import { AuthProvider } from "@/lib/auth"
 import App from "./App"
 import "./index.css"
@@ -12,7 +13,10 @@ import "./index.css"
 const queryClient = new QueryClient({
   defaultOptions: {
     queries: {
-      retry: 1,
+      // One retry for network / 5xx errors; a 4xx (403 role, 429 rate
+      // limit…) would only fail again — and a 429 retry burns the budget.
+      retry: (failureCount, error) =>
+        failureCount < 1 && !(error instanceof ApiError && error.statusCode < 500),
       refetchOnWindowFocus: false,
     },
   },

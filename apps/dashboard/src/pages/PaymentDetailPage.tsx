@@ -33,6 +33,8 @@ import {
   TableRow,
 } from "@/components/ui/table"
 import { usePayment, useRetryWebhook } from "@/hooks/queries"
+import { useIsAdmin } from "@/lib/auth"
+import { toastError } from "@/lib/errors"
 import { formatAmount, formatDate, networkLabel, shortHash } from "@/lib/format"
 
 /** BOLT11 QRs encode the uppercased invoice behind a `lightning:` URI —
@@ -85,13 +87,15 @@ export function PaymentDetailPage() {
   const { id } = useParams<{ id: string }>()
   const payment = usePayment(id)
   const retryWebhook = useRetryWebhook()
+  // Webhook retries are admin-only on the API.
+  const isAdmin = useIsAdmin()
 
   async function retry(depositId: string) {
     try {
       await retryWebhook.mutateAsync(depositId)
       toast.success("Webhook re-queued")
     } catch (error) {
-      toast.error(error instanceof Error ? error.message : "Retry failed")
+      toastError(error, "Retry failed")
     }
   }
 
@@ -195,7 +199,7 @@ export function PaymentDetailPage() {
                   <TableHead>Confirmations</TableHead>
                   <TableHead>Status</TableHead>
                   <TableHead>Webhook</TableHead>
-                  <TableHead className="text-right">Actions</TableHead>
+                  {isAdmin && <TableHead className="text-right">Actions</TableHead>}
                 </TableRow>
               </TableHeader>
               <TableBody>
@@ -261,16 +265,18 @@ export function PaymentDetailPage() {
                         <span className="text-xs text-muted-foreground">—</span>
                       )}
                     </TableCell>
-                    <TableCell className="text-right">
-                      <Button
-                        variant="outline"
-                        size="sm"
-                        disabled={deposit.status !== "confirmed" || retryWebhook.isPending}
-                        onClick={() => retry(deposit.id)}
-                      >
-                        <RefreshCw className="size-3.5" /> Retry webhook
-                      </Button>
-                    </TableCell>
+                    {isAdmin && (
+                      <TableCell className="text-right">
+                        <Button
+                          variant="outline"
+                          size="sm"
+                          disabled={deposit.status !== "confirmed" || retryWebhook.isPending}
+                          onClick={() => retry(deposit.id)}
+                        >
+                          <RefreshCw className="size-3.5" /> Retry webhook
+                        </Button>
+                      </TableCell>
+                    )}
                   </TableRow>
                 ))}
               </TableBody>

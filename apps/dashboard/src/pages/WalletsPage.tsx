@@ -13,12 +13,15 @@ import {
 } from "@/components/ui/card"
 import { Skeleton } from "@/components/ui/skeleton"
 import { useLiveBalances, useWalletBalances } from "@/hooks/queries"
+import { useIsAdmin } from "@/lib/auth"
 import { formatAmount, formatDate, networkLabel } from "@/lib/format"
 import type { WalletBalances } from "@/lib/types"
 
 export function WalletsPage() {
   const cached = useWalletBalances()
   const live = useLiveBalances()
+  // The Lightning history is admin-only.
+  const isAdmin = useIsAdmin()
 
   async function refreshLive() {
     toast.info("Querying balances on-chain — this can take a while…")
@@ -98,7 +101,7 @@ export function WalletsPage() {
                   {network.message && (
                     <p className="mt-1 text-xs text-muted-foreground">{network.message}</p>
                   )}
-                  {network.network === "lightning" && network.available && (
+                  {isAdmin && network.network === "lightning" && network.available && (
                     <Link
                       to="/lightning"
                       className="mt-2 inline-block text-xs underline-offset-4 hover:underline"

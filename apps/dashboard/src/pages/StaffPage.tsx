@@ -1,4 +1,4 @@
-import { useState } from "react"
+import { useMemo, useState } from "react"
 import { zodResolver } from "@hookform/resolvers/zod"
 import {
   Ban,
@@ -9,22 +9,13 @@ import {
   ShieldOff,
   UserCog,
 } from "lucide-react"
-import { useForm } from "react-hook-form"
+import { Controller, useForm } from "react-hook-form"
 import { toast } from "sonner"
 import { z } from "zod"
 
 import { QueryError } from "@/components/shared/QueryError"
 import { StatusBadge } from "@/components/shared/StatusBadge"
-import {
-  AlertDialog,
-  AlertDialogAction,
-  AlertDialogCancel,
-  AlertDialogContent,
-  AlertDialogDescription,
-  AlertDialogFooter,
-  AlertDialogHeader,
-  AlertDialogTitle,
-} from "@/components/ui/alert-dialog"
+import { StepUpCodeField, StepUpDialog } from "@/components/shared/StepUpCodeField"
 import { Avatar, AvatarFallback } from "@/components/ui/avatar"
 import { Button } from "@/components/ui/button"
 import {
@@ -67,8 +58,43 @@ import {
   useUpdateStaff,
 } from "@/hooks/queries"
 import { useAuth } from "@/lib/auth"
+import { toastError } from "@/lib/errors"
 import { formatDate, initials } from "@/lib/format"
 import type { Staff } from "@/lib/types"
+import { isTotpCode, optionalPasswordSchema, passwordSchema } from "@/lib/validation"
+
+/** Account changes confirmed with a step-up code. */
+type MemberAction = { kind: "block" | "unblock" | "reset-totp"; member: Staff }
+
+function fullName(member: Staff): string {
+  return `${member.first_name} ${member.last_name}`
+}
+
+const ACTION_COPY: Record<
+  MemberAction["kind"],
+  { title: (member: Staff) => string; description: string; confirm: string; destructive?: boolean }
+> = {
+  block: {
+    title: (member) => `Block ${fullName(member)}?`,
+    description:
+      "They will be signed out immediately and unable to log in until an admin unblocks them. Every API key they created is permanently revoked. Their account and history are kept.",
+    confirm: "Block account",
+    destructive: true,
+  },
+  unblock: {
+    title: (member) => `Unblock ${fullName(member)}?`,
+    description:
+      "They can sign in again with their current password. API keys revoked when they were blocked stay revoked.",
+    confirm: "Unblock account",
+  },
+  "reset-totp": {
+    title: (member) => `Reset 2FA for ${fullName(member)}?`,
+    description:
+      "Their two-factor authentication will be removed and all their sessions revoked. They can sign in with their password only and re-enroll from the Account security page.",
+    confirm: "Reset 2FA",
+    destructive: true,
+  },
+}
 
 export function StaffPage() {
   const { staff: me } = useAuth()
@@ -76,43 +102,37 @@ export function StaffPage() {
   const updateStaff = useUpdateStaff()
   const resetStaffTotp = useResetStaffTotp()
   const [editing, setEditing] = useState<Staff | null>(null)
-  const [blocking, setBlocking] = useState<Staff | null>(null)
-  const [resettingTotp, setResettingTotp] = useState<Staff | null>(null)
+  const [action, setAction] = useState<MemberAction | null>(null)
+  // Kept while the dialog animates out, so its copy doesn't flash empty.
+  const [lastAction, setLastAction] = useState<MemberAction | null>(null)
 
-  async function blockMember(member: Staff) {
+  function openAction(next: MemberAction) {
+    setAction(next)
+    setLastAction(next)
+  }
+
+  async function runAction({ kind, member }: MemberAction, code: string) {
     try {
-      await updateStaff.mutateAsync({ id: member.id, is_active: false })
-      toast.success(
-        `${member.first_name} ${member.last_name} is blocked — their sessions were revoked`,
+      if (kind === "reset-totp") {
+        await resetStaffTotp.mutateAsync({ id: member.id, totp_code: code })
+        toast.success(`2FA removed for ${fullName(member)} — their sessions were revoked`)
+      } else if (kind === "block") {
+        await updateStaff.mutateAsync({ id: member.id, is_active: false, totp_code: code })
+        toast.success(`${fullName(member)} is blocked — their sessions were revoked`)
+      } else {
+        await updateStaff.mutateAsync({ id: member.id, is_active: true, totp_code: code })
+        toast.success(`${fullName(member)} can sign in again`)
+      }
+      setAction(null)
+    } catch (error) {
+      toastError(
+        error,
+        kind === "reset-totp" ? "Reset failed" : kind === "block" ? "Blocking failed" : "Unblocking failed",
       )
-    } catch (error) {
-      toast.error(error instanceof Error ? error.message : "Blocking failed")
-    } finally {
-      setBlocking(null)
     }
   }
 
-  async function resetMemberTotp(member: Staff) {
-    try {
-      await resetStaffTotp.mutateAsync(member.id)
-      toast.success(
-        `2FA removed for ${member.first_name} ${member.last_name} — their sessions were revoked`,
-      )
-    } catch (error) {
-      toast.error(error instanceof Error ? error.message : "Reset failed")
-    } finally {
-      setResettingTotp(null)
-    }
-  }
-
-  async function unblockMember(member: Staff) {
-    try {
-      await updateStaff.mutateAsync({ id: member.id, is_active: true })
-      toast.success(`${member.first_name} ${member.last_name} can sign in again`)
-    } catch (error) {
-      toast.error(error instanceof Error ? error.message : "Unblocking failed")
-    }
-  }
+  const copy = lastAction ? ACTION_COPY[lastAction.kind] : null
 
   return (
     <div className="space-y-6 p-4 lg:p-6">
@@ -202,7 +222,9 @@ export function StaffPage() {
                           <UserCog /> Edit
                         </DropdownMenuItem>
                         {member.id !== me?.id && member.totp_enabled && (
-                          <DropdownMenuItem onClick={() => setResettingTotp(member)}>
+                          <DropdownMenuItem
+                            onClick={() => openAction({ kind: "reset-totp", member })}
+                          >
                             <ShieldOff /> Reset 2FA
                           </DropdownMenuItem>
                         )}
@@ -211,13 +233,15 @@ export function StaffPage() {
                             member.role !== "admin" && (
                               <DropdownMenuItem
                                 variant="destructive"
-                                onClick={() => setBlocking(member)}
+                                onClick={() => openAction({ kind: "block", member })}
                               >
                                 <Ban /> Block
                               </DropdownMenuItem>
                             )
                           ) : (
-                            <DropdownMenuItem onClick={() => unblockMember(member)}>
+                            <DropdownMenuItem
+                              onClick={() => openAction({ kind: "unblock", member })}
+                            >
                               <CircleCheck /> Unblock
                             </DropdownMenuItem>
                           ))}
@@ -235,52 +259,16 @@ export function StaffPage() {
         <EditStaffDialog member={editing} onClose={() => setEditing(null)} />
       )}
 
-      <AlertDialog
-        open={resettingTotp !== null}
-        onOpenChange={(open) => !open && setResettingTotp(null)}
-      >
-        <AlertDialogContent>
-          <AlertDialogHeader>
-            <AlertDialogTitle>
-              Reset 2FA for {resettingTotp?.first_name} {resettingTotp?.last_name}?
-            </AlertDialogTitle>
-            <AlertDialogDescription>
-              Their two-factor authentication will be removed and all their
-              sessions revoked. They can sign in with their password only and
-              re-enroll from the Account page.
-            </AlertDialogDescription>
-          </AlertDialogHeader>
-          <AlertDialogFooter>
-            <AlertDialogCancel>Cancel</AlertDialogCancel>
-            <AlertDialogAction
-              onClick={() => resettingTotp && resetMemberTotp(resettingTotp)}
-            >
-              Reset 2FA
-            </AlertDialogAction>
-          </AlertDialogFooter>
-        </AlertDialogContent>
-      </AlertDialog>
-
-      <AlertDialog open={blocking !== null} onOpenChange={(open) => !open && setBlocking(null)}>
-        <AlertDialogContent>
-          <AlertDialogHeader>
-            <AlertDialogTitle>
-              Block {blocking?.first_name} {blocking?.last_name}?
-            </AlertDialogTitle>
-            <AlertDialogDescription>
-              They will be signed out immediately and unable to log in until an
-              admin unblocks them. Every API key they created is permanently
-              revoked. Their account and history are kept.
-            </AlertDialogDescription>
-          </AlertDialogHeader>
-          <AlertDialogFooter>
-            <AlertDialogCancel>Cancel</AlertDialogCancel>
-            <AlertDialogAction onClick={() => blocking && blockMember(blocking)}>
-              Block account
-            </AlertDialogAction>
-          </AlertDialogFooter>
-        </AlertDialogContent>
-      </AlertDialog>
+      <StepUpDialog
+        open={action !== null}
+        onOpenChange={(open) => !open && setAction(null)}
+        title={copy && lastAction ? copy.title(lastAction.member) : ""}
+        description={copy?.description ?? ""}
+        confirmLabel={copy?.confirm ?? "Confirm"}
+        destructive={copy?.destructive}
+        pending={updateStaff.isPending || resetStaffTotp.isPending}
+        onConfirm={(code) => (action ? runAction(action, code) : Promise.resolve())}
+      />
     </div>
   )
 }
@@ -289,18 +277,22 @@ const createSchema = z.object({
   first_name: z.string().trim().min(1, "Required"),
   last_name: z.string().trim().min(1, "Required"),
   email: z.string().trim().email("Invalid email"),
-  password: z.string().min(8, "At least 8 characters"),
+  password: passwordSchema,
   role: z.enum(["admin", "operator"]),
+  totp_code: z.string().trim().refine(isTotpCode, "Enter the 6-digit code"),
 })
 
 type CreateValues = z.infer<typeof createSchema>
 
+const CREATE_DEFAULTS: Partial<CreateValues> = { role: "operator", totp_code: "" }
+
 function CreateStaffDialog() {
+  const { staff: me } = useAuth()
   const [open, setOpen] = useState(false)
   const createStaff = useCreateStaff()
   const form = useForm<CreateValues>({
     resolver: zodResolver(createSchema),
-    defaultValues: { role: "operator" },
+    defaultValues: CREATE_DEFAULTS,
   })
 
   async function onSubmit(values: CreateValues) {
@@ -308,16 +300,24 @@ function CreateStaffDialog() {
       await createStaff.mutateAsync(values)
       toast.success(`${values.first_name} ${values.last_name} added`)
       setOpen(false)
-      form.reset({ role: "operator" })
+      form.reset(CREATE_DEFAULTS)
     } catch (error) {
-      toast.error(error instanceof Error ? error.message : "Creation failed")
+      toastError(error, "Creation failed")
+      // Single-use codes: a retry needs a fresh one.
+      form.setValue("totp_code", "")
     }
   }
 
   const { errors, isSubmitting } = form.formState
 
+  function handleOpenChange(next: boolean) {
+    setOpen(next)
+    // Codes are single-use and short-lived: never carry one over.
+    if (!next) form.setValue("totp_code", "")
+  }
+
   return (
-    <Dialog open={open} onOpenChange={setOpen}>
+    <Dialog open={open} onOpenChange={handleOpenChange}>
       <DialogTrigger asChild>
         <Button>
           <Plus className="size-4" /> Add staff
@@ -354,9 +354,16 @@ function CreateStaffDialog() {
           </div>
           <div className="space-y-2">
             <Label htmlFor="create-password">Password</Label>
-            <Input id="create-password" type="password" {...form.register("password")} />
-            {errors.password && (
+            <Input
+              id="create-password"
+              type="password"
+              autoComplete="new-password"
+              {...form.register("password")}
+            />
+            {errors.password ? (
               <p className="text-xs text-destructive">{errors.password.message}</p>
+            ) : (
+              <p className="text-xs text-muted-foreground">12 to 128 characters.</p>
             )}
           </div>
           <div className="space-y-2">
@@ -374,8 +381,20 @@ function CreateStaffDialog() {
               </SelectContent>
             </Select>
           </div>
+          <Controller
+            control={form.control}
+            name="totp_code"
+            render={({ field, fieldState }) => (
+              <StepUpCodeField
+                id="create-staff-code"
+                value={field.value ?? ""}
+                onChange={field.onChange}
+                error={fieldState.error?.message}
+              />
+            )}
+          />
           <DialogFooter>
-            <Button type="submit" disabled={isSubmitting}>
+            <Button type="submit" disabled={isSubmitting || !me?.totp_enabled}>
               {isSubmitting ? "Adding…" : "Add member"}
             </Button>
           </DialogFooter>
@@ -385,44 +404,68 @@ function CreateStaffDialog() {
   )
 }
 
-const editSchema = z.object({
+const editFields = z.object({
   first_name: z.string().trim().min(1, "Required"),
   last_name: z.string().trim().min(1, "Required"),
   role: z.enum(["admin", "operator"]),
-  password: z
-    .string()
-    .optional()
-    .refine((value) => !value || value.length >= 8, {
-      message: "At least 8 characters",
-    }),
+  password: optionalPasswordSchema,
+  totp_code: z.string().optional(),
 })
 
-type EditValues = z.infer<typeof editSchema>
+type EditValues = z.infer<typeof editFields>
+
+/** A role or password change needs a step-up code; names alone don't. */
+function needsStepUp(values: Pick<EditValues, "role" | "password">, member: Staff): boolean {
+  return values.role !== member.role || Boolean(values.password)
+}
+
+function editSchema(member: Staff) {
+  return editFields.superRefine((values, ctx) => {
+    if (needsStepUp(values, member) && !isTotpCode(values.totp_code)) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["totp_code"],
+        message: "Enter the 6-digit code",
+      })
+    }
+  })
+}
 
 function EditStaffDialog({ member, onClose }: { member: Staff; onClose: () => void }) {
   const updateStaff = useUpdateStaff()
+  const schema = useMemo(() => editSchema(member), [member])
   const form = useForm<EditValues>({
-    resolver: zodResolver(editSchema),
+    resolver: zodResolver(schema),
     defaultValues: {
       first_name: member.first_name,
       last_name: member.last_name,
       role: member.role,
+      password: "",
+      totp_code: "",
     },
   })
+  const stepUp = needsStepUp(
+    { role: form.watch("role"), password: form.watch("password") },
+    member,
+  )
 
   async function onSubmit(values: EditValues) {
+    const sensitive = needsStepUp(values, member)
     try {
       await updateStaff.mutateAsync({
         id: member.id,
         first_name: values.first_name,
         last_name: values.last_name,
-        role: values.role,
-        password: values.password || undefined,
+        // Only send what changed: an unchanged role must not require a code.
+        ...(values.role !== member.role ? { role: values.role } : {}),
+        ...(values.password ? { password: values.password } : {}),
+        ...(sensitive ? { totp_code: values.totp_code?.trim() } : {}),
       })
       toast.success("Staff member updated")
       onClose()
     } catch (error) {
-      toast.error(error instanceof Error ? error.message : "Update failed")
+      toastError(error, "Update failed")
+      form.setValue("totp_code", "")
     }
   }
 
@@ -474,13 +517,30 @@ function EditStaffDialog({ member, onClose }: { member: Staff; onClose: () => vo
             <Input
               id="edit-password"
               type="password"
+              autoComplete="new-password"
               placeholder="Leave empty to keep current"
               {...form.register("password")}
             />
-            {errors.password && (
+            {errors.password ? (
               <p className="text-xs text-destructive">{errors.password.message}</p>
+            ) : (
+              <p className="text-xs text-muted-foreground">12 to 128 characters.</p>
             )}
           </div>
+          {stepUp && (
+            <Controller
+              control={form.control}
+              name="totp_code"
+              render={({ field, fieldState }) => (
+                <StepUpCodeField
+                  id="edit-staff-code"
+                  value={field.value ?? ""}
+                  onChange={field.onChange}
+                  error={fieldState.error?.message}
+                />
+              )}
+            />
+          )}
           <DialogFooter>
             <Button type="submit" disabled={isSubmitting}>
               {isSubmitting ? "Saving…" : "Save changes"}

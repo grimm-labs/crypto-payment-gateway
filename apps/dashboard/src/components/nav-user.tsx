@@ -30,8 +30,9 @@ export function NavUser() {
   const fallback = initials(staff.first_name, staff.last_name)
 
   async function handleLogout() {
+    // Never throws: the local session is cleared even if the call fails.
     await logout()
-    navigate("/login")
+    navigate("/login", { replace: true })
   }
 
   return (

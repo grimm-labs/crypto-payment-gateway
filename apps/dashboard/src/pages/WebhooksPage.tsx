@@ -1,7 +1,8 @@
 import { useState } from "react"
-import { KeyRound, Pencil, Plus, Wand2, Webhook } from "lucide-react"
+import { KeyRound, Pencil, Plus, ShieldAlert, TriangleAlert, Wand2, Webhook } from "lucide-react"
 import { toast } from "sonner"
 
+import { CopyButton } from "@/components/shared/CopyButton"
 import { QueryError } from "@/components/shared/QueryError"
 import { StatusBadge } from "@/components/shared/StatusBadge"
 import {
@@ -16,6 +17,13 @@ import {
 } from "@/components/ui/alert-dialog"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
+import {
+  Card,
+  CardContent,
+  CardDescription,
+  CardHeader,
+  CardTitle,
+} from "@/components/ui/card"
 import { Checkbox } from "@/components/ui/checkbox"
 import {
   Dialog,
@@ -44,6 +52,7 @@ import {
   useUpdateWebhookEndpoint,
   useWebhookEndpoints,
 } from "@/hooks/queries"
+import { toastError } from "@/lib/errors"
 import { formatDate } from "@/lib/format"
 import type { WebhookEndpoint, WebhookEventType } from "@/lib/types"
 
@@ -67,16 +76,49 @@ const EVENT_OPTIONS: Array<{
   },
 ]
 
-/** 32 random alphanumeric chars for the signing secret. */
+const SECRET_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
+const SECRET_LENGTH = 32
+/** Largest multiple of the alphabet size that fits in a byte (248 = 4 × 62):
+ *  bytes at or above it are discarded, since `byte % 62` over the full
+ *  0–255 range would favour the first 8 characters (#38). */
+const UNBIASED_BYTE_LIMIT = 256 - (256 % SECRET_ALPHABET.length)
+
+/** 32 uniformly random alphanumeric chars (rejection sampling). */
 function generateSecret(): string {
-  const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
-  const bytes = new Uint8Array(32)
-  crypto.getRandomValues(bytes)
-  return Array.from(bytes, (byte) => chars[byte % chars.length]).join("")
+  let secret = ""
+  const bytes = new Uint8Array(64)
+  while (secret.length < SECRET_LENGTH) {
+    crypto.getRandomValues(bytes)
+    for (const byte of bytes) {
+      if (byte >= UNBIASED_BYTE_LIMIT) continue
+      secret += SECRET_ALPHABET[byte % SECRET_ALPHABET.length]
+      if (secret.length === SECRET_LENGTH) break
+    }
+  }
+  return secret
 }
+
+const SECRET_RULES = "Secret must be 16-128 printable characters without spaces"
 
 function validSecret(secret: string): boolean {
   return secret.length >= 16 && secret.length <= 128 && /^[\x21-\x7e]+$/.test(secret)
+}
+
+/** Client-side pre-checks; the API also requires a publicly resolvable host. */
+function urlProblem(raw: string): string | null {
+  let url: URL
+  try {
+    url = new URL(raw)
+  } catch {
+    return "Enter a valid URL, e.g. https://example.com/webhooks"
+  }
+  if (url.protocol !== "https:" && url.protocol !== "http:") {
+    return "URL must start with https://"
+  }
+  if (url.username || url.password) {
+    return "Credentials (user:password@) are not allowed in the URL"
+  }
+  return null
 }
 
 export function WebhooksPage() {
@@ -90,7 +132,7 @@ export function WebhooksPage() {
       await toggleEndpoint.mutateAsync({ id: endpoint.id, is_active: isActive })
       toast.success(isActive ? "Endpoint activated" : "Endpoint deactivated")
     } catch (error) {
-      toast.error(error instanceof Error ? error.message : "Update failed")
+      toastError(error, "Update failed")
     } finally {
       setDeactivating(null)
     }
@@ -142,13 +184,24 @@ export function WebhooksPage() {
                     <div className="flex items-center gap-2">
                       <Webhook className="size-3.5 shrink-0 text-muted-foreground" />
                       <code className="max-w-96 truncate text-xs">{endpoint.url}</code>
-                      {endpoint.has_secret && (
+                      {endpoint.has_secret ? (
                         <KeyRound
                           className="size-3.5 shrink-0 text-muted-foreground"
                           aria-label="Signed deliveries"
                         >
-                          <title>Deliveries are signed (X-Webhook-Signature)</title>
+                          <title>Deliveries are signed (X-Webhook-Signature-V2)</title>
                         </KeyRound>
+                      ) : (
+                        <Badge
+                          asChild
+                          variant="secondary"
+                          className="cursor-pointer bg-amber-100 text-amber-900 hover:bg-amber-200 dark:bg-amber-900/40 dark:text-amber-200"
+                        >
+                          <button type="button" onClick={() => setEditing(endpoint)}>
+                            <ShieldAlert />
+                            Unsigned — add a secret
+                          </button>
+                        </Badge>
                       )}
                     </div>
                   </TableCell>
@@ -204,6 +257,8 @@ export function WebhooksPage() {
           </Table>
         </div>
       )}
+
+      <ReceiverDocsCard />
 
       <EditEndpointDialog endpoint={editing} onClose={() => setEditing(null)} />
 
@@ -276,39 +331,49 @@ function AddEndpointDialog() {
   const [secret, setSecret] = useState("")
   const createEndpoint = useCreateWebhookEndpoint()
 
+  const plainHttp = url.trim().toLowerCase().startsWith("http://")
+
+  function handleOpenChange(next: boolean) {
+    setOpen(next)
+    if (!next) {
+      // The secret is write-only: never keep it around once the dialog is gone.
+      setUrl("")
+      setEvents(["paid"])
+      setSecret("")
+    }
+  }
+
   async function handleCreate() {
     const trimmed = url.trim()
     const trimmedSecret = secret.trim()
-    if (!/^https?:\/\/.+/.test(trimmed)) {
-      toast.error("URL must start with http:// or https://")
+    const problem = urlProblem(trimmed)
+    if (problem) {
+      toast.error(problem)
       return
     }
     if (events.length === 0) {
       toast.error("Select at least one event")
       return
     }
-    if (trimmedSecret && !validSecret(trimmedSecret)) {
-      toast.error("Secret must be 16-128 printable characters without spaces")
+    if (!trimmedSecret) {
+      toast.error("A signing secret is required — generate one")
+      return
+    }
+    if (!validSecret(trimmedSecret)) {
+      toast.error(SECRET_RULES)
       return
     }
     try {
-      await createEndpoint.mutateAsync({
-        url: trimmed,
-        events,
-        ...(trimmedSecret ? { secret: trimmedSecret } : {}),
-      })
+      await createEndpoint.mutateAsync({ url: trimmed, events, secret: trimmedSecret })
       toast.success("Webhook endpoint added")
-      setOpen(false)
-      setUrl("")
-      setEvents(["paid"])
-      setSecret("")
+      handleOpenChange(false)
     } catch (error) {
-      toast.error(error instanceof Error ? error.message : "Creation failed")
+      toastError(error, "Creation failed")
     }
   }
 
   return (
-    <Dialog open={open} onOpenChange={setOpen}>
+    <Dialog open={open} onOpenChange={handleOpenChange}>
       <DialogTrigger asChild>
         <Button size="sm">
           <Plus className="size-4" /> Add endpoint
@@ -318,7 +383,7 @@ function AddEndpointDialog() {
         <DialogHeader>
           <DialogTitle>Add webhook endpoint</DialogTitle>
           <DialogDescription>
-            This URL will receive a POST for each selected event, with
+            This URL will receive a signed POST for each selected event, with
             automatic retries on failure.
           </DialogDescription>
         </DialogHeader>
@@ -334,6 +399,17 @@ function AddEndpointDialog() {
                 if (event.key === "Enter") handleCreate()
               }}
             />
+            {plainHttp ? (
+              <p className="flex items-start gap-1.5 text-xs text-amber-700 dark:text-amber-400">
+                <TriangleAlert className="mt-0.5 size-3 shrink-0" />
+                Plain http:// is only accepted when the API runs in development —
+                use https://.
+              </p>
+            ) : (
+              <p className="text-xs text-muted-foreground">
+                Must use https:// and resolve to a public address.
+              </p>
+            )}
           </div>
           <div className="space-y-2">
             <Label>Events</Label>
@@ -345,16 +421,18 @@ function AddEndpointDialog() {
             />
           </div>
           <div className="space-y-2">
-            <Label htmlFor="endpoint-secret">Signing secret (optional)</Label>
+            <Label htmlFor="endpoint-secret">Signing secret</Label>
             <div className="flex items-center gap-2">
               <Input
                 id="endpoint-secret"
                 className="font-mono text-xs"
-                placeholder="No signature"
+                placeholder="Generate or paste a secret"
                 value={secret}
                 onChange={(event) => setSecret(event.target.value)}
                 autoComplete="off"
+                spellCheck={false}
               />
+              {secret && <CopyButton value={secret} />}
               <Button
                 type="button"
                 variant="outline"
@@ -365,9 +443,9 @@ function AddEndpointDialog() {
               </Button>
             </div>
             <p className="text-xs text-muted-foreground">
-              If set, each delivery carries an X-Webhook-Signature header
-              (HMAC-SHA256 of the body). Store it now — it cannot be read back
-              later.
+              Required. Every delivery carries an X-Webhook-Signature-V2 header
+              computed with it — see “Verifying deliveries” below. Store it in
+              your receiver now: it cannot be read back later.
             </p>
           </div>
         </div>
@@ -390,7 +468,6 @@ function EditEndpointDialog({
 }) {
   const [events, setEvents] = useState<WebhookEventType[]>([])
   const [secret, setSecret] = useState("")
-  const [removeSecret, setRemoveSecret] = useState(false)
   const [editingId, setEditingId] = useState<string | null>(null)
   const updateEndpoint = useUpdateWebhookEndpoint()
 
@@ -399,7 +476,6 @@ function EditEndpointDialog({
     setEditingId(endpoint.id)
     setEvents(endpoint.events)
     setSecret("")
-    setRemoveSecret(false)
   }
 
   async function handleSave() {
@@ -409,23 +485,30 @@ function EditEndpointDialog({
       return
     }
     const trimmedSecret = secret.trim()
-    if (!removeSecret && trimmedSecret && !validSecret(trimmedSecret)) {
-      toast.error("Secret must be 16-128 printable characters without spaces")
+    if (trimmedSecret && !validSecret(trimmedSecret)) {
+      toast.error(SECRET_RULES)
       return
     }
-    // Only touch the secret when the user acted: empty string removes it,
-    // a new value rotates it, otherwise it stays as-is server-side.
-    const secretPatch = removeSecret
-      ? { secret: "" }
-      : trimmedSecret
-        ? { secret: trimmedSecret }
-        : {}
+    // A new value rotates the secret; empty leaves it as-is server-side.
+    // A secret can no longer be removed.
     try {
-      await updateEndpoint.mutateAsync({ id: endpoint.id, events, ...secretPatch })
-      toast.success("Endpoint updated")
+      await updateEndpoint.mutateAsync({
+        id: endpoint.id,
+        events,
+        ...(trimmedSecret ? { secret: trimmedSecret } : {}),
+      })
+      toast.success(
+        trimmedSecret
+          ? endpoint.has_secret
+            ? "Endpoint updated — signing secret rotated"
+            : "Endpoint updated — deliveries are now signed"
+          : "Endpoint updated",
+      )
+      setEditingId(null)
+      setSecret("")
       onClose()
     } catch (error) {
-      toast.error(error instanceof Error ? error.message : "Update failed")
+      toastError(error, "Update failed")
     }
   }
 
@@ -435,6 +518,7 @@ function EditEndpointDialog({
       onOpenChange={(open) => {
         if (!open) {
           setEditingId(null)
+          setSecret("")
           onClose()
         }
       }}
@@ -463,39 +547,36 @@ function EditEndpointDialog({
                 id="edit-endpoint-secret"
                 className="font-mono text-xs"
                 placeholder={
-                  endpoint?.has_secret ? "Unchanged — type to rotate" : "No signature"
+                  endpoint?.has_secret ? "Unchanged — type to rotate" : "Add a secret to sign deliveries"
                 }
                 value={secret}
-                disabled={removeSecret}
                 onChange={(event) => setSecret(event.target.value)}
                 autoComplete="off"
+                spellCheck={false}
               />
+              {secret && <CopyButton value={secret} />}
               <Button
                 type="button"
                 variant="outline"
                 size="sm"
-                disabled={removeSecret}
                 onClick={() => setSecret(generateSecret())}
               >
                 <Wand2 className="size-3.5" /> Generate
               </Button>
             </div>
-            {endpoint?.has_secret && (
-              <div className="flex items-center gap-2">
-                <Checkbox
-                  id="remove-secret"
-                  checked={removeSecret}
-                  onCheckedChange={(checked) => setRemoveSecret(checked === true)}
-                />
-                <Label htmlFor="remove-secret" className="text-xs font-normal">
-                  Remove the secret (deliveries become unsigned)
-                </Label>
-              </div>
+            {endpoint && !endpoint.has_secret ? (
+              <p className="flex items-start gap-1.5 text-xs text-amber-700 dark:text-amber-400">
+                <ShieldAlert className="mt-0.5 size-3 shrink-0" />
+                Deliveries to this endpoint are unsigned, so the receiver cannot
+                tell them from forged requests. Add a secret and configure it in
+                the receiver.
+              </p>
+            ) : (
+              <p className="text-xs text-muted-foreground">
+                The current secret cannot be read back — set a new one to rotate
+                it. Update the receiver at the same time.
+              </p>
             )}
-            <p className="text-xs text-muted-foreground">
-              The current secret cannot be read back — set a new one to rotate
-              it.
-            </p>
           </div>
         </div>
         <DialogFooter>
@@ -505,5 +586,84 @@ function EditEndpointDialog({
         </DialogFooter>
       </DialogContent>
     </Dialog>
+  )
+}
+
+const VERIFY_SNIPPET = `import crypto from "node:crypto"
+
+// rawBody: the exact bytes received (Buffer) — never re-serialized JSON.
+export function verifyWebhook(rawBody, headers, secret) {
+  const parts = Object.fromEntries(
+    (headers["x-webhook-signature-v2"] ?? "").split(",").map((part) => part.split("=")),
+  )
+  const timestamp = Number(parts.t)
+  // Reject stale deliveries: a captured request cannot be replayed later.
+  if (!Number.isInteger(timestamp) || Math.abs(Date.now() / 1000 - timestamp) > 300) {
+    return false
+  }
+  const expected = crypto
+    .createHmac("sha256", secret)
+    .update(\`\${parts.t}.\`)
+    .update(rawBody)
+    .digest()
+  const received = Buffer.from(parts.v1 ?? "", "hex")
+  return received.length === expected.length && crypto.timingSafeEqual(received, expected)
+}`
+
+const DELIVERY_HEADERS: Array<{ name: string; description: string }> = [
+  {
+    name: "X-Webhook-Signature-V2",
+    description:
+      "t=<timestamp>,v1=<hex> — HMAC-SHA256 of \"<timestamp>.<raw body>\" keyed with the endpoint secret. Verify this one.",
+  },
+  {
+    name: "X-Webhook-Timestamp",
+    description: "Unix seconds when the delivery was signed (same value as t).",
+  },
+  {
+    name: "X-Webhook-Id",
+    description:
+      "Delivery id, also event_id in the body — use it to ignore deliveries already processed.",
+  },
+  {
+    name: "X-Webhook-Signature",
+    description:
+      "Legacy sha256=<hex> of the body alone. It does not cover the timestamp, so prefer V2.",
+  },
+]
+
+function ReceiverDocsCard() {
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle>Verifying deliveries</CardTitle>
+        <CardDescription>
+          Every POST is signed with the endpoint secret. Payloads also carry
+          event_id and occurred_at (RFC 3339) at the top level. Answer with a
+          2xx quickly; anything else is retried.
+        </CardDescription>
+      </CardHeader>
+      <CardContent className="space-y-4">
+        <dl className="grid gap-x-4 gap-y-2 text-sm sm:grid-cols-[auto_1fr]">
+          {DELIVERY_HEADERS.map((header) => (
+            <div key={header.name} className="contents">
+              <dt>
+                <code className="text-xs font-medium">{header.name}</code>
+              </dt>
+              <dd className="text-muted-foreground">{header.description}</dd>
+            </div>
+          ))}
+        </dl>
+        <div className="space-y-2">
+          <div className="flex items-center justify-between">
+            <p className="text-sm font-medium">Node.js</p>
+            <CopyButton value={VERIFY_SNIPPET} label="Copy" />
+          </div>
+          <pre className="overflow-auto rounded-md border bg-muted/50 p-3 font-mono text-xs leading-relaxed">
+            {VERIFY_SNIPPET}
+          </pre>
+        </div>
+      </CardContent>
+    </Card>
   )
 }

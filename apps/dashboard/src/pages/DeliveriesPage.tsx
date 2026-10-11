@@ -50,6 +50,8 @@ import {
   useRetryWebhookDelivery,
   useWebhooks,
 } from "@/hooks/queries"
+import { useIsAdmin } from "@/lib/auth"
+import { toastError } from "@/lib/errors"
 import { formatAmount, formatDate, networkLabel, networkToken, shortHash } from "@/lib/format"
 import type { WebhookDelivery } from "@/lib/types"
 
@@ -69,6 +71,8 @@ export function DeliveriesPage() {
   const retryOne = useRetryWebhook()
   const retryDelivery = useRetryWebhookDelivery()
   const retryAll = useRetryAllFailedWebhooks()
+  // Retries (and the Lightning history) are admin-only on the API.
+  const isAdmin = useIsAdmin()
   const [payloadWebhook, setPayloadWebhook] = useState<WebhookDelivery | null>(null)
 
   function updateParams(updates: Record<string, string | undefined>) {
@@ -91,7 +95,7 @@ export function DeliveriesPage() {
       }
       toast.success("Webhook re-queued")
     } catch (error) {
-      toast.error(error instanceof Error ? error.message : "Retry failed")
+      toastError(error, "Retry failed")
     }
   }
 
@@ -109,7 +113,7 @@ export function DeliveriesPage() {
       const result = await retryAll.mutateAsync()
       toast.success(`${result.retried} webhook${result.retried === 1 ? "" : "s"} re-queued`)
     } catch (error) {
-      toast.error(error instanceof Error ? error.message : "Bulk retry failed")
+      toastError(error, "Bulk retry failed")
     }
   }
 
@@ -123,27 +127,29 @@ export function DeliveriesPage() {
             deposit and endpoint).
           </p>
         </div>
-        <AlertDialog>
-          <AlertDialogTrigger asChild>
-            <Button variant="outline" disabled={retryAll.isPending}>
-              <RotateCcw className="size-4" /> Retry all failed
-            </Button>
-          </AlertDialogTrigger>
-          <AlertDialogContent>
-            <AlertDialogHeader>
-              <AlertDialogTitle>Retry all failed webhooks?</AlertDialogTitle>
-              <AlertDialogDescription>
-                Every failed delivery is reset and re-queued for an immediate
-                attempt, restarting its full retry cycle. Paid deliveries are
-                only retried once their deposit is confirmed.
-              </AlertDialogDescription>
-            </AlertDialogHeader>
-            <AlertDialogFooter>
-              <AlertDialogCancel>Cancel</AlertDialogCancel>
-              <AlertDialogAction onClick={handleRetryAll}>Retry all</AlertDialogAction>
-            </AlertDialogFooter>
-          </AlertDialogContent>
-        </AlertDialog>
+        {isAdmin && (
+          <AlertDialog>
+            <AlertDialogTrigger asChild>
+              <Button variant="outline" disabled={retryAll.isPending}>
+                <RotateCcw className="size-4" /> Retry all failed
+              </Button>
+            </AlertDialogTrigger>
+            <AlertDialogContent>
+              <AlertDialogHeader>
+                <AlertDialogTitle>Retry all failed webhooks?</AlertDialogTitle>
+                <AlertDialogDescription>
+                  Every failed delivery is reset and re-queued for an immediate
+                  attempt, restarting its full retry cycle. Paid deliveries are
+                  only retried once their deposit is confirmed.
+                </AlertDialogDescription>
+              </AlertDialogHeader>
+              <AlertDialogFooter>
+                <AlertDialogCancel>Cancel</AlertDialogCancel>
+                <AlertDialogAction onClick={handleRetryAll}>Retry all</AlertDialogAction>
+              </AlertDialogFooter>
+            </AlertDialogContent>
+          </AlertDialog>
+        )}
       </div>
 
       <Select value={status} onValueChange={(value) => updateParams({ status: value, offset: undefined })}>
@@ -198,7 +204,7 @@ export function DeliveriesPage() {
                         >
                           {shortHash(webhook.address, 6)}
                         </Link>
-                      ) : webhook.lightning_payment_id ? (
+                      ) : webhook.lightning_payment_id && isAdmin ? (
                         <Link
                           to="/lightning"
                           className="font-mono text-xs underline-offset-4 hover:underline"
@@ -206,6 +212,13 @@ export function DeliveriesPage() {
                         >
                           Payout {shortHash(webhook.lightning_payment_id, 6)}
                         </Link>
+                      ) : webhook.lightning_payment_id ? (
+                        <span
+                          className="font-mono text-xs"
+                          title={webhook.lightning_payment_id}
+                        >
+                          Payout {shortHash(webhook.lightning_payment_id, 6)}
+                        </span>
                       ) : (
                         <span className="text-xs text-muted-foreground">—</span>
                       )}
@@ -270,18 +283,20 @@ export function DeliveriesPage() {
                         >
                           <Braces className="size-3.5" /> Payload
                         </Button>
-                        <Button
-                          variant="outline"
-                          size="sm"
-                          disabled={
-                            !canRetry(webhook) ||
-                            retryOne.isPending ||
-                            retryDelivery.isPending
-                          }
-                          onClick={() => handleRetry(webhook)}
-                        >
-                          <RefreshCw className="size-3.5" /> Retry
-                        </Button>
+                        {isAdmin && (
+                          <Button
+                            variant="outline"
+                            size="sm"
+                            disabled={
+                              !canRetry(webhook) ||
+                              retryOne.isPending ||
+                              retryDelivery.isPending
+                            }
+                            onClick={() => handleRetry(webhook)}
+                          >
+                            <RefreshCw className="size-3.5" /> Retry
+                          </Button>
+                        )}
                       </div>
                     </TableCell>
                   </TableRow>
