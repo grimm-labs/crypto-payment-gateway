@@ -53,7 +53,7 @@ pub async fn record_traffic(
     let started = Instant::now();
     let created_at = Utc::now();
     let surface = ApiSurface::from_path(request.uri().path());
-    let method = request.method().to_string();
+    let method = recorded_method(request.method());
     let route = request
         .extensions()
         .get::<MatchedPath>()
@@ -85,7 +85,29 @@ pub async fn record_traffic(
     response
 }
 
-fn client_ip(request: &Request, trusted_proxies: &[IpNet]) -> Option<String> {
+/// Standard methods as-is; any extension method (the http crate accepts
+/// arbitrary tokens of hundreds of KB) is stored as `OTHER`.
+fn recorded_method(method: &axum::http::Method) -> String {
+    use axum::http::Method;
+    const KNOWN: [Method; 9] = [
+        Method::GET,
+        Method::POST,
+        Method::PUT,
+        Method::PATCH,
+        Method::DELETE,
+        Method::HEAD,
+        Method::OPTIONS,
+        Method::CONNECT,
+        Method::TRACE,
+    ];
+    if KNOWN.contains(method) {
+        method.as_str().to_string()
+    } else {
+        "OTHER".to_string()
+    }
+}
+
+pub(crate) fn client_ip(request: &Request, trusted_proxies: &[IpNet]) -> Option<String> {
     let header = |name: &str| request.headers().get(name).and_then(|v| v.to_str().ok());
     let peer = request
         .extensions()
@@ -101,26 +123,40 @@ fn client_ip(request: &Request, trusted_proxies: &[IpNet]) -> Option<String> {
 }
 
 /// Forwarding headers are client-forgeable, so they only count when the TCP
-/// peer is a trusted proxy. Then the *last* `X-Forwarded-For` entry is the
-/// client (the only hop the proxy itself appended — earlier ones came from
-/// the client), falling back to `X-Real-IP`, then to the peer. Otherwise the
-/// socket address is the client and the headers are ignored.
-fn resolve_client_ip(
+/// peer is a trusted proxy. Then `X-Forwarded-For` is walked from the right
+/// (the hops appended by our own proxies) and the first hop that is *not* a
+/// trusted proxy is the client — so a chain of proxies (dashboard nginx →
+/// kamal-proxy → api) resolves to the real client as long as every proxy
+/// is listed. Entries left of it came from the client and are ignored. An
+/// unparsable hop stops the walk at the last trusted hop; with no usable
+/// header, `X-Real-IP`, then the peer. An untrusted peer is the client and
+/// the headers are ignored.
+pub(crate) fn resolve_client_ip(
     peer: Option<IpAddr>,
     forwarded_for: Option<&str>,
     real_ip: Option<&str>,
     trusted_proxies: &[IpNet],
 ) -> Option<IpAddr> {
     let peer = peer?;
-    if !trusted_proxies.iter().any(|net| net.contains(&peer)) {
+    let trusted = |ip: &IpAddr| trusted_proxies.iter().any(|net| net.contains(ip));
+    if !trusted(&peer) {
         return Some(peer);
     }
     let parse = |value: &str| value.trim().parse::<IpAddr>().ok();
-    forwarded_for
-        .and_then(|header| header.split(',').next_back())
-        .and_then(parse)
-        .or_else(|| real_ip.and_then(parse))
-        .or(Some(peer))
+    if let Some(header) = forwarded_for {
+        let mut last_trusted = None;
+        for hop in header.split(',').rev() {
+            let Some(ip) = parse(hop) else { break };
+            if !trusted(&ip) {
+                return Some(ip);
+            }
+            last_trusted = Some(ip);
+        }
+        if let Some(ip) = last_trusted {
+            return Some(ip);
+        }
+    }
+    real_ip.and_then(parse).or(Some(peer))
 }
 
 #[cfg(test)]
@@ -190,6 +226,34 @@ mod tests {
             &nets(&["10.0.0.0/8"]),
         );
         assert_eq!(resolved, Some(ip("198.51.100.7")));
+    }
+
+    #[test]
+    fn chained_trusted_proxies_are_skipped_from_the_right() {
+        // client → dashboard nginx (172.18.0.3) → kamal-proxy via the
+        // server's public IP (203.0.113.10) → api.
+        let trusted = nets(&["172.16.0.0/12", "203.0.113.10/32"]);
+        let resolved = resolve_client_ip(
+            Some(ip("172.18.0.2")),
+            Some("6.6.6.6, 198.51.100.7, 172.18.0.3, 203.0.113.10"),
+            None,
+            &trusted,
+        );
+        // 6.6.6.6 was supplied by the client itself: never trusted.
+        assert_eq!(resolved, Some(ip("198.51.100.7")));
+        // Every hop trusted: the leftmost one.
+        assert_eq!(
+            resolve_client_ip(Some(ip("172.18.0.2")), Some("172.18.0.3"), None, &trusted),
+            Some(ip("172.18.0.3"))
+        );
+    }
+
+    #[test]
+    fn extension_methods_are_recorded_as_other() {
+        use axum::http::Method;
+        assert_eq!(recorded_method(&Method::PATCH), "PATCH");
+        let huge = Method::from_bytes("X".repeat(10_000).as_bytes()).unwrap();
+        assert_eq!(recorded_method(&huge), "OTHER");
     }
 
     #[test]

@@ -1,11 +1,15 @@
-use axum::extract::{Request, State};
+use std::convert::Infallible;
+use std::net::SocketAddr;
+
+use axum::extract::{ConnectInfo, FromRequestParts, Request, State};
 use axum::http::header::AUTHORIZATION;
+use axum::http::request::Parts;
 use axum::middleware::Next;
 use axum::response::Response;
 use domain::StaffRole;
 use jobs::AppState;
 
-use crate::ApiError;
+use crate::{rate_limit, session, traffic, ApiError};
 
 /// Authenticated staff member, inserted as a request extension by
 /// [`require_jwt`]. Admin handlers act on behalf of this user. Also copied
@@ -14,7 +18,6 @@ use crate::ApiError;
 #[derive(Debug, Clone)]
 pub struct CurrentStaff {
     pub id: String,
-    pub email: String,
     pub role: StaffRole,
 }
 
@@ -27,27 +30,76 @@ pub struct CurrentApiKey {
     pub can_send: bool,
 }
 
+/// The client IP, resolved like the traffic log does (forwarding headers
+/// only from `TRUSTED_PROXIES`). `None` without a socket address (tests).
+#[derive(Debug, Clone)]
+pub struct ClientIp(pub Option<String>);
+
+impl ClientIp {
+    /// Rate-limit identity: the IP, or a shared bucket when unknown.
+    pub fn bucket(&self) -> &str {
+        self.0.as_deref().unwrap_or("unknown")
+    }
+}
+
+impl FromRequestParts<AppState> for ClientIp {
+    type Rejection = Infallible;
+
+    async fn from_request_parts(parts: &mut Parts, state: &AppState) -> Result<Self, Infallible> {
+        let peer = parts
+            .extensions
+            .get::<ConnectInfo<SocketAddr>>()
+            .map(|info| info.0.ip());
+        let header = |name: &str| parts.headers.get(name).and_then(|v| v.to_str().ok());
+        Ok(Self(
+            traffic::resolve_client_ip(
+                peer,
+                header("x-forwarded-for"),
+                header("x-real-ip"),
+                &state.config.trusted_proxies,
+            )
+            .map(|ip| ip.to_string()),
+        ))
+    }
+}
+
 /// Merchant-API guard: validates the `x-api-key` header against the hashed
-/// `api_keys` table.
+/// `api_keys` table. Invalid keys are rate-limited per client IP, valid
+/// ones per key.
 pub async fn require_api_key(
     State(state): State<AppState>,
+    client_ip: ClientIp,
     mut request: Request,
     next: Next,
 ) -> Result<Response, ApiError> {
+    rate_limit::check_failures(&state, rate_limit::INVALID_API_KEY_PER_IP, client_ip.bucket())
+        .await?;
     let key = request
         .headers()
         .get("x-api-key")
         .and_then(|v| v.to_str().ok())
-        .ok_or_else(|| ApiError::unauthorized("Missing x-api-key header"))?;
-
-    let prefix = auth::parse_api_key_prefix(key)
-        .ok_or_else(|| ApiError::unauthorized("Invalid API key"))?;
-    let Some(row) = state.db.find_api_key_by_prefix(prefix).await? else {
-        return Err(ApiError::unauthorized("Invalid API key"));
+        .map(str::to_owned);
+    let row = match key.as_deref() {
+        Some(key) => match auth::parse_api_key_prefix(key) {
+            Some(prefix) => state
+                .db
+                .find_api_key_by_prefix(prefix)
+                .await?
+                .filter(|row| auth::constant_time_eq_hex(&auth::sha256_hex(key), &row.key_hash)),
+            None => None,
+        },
+        None => None,
     };
-    if !auth::constant_time_eq_hex(&auth::sha256_hex(key), &row.key_hash) {
-        return Err(ApiError::unauthorized("Invalid API key"));
-    }
+    let Some(row) = row else {
+        rate_limit::record_failure(&state, rate_limit::INVALID_API_KEY_PER_IP, client_ip.bucket())
+            .await?;
+        return Err(ApiError::unauthorized(if key.is_none() {
+            "Missing x-api-key header"
+        } else {
+            "Invalid API key"
+        }));
+    };
+    rate_limit::hit(&state, rate_limit::API_KEY_REQUESTS, &row.id).await?;
 
     let current = CurrentApiKey {
         id: row.id.clone(),
@@ -68,8 +120,9 @@ pub async fn require_api_key(
     Ok(response)
 }
 
-/// Dashboard guard: validates the `Authorization: Bearer` access token and
-/// loads the staff user (rejected when deactivated).
+/// Dashboard guard: validates the `Authorization: Bearer` access token,
+/// checks its session is still alive (logout, password change and
+/// deactivation revoke access tokens immediately) and loads the staff user.
 pub async fn require_jwt(
     State(state): State<AppState>,
     mut request: Request,
@@ -90,6 +143,9 @@ pub async fn require_jwt(
 
     let claims = auth::decode_access_token(secret, token)
         .map_err(|_| ApiError::unauthorized("Invalid or expired token"))?;
+    if !session::session_is_active(&state, &claims.sid).await? {
+        return Err(ApiError::unauthorized("Session expired"));
+    }
 
     let Some(staff) = state.db.find_staff_by_id(&claims.sub).await? else {
         return Err(ApiError::unauthorized("Unknown staff user"));
@@ -100,11 +156,7 @@ pub async fn require_jwt(
     let role = StaffRole::from_db(&staff.role)
         .map_err(|e| ApiError::internal(e.to_string()))?;
 
-    let current = CurrentStaff {
-        id: staff.id,
-        email: staff.email,
-        role,
-    };
+    let current = CurrentStaff { id: staff.id, role };
     request.extensions_mut().insert(current.clone());
     let mut response = next.run(request).await;
     response.extensions_mut().insert(current);

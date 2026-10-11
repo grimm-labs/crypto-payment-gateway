@@ -1,35 +1,39 @@
 use axum::extract::{Path, Query, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
+use axum::response::{IntoResponse, Response};
 use chrono::Utc;
 use axum::routing::{delete, get, patch, post};
 use axum::{Extension, Json, Router};
-use db::{ApiRequestFilter, ApiRequestRow, StaffUserRow};
+use config::{PASSWORD_MAX_LEN, PASSWORD_MIN_LEN};
+use db::{ApiRequestFilter, ApiRequestRow, AuditActor, StaffUpdate, StaffUserRow};
 use domain::{
     ApiSurface, StaffRole, StatusClass, TrafficWindow, WebhookDeliveryStatus, WebhookEventType,
 };
-use jobs::{retrigger_delivery, retrigger_failed_webhooks, AppState, RetriggerError};
+use jobs::{retrigger_delivery, retrigger_failed_webhooks, Actor, AppState, RetriggerError};
 use redis::AsyncCommands;
 use serde::{Deserialize, Deserializer};
 use serde_json::{json, Value};
 
-use crate::middleware::{require_admin, require_jwt, CurrentStaff};
+use crate::middleware::{require_admin, require_jwt, ClientIp, CurrentStaff};
+use crate::session::{self, set_cookie_header};
 use crate::{
     create_deposit_address, create_lightning_payout, get_balances, get_deposit_address,
     get_lightning_payment, get_wallet_balances, list_deposit_addresses, list_lightning_payments,
-    retry_deposit_webhook, ApiError, ListQuery,
+    quote_lightning_payout, rate_limit, retry_deposit_webhook, ApiError, ListQuery,
 };
 
-const MIN_PASSWORD_LEN: usize = 8;
-
 /// Everything the dashboard calls lives under `/api/admin/v1`. Only
-/// setup/login/refresh are public; the rest requires the acting staff's JWT,
-/// and staff/API-key management additionally requires the ADMIN role.
+/// setup/login/refresh/logout are public (rate-limited; refresh and logout
+/// read the HttpOnly cookie and need the CSRF header); the rest requires
+/// the acting staff's JWT, and anything that moves funds, changes access,
+/// replays webhooks or reads the wallet history requires the ADMIN role.
 pub fn admin_router(state: &AppState) -> Router<AppState> {
     let public = Router::new()
         .route("/setup", get(get_setup).post(post_setup))
         .route("/auth/login", post(login))
         .route("/auth/login/totp", post(login_totp))
-        .route("/auth/refresh", post(refresh));
+        .route("/auth/refresh", post(refresh))
+        .route("/auth/logout", post(logout));
 
     let admin_only = Router::new()
         .route("/staff", get(list_staff).post(create_staff))
@@ -46,20 +50,32 @@ pub fn admin_router(state: &AppState) -> Router<AppState> {
             "/webhook-endpoints/{id}",
             patch(update_webhook_endpoint).delete(delete_webhook_endpoint),
         )
-        .route_layer(axum::middleware::from_fn(require_admin));
-
-    let authed = Router::new()
-        .route("/auth/logout", post(logout))
-        .route("/auth/me", get(me))
-        .route("/auth/totp/setup", post(totp_setup))
-        .route("/auth/totp/enable", post(totp_enable))
-        .route("/auth/totp/disable", post(totp_disable))
-        .route("/webhooks", get(list_webhooks))
         .route("/webhooks/retry-failed", post(retry_failed))
         .route(
             "/webhook-deliveries/{id}/retry",
             post(retry_webhook_delivery),
         )
+        .route(
+            "/deposits/{deposit_id}/webhooks/retry",
+            post(retry_deposit_webhook),
+        )
+        .route(
+            "/lightning/payments",
+            get(list_lightning_payments).post(create_lightning_payout),
+        )
+        .route("/lightning/payments/quote", post(quote_lightning_payout))
+        .route("/lightning/payments/{id}", get(get_lightning_payment))
+        .route("/audit-log", get(list_audit_log))
+        .route_layer(axum::middleware::from_fn(require_admin));
+
+    let authed = Router::new()
+        .route("/auth/logout-all", post(logout_all))
+        .route("/auth/me", get(me))
+        .route("/auth/password", post(change_password))
+        .route("/auth/totp/setup", post(totp_setup))
+        .route("/auth/totp/enable", post(totp_enable))
+        .route("/auth/totp/disable", post(totp_disable))
+        .route("/webhooks", get(list_webhooks))
         .route("/stats", get(stats))
         .route("/stats/deposits-timeseries", get(deposits_timeseries))
         .route("/traffic/overview", get(traffic_overview))
@@ -69,18 +85,8 @@ pub fn admin_router(state: &AppState) -> Router<AppState> {
             post(create_deposit_address).get(list_deposit_addresses),
         )
         .route("/deposit-addresses/{id}", get(get_deposit_address))
-        .route(
-            "/deposits/{deposit_id}/webhooks/retry",
-            post(retry_deposit_webhook),
-        )
         .route("/balances", get(get_balances))
         .route("/wallet-balances", get(get_wallet_balances))
-        // POST is ADMIN-only, enforced in the handler (shared with /api/v1).
-        .route(
-            "/lightning/payments",
-            get(list_lightning_payments).post(create_lightning_payout),
-        )
-        .route("/lightning/payments/{id}", get(get_lightning_payment))
         .merge(admin_only)
         .route_layer(axum::middleware::from_fn_with_state(
             state.clone(),
@@ -88,6 +94,18 @@ pub fn admin_router(state: &AppState) -> Router<AppState> {
         ));
 
     public.merge(authed)
+}
+
+fn staff_actor(staff: &CurrentStaff, ip: &ClientIp) -> Actor {
+    Actor {
+        audit: AuditActor::Staff(staff.id.clone()),
+        ip: ip.0.clone(),
+    }
+}
+
+/// A session-opening response: JSON body + the refresh cookie.
+fn session_response(status: StatusCode, issued: session::IssuedSession) -> Response {
+    (status, set_cookie_header(issued.cookie), Json(issued.body)).into_response()
 }
 
 async fn get_setup(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
@@ -101,12 +119,31 @@ struct SetupRequest {
     password: String,
     first_name: String,
     last_name: String,
+    setup_token: Option<String>,
 }
 
+/// First-admin bootstrap. Needs the one-time setup token printed in the
+/// API logs at boot (or `SETUP_TOKEN`): an attacker reaching a fresh
+/// instance first can no longer claim it. Every cheap check runs before the
+/// argon2 hash, so the public route cannot be used to burn CPU.
 async fn post_setup(
     State(state): State<AppState>,
+    client_ip: ClientIp,
     Json(body): Json<SetupRequest>,
-) -> Result<(StatusCode, Json<Value>), ApiError> {
+) -> Result<Response, ApiError> {
+    rate_limit::hit(&state, rate_limit::SETUP_PER_IP, client_ip.bucket()).await?;
+    if state.db.count_staff().await? > 0 {
+        return Err(ApiError::conflict("Setup already completed"));
+    }
+    let token_ok = match (&state.setup_token, body.setup_token.as_deref()) {
+        (Some(expected), Some(given)) => {
+            auth::constant_time_eq_hex(&auth::sha256_hex(expected), &auth::sha256_hex(given.trim()))
+        }
+        _ => false,
+    };
+    if !token_ok {
+        return Err(ApiError::forbidden("Invalid setup token"));
+    }
     let email = validate_email(&body.email)?;
     let (first_name, last_name) = validate_names(&body.first_name, &body.last_name)?;
     validate_password(&body.password)?;
@@ -121,8 +158,19 @@ async fn post_setup(
         return Err(ApiError::conflict("Setup already completed"));
     };
 
-    let tokens = issue_token_pair(&state, &staff).await?;
-    Ok((StatusCode::CREATED, Json(tokens)))
+    jobs::audit::record(
+        &state,
+        &Actor {
+            audit: AuditActor::Staff(staff.id.clone()),
+            ip: client_ip.0.clone(),
+        },
+        "setup.completed",
+        Some(("staff", &staff.id)),
+        json!({ "email": staff.email }),
+    )
+    .await;
+    let issued = session::open_session(&state, &staff).await?;
+    Ok(session_response(StatusCode::CREATED, issued))
 }
 
 #[derive(Debug, Deserialize)]
@@ -133,18 +181,28 @@ struct LoginRequest {
 
 async fn login(
     State(state): State<AppState>,
+    client_ip: ClientIp,
     Json(body): Json<LoginRequest>,
-) -> Result<Json<Value>, ApiError> {
-    let staff = state.db.find_staff_by_email(body.email.trim()).await?;
-    // Verify against a real hash whenever possible so the timing of the
-    // response does not reveal whether the email exists.
-    let Some(staff) = staff else {
-        let _ = auth::verify_password(&body.password, "");
-        return Err(ApiError::unauthorized("Invalid email or password"));
-    };
-    if !auth::verify_password(&body.password, &staff.password_hash) {
+) -> Result<Response, ApiError> {
+    // Per client and per targeted account: spraying many accounts from one
+    // IP and hammering one account from many IPs are both bounded.
+    rate_limit::hit(&state, rate_limit::LOGIN_PER_IP, client_ip.bucket()).await?;
+    let email = body.email.trim().to_lowercase();
+    rate_limit::hit(&state, rate_limit::LOGIN_PER_ACCOUNT, &email).await?;
+    if body.password.len() > PASSWORD_MAX_LEN * 4 {
         return Err(ApiError::unauthorized("Invalid email or password"));
     }
+
+    let staff = state.db.find_staff_by_email(&email).await?;
+    // Unknown accounts are verified against a dummy hash: same argon2 cost,
+    // so the timing does not reveal whether the email exists.
+    let verified = auth::verify_password_constant_time(
+        &body.password,
+        staff.as_ref().map(|staff| staff.password_hash.as_str()),
+    );
+    let Some(staff) = staff.filter(|_| verified) else {
+        return Err(ApiError::unauthorized("Invalid email or password"));
+    };
 
     // Second factor: hand out a short-lived single-use MFA token instead of
     // the session — /auth/login/totp exchanges it plus a valid code. The
@@ -159,7 +217,8 @@ async fn login(
         return Ok(Json(json!({
             "mfa_required": true,
             "mfa_token": mfa_token,
-        })));
+        }))
+        .into_response());
     }
 
     if !staff.is_active {
@@ -168,8 +227,8 @@ async fn login(
         ));
     }
 
-    let tokens = issue_token_pair(&state, &staff).await?;
-    Ok(Json(tokens))
+    let issued = session::open_session(&state, &staff).await?;
+    Ok(session_response(StatusCode::OK, issued))
 }
 
 /// Lifetime of the password-proven login challenge.
@@ -187,8 +246,10 @@ struct LoginTotpRequest {
 
 async fn login_totp(
     State(state): State<AppState>,
+    client_ip: ClientIp,
     Json(body): Json<LoginTotpRequest>,
-) -> Result<Json<Value>, ApiError> {
+) -> Result<Response, ApiError> {
+    rate_limit::hit(&state, rate_limit::LOGIN_PER_IP, client_ip.bucket()).await?;
     let hash = auth::sha256_hex(&body.mfa_token);
     let key = state.config.redis_key(&format!("auth:mfa:{hash}"));
     let attempts_key = state.config.redis_key(&format!("auth:mfa:attempts:{hash}"));
@@ -219,10 +280,16 @@ async fn login_totp(
     };
 
     // A wrong code does NOT consume the token: a typo shouldn't force the
-    // password step again. The attempt counter above bounds brute force.
-    verify_totp_code(&state, &staff.id, secret, &body.code)
+    // password step again. The per-token counter above and the per-account
+    // failure budget (across every MFA token) bound brute force.
+    rate_limit::check_failures(&state, rate_limit::TOTP_FAILURES, &staff.id).await?;
+    if verify_totp_code(&state, &staff.id, secret, &body.code)
         .await?
-        .ok_or_else(|| ApiError::unauthorized("Invalid authentication code"))?;
+        .is_none()
+    {
+        rate_limit::record_failure(&state, rate_limit::TOTP_FAILURES, &staff.id).await?;
+        return Err(ApiError::unauthorized("Invalid authentication code"));
+    }
 
     let _: () = redis.del(&key).await?;
     let _: () = redis.del(&attempts_key).await?;
@@ -234,8 +301,8 @@ async fn login_totp(
         ));
     }
 
-    let tokens = issue_token_pair(&state, &staff).await?;
-    Ok(Json(tokens))
+    let issued = session::open_session(&state, &staff).await?;
+    Ok(session_response(StatusCode::OK, issued))
 }
 
 /// Verify a TOTP code with replay protection: a code is only accepted for a
@@ -260,46 +327,148 @@ async fn verify_totp_code(
     Ok(Some(counter))
 }
 
-#[derive(Debug, Deserialize)]
-struct RefreshRequest {
-    refresh_token: String,
-}
-
+/// Rotate the refresh cookie. A failure clears the cookie.
 async fn refresh(
     State(state): State<AppState>,
-    Json(body): Json<RefreshRequest>,
-) -> Result<Json<Value>, ApiError> {
-    let hash = auth::sha256_hex(&body.refresh_token);
-    let key = state.config.redis_key(&format!("auth:refresh:{hash}"));
-    let mut redis = state.redis.clone();
-
-    let staff_id: Option<String> = redis.get(&key).await?;
-    let Some(staff_id) = staff_id else {
-        return Err(ApiError::unauthorized("Invalid refresh token"));
+    client_ip: ClientIp,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    session::require_csrf_header(&headers)?;
+    rate_limit::hit(&state, rate_limit::REFRESH_PER_IP, client_ip.bucket()).await?;
+    let result = match session::refresh_token_from(&headers) {
+        Some(token) => session::refresh_session(&state, &token).await,
+        None => Err(ApiError::unauthorized("No session")),
     };
-    // Rotation: the presented token is consumed no matter what happens next.
-    let _: () = redis.del(&key).await?;
-
-    let Some(staff) = state.db.find_staff_by_id(&staff_id).await? else {
-        return Err(ApiError::unauthorized("Unknown staff user"));
-    };
-    if !staff.is_active {
-        return Err(ApiError::unauthorized("Account is deactivated"));
+    match result {
+        Ok(issued) => Ok(session_response(StatusCode::OK, issued)),
+        Err(err) if err.status == StatusCode::UNAUTHORIZED => {
+            let mut response = err.into_response();
+            response
+                .headers_mut()
+                .insert(axum::http::header::SET_COOKIE, session::clear_cookie(&state));
+            Ok(response)
+        }
+        Err(err) => Err(err),
     }
-
-    let tokens = issue_token_pair(&state, &staff).await?;
-    Ok(Json(tokens))
 }
 
-async fn logout(
+/// Public on purpose: logging out must work with an expired access token
+/// (the old JWT-guarded route went through a refresh first and left the
+/// rotated session alive). Always 200, always clears the cookie.
+async fn logout(State(state): State<AppState>, headers: HeaderMap) -> Result<Response, ApiError> {
+    session::require_csrf_header(&headers)?;
+    if let Some(token) = session::refresh_token_from(&headers) {
+        session::revoke_session_of_token(&state, &token).await?;
+    }
+    Ok((
+        set_cookie_header(session::clear_cookie(&state)),
+        Json(json!({ "status": "ok" })),
+    )
+        .into_response())
+}
+
+/// Revoke every session of the current staff member, this one included.
+async fn logout_all(
     State(state): State<AppState>,
-    Json(body): Json<RefreshRequest>,
-) -> Result<Json<Value>, ApiError> {
-    let hash = auth::sha256_hex(&body.refresh_token);
-    let key = state.config.redis_key(&format!("auth:refresh:{hash}"));
-    let mut redis = state.redis.clone();
-    let _: () = redis.del(&key).await?;
-    Ok(Json(json!({ "status": "ok" })))
+    Extension(current): Extension<CurrentStaff>,
+    client_ip: ClientIp,
+) -> Result<Response, ApiError> {
+    session::revoke_all_sessions(&state, &current.id).await?;
+    jobs::audit::record(
+        &state,
+        &staff_actor(&current, &client_ip),
+        "auth.sessions_revoked",
+        Some(("staff", &current.id)),
+        json!({ "scope": "self" }),
+    )
+    .await;
+    Ok((
+        set_cookie_header(session::clear_cookie(&state)),
+        Json(json!({ "status": "ok" })),
+    )
+        .into_response())
+}
+
+#[derive(Debug, Deserialize)]
+struct ChangePasswordRequest {
+    current_password: String,
+    new_password: String,
+    totp_code: Option<String>,
+}
+
+/// Self-service password change: needs the current password (and a TOTP
+/// code when 2FA is on); every session is revoked and a fresh one opened.
+async fn change_password(
+    State(state): State<AppState>,
+    Extension(current): Extension<CurrentStaff>,
+    client_ip: ClientIp,
+    Json(body): Json<ChangePasswordRequest>,
+) -> Result<Response, ApiError> {
+    let Some(staff) = state.db.find_staff_by_id(&current.id).await? else {
+        return Err(ApiError::unauthorized("Unknown staff user"));
+    };
+    verify_current_password(&state, &staff, &body.current_password).await?;
+    if staff.totp_enabled() {
+        require_step_up(&state, &staff.id, body.totp_code.as_deref()).await?;
+    }
+    validate_password(&body.new_password)?;
+    let hash =
+        auth::hash_password(&body.new_password).map_err(|e| ApiError::internal(e.to_string()))?;
+    state.db.set_staff_password(&staff.id, &hash).await?;
+    session::revoke_all_sessions(&state, &staff.id).await?;
+    jobs::audit::record(
+        &state,
+        &staff_actor(&current, &client_ip),
+        "auth.password_changed",
+        Some(("staff", &staff.id)),
+        json!({}),
+    )
+    .await;
+    let issued = session::open_session(&state, &staff).await?;
+    Ok(session_response(StatusCode::OK, issued))
+}
+
+/// 400 (never 401 — the dashboard treats 401 as an expired session) on a
+/// wrong current password, with a per-account failure budget so a stolen
+/// session cannot brute-force it.
+async fn verify_current_password(
+    state: &AppState,
+    staff: &StaffUserRow,
+    password: &str,
+) -> Result<(), ApiError> {
+    rate_limit::check_failures(state, rate_limit::PASSWORD_FAILURES, &staff.id).await?;
+    if password.len() > PASSWORD_MAX_LEN * 4 || !auth::verify_password(password, &staff.password_hash) {
+        rate_limit::record_failure(state, rate_limit::PASSWORD_FAILURES, &staff.id).await?;
+        return Err(ApiError::bad_request("Current password is incorrect"));
+    }
+    Ok(())
+}
+
+/// Step-up authentication for sensitive actions (payouts, granting payout
+/// rights, payout limits, staff management): a fresh TOTP code of the
+/// acting staff member. Admins without 2FA cannot perform them.
+pub(crate) async fn require_step_up(
+    state: &AppState,
+    staff_id: &str,
+    code: Option<&str>,
+) -> Result<(), ApiError> {
+    let Some(staff) = state.db.find_staff_by_id(staff_id).await? else {
+        return Err(ApiError::unauthorized("Unknown staff user"));
+    };
+    let Some(secret) = staff.totp_secret.as_deref().filter(|_| staff.totp_enabled()) else {
+        return Err(ApiError::forbidden(
+            "Two-factor authentication must be enabled on your account to perform this action",
+        ));
+    };
+    let Some(code) = code.map(str::trim).filter(|code| !code.is_empty()) else {
+        return Err(ApiError::bad_request("totp_code is required for this action"));
+    };
+    rate_limit::check_failures(state, rate_limit::TOTP_FAILURES, &staff.id).await?;
+    if verify_totp_code(state, &staff.id, secret, code).await?.is_none() {
+        rate_limit::record_failure(state, rate_limit::TOTP_FAILURES, &staff.id).await?;
+        return Err(ApiError::bad_request("Invalid authentication code"));
+    }
+    Ok(())
 }
 
 async fn me(Extension(staff): Extension<CurrentStaff>, State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
@@ -313,13 +482,27 @@ async fn me(Extension(staff): Extension<CurrentStaff>, State(state): State<AppSt
 /// abandoned setups expire on their own and nothing half-enrolled hits the DB.
 const TOTP_PENDING_TTL_SECS: u64 = 600;
 
+#[derive(Debug, Deserialize)]
+struct PasswordConfirmation {
+    password: String,
+}
+
+/// Enrolling needs the password: a stolen session alone must not be able to
+/// bind the attacker's authenticator to the account (#60).
 async fn totp_setup(
     Extension(current): Extension<CurrentStaff>,
     State(state): State<AppState>,
+    Json(body): Json<PasswordConfirmation>,
 ) -> Result<Json<Value>, ApiError> {
     let Some(staff) = state.db.find_staff_by_id(&current.id).await? else {
         return Err(ApiError::unauthorized("Unknown staff user"));
     };
+    verify_current_password(&state, &staff, &body.password)
+        .await
+        .map_err(|err| match err.status {
+            StatusCode::BAD_REQUEST => ApiError::bad_request("Password is incorrect"),
+            _ => err,
+        })?;
     if staff.totp_enabled() {
         return Err(ApiError::conflict(
             "Two-factor authentication is already enabled",
@@ -347,6 +530,7 @@ struct TotpCodeRequest {
 async fn totp_enable(
     Extension(current): Extension<CurrentStaff>,
     State(state): State<AppState>,
+    client_ip: ClientIp,
     Json(body): Json<TotpCodeRequest>,
 ) -> Result<Json<Value>, ApiError> {
     let Some(staff) = state.db.find_staff_by_id(&current.id).await? else {
@@ -369,10 +553,12 @@ async fn totp_enable(
 
     // 400, never 401: on authed routes the dashboard treats 401 as an
     // expired session and would log the user out over a typo.
+    rate_limit::check_failures(&state, rate_limit::TOTP_FAILURES, &staff.id).await?;
     if verify_totp_code(&state, &staff.id, &secret, &body.code)
         .await?
         .is_none()
     {
+        rate_limit::record_failure(&state, rate_limit::TOTP_FAILURES, &staff.id).await?;
         return Err(ApiError::bad_request("Invalid authentication code"));
     }
 
@@ -380,33 +566,63 @@ async fn totp_enable(
         return Err(ApiError::unauthorized("Unknown staff user"));
     };
     let _: () = redis.del(&key).await?;
+    jobs::audit::record(
+        &state,
+        &staff_actor(&current, &client_ip),
+        "auth.totp_enabled",
+        Some(("staff", &row.id)),
+        json!({}),
+    )
+    .await;
     Ok(Json(staff_to_json(&row)))
 }
 
+#[derive(Debug, Deserialize)]
+struct TotpDisableRequest {
+    password: String,
+    code: String,
+}
+
+/// Needs both the password and a code (rate-limited): a stolen session
+/// cannot strip the second factor.
 async fn totp_disable(
     Extension(current): Extension<CurrentStaff>,
     State(state): State<AppState>,
-    Json(body): Json<TotpCodeRequest>,
+    client_ip: ClientIp,
+    Json(body): Json<TotpDisableRequest>,
 ) -> Result<Json<Value>, ApiError> {
     let Some(staff) = state.db.find_staff_by_id(&current.id).await? else {
         return Err(ApiError::unauthorized("Unknown staff user"));
     };
-    let Some(secret) = staff.totp_secret.as_deref().filter(|_| staff.totp_enabled()) else {
+    if !staff.totp_enabled() {
         return Err(ApiError::bad_request(
             "Two-factor authentication is not enabled",
         ));
-    };
-
-    if verify_totp_code(&state, &staff.id, secret, &body.code)
-        .await?
-        .is_none()
-    {
-        return Err(ApiError::bad_request("Invalid authentication code"));
     }
+    verify_current_password(&state, &staff, &body.password)
+        .await
+        .map_err(|err| match err.status {
+            StatusCode::BAD_REQUEST => ApiError::bad_request("Password is incorrect"),
+            _ => err,
+        })?;
+    require_step_up(&state, &staff.id, Some(&body.code))
+        .await
+        .map_err(|err| match err.status {
+            StatusCode::BAD_REQUEST => ApiError::bad_request("Invalid authentication code"),
+            _ => err,
+        })?;
 
     let Some(row) = state.db.clear_staff_totp(&staff.id).await? else {
         return Err(ApiError::unauthorized("Unknown staff user"));
     };
+    jobs::audit::record(
+        &state,
+        &staff_actor(&current, &client_ip),
+        "auth.totp_disabled",
+        Some(("staff", &row.id)),
+        json!({}),
+    )
+    .await;
     Ok(Json(staff_to_json(&row)))
 }
 
@@ -432,12 +648,16 @@ struct CreateStaffRequest {
     first_name: String,
     last_name: String,
     role: String,
+    totp_code: Option<String>,
 }
 
 async fn create_staff(
     State(state): State<AppState>,
+    Extension(current): Extension<CurrentStaff>,
+    client_ip: ClientIp,
     Json(body): Json<CreateStaffRequest>,
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
+    require_step_up(&state, &current.id, body.totp_code.as_deref()).await?;
     let email = validate_email(&body.email)?;
     let (first_name, last_name) = validate_names(&body.first_name, &body.last_name)?;
     validate_password(&body.password)?;
@@ -454,6 +674,14 @@ async fn create_staff(
         .db
         .create_staff_user(&email, &first_name, &last_name, &password_hash, role)
         .await?;
+    jobs::audit::record(
+        &state,
+        &staff_actor(&current, &client_ip),
+        "staff.created",
+        Some(("staff", &row.id)),
+        json!({ "email": row.email, "role": role.as_api() }),
+    )
+    .await;
     Ok((StatusCode::CREATED, Json(staff_to_json(&row))))
 }
 
@@ -464,11 +692,14 @@ struct UpdateStaffRequest {
     role: Option<String>,
     is_active: Option<bool>,
     password: Option<String>,
+    /// Required when `role`, `is_active` or `password` is present.
+    totp_code: Option<String>,
 }
 
 async fn update_staff(
     State(state): State<AppState>,
     Extension(current): Extension<CurrentStaff>,
+    client_ip: ClientIp,
     Path(id): Path<String>,
     Json(body): Json<UpdateStaffRequest>,
 ) -> Result<Json<Value>, ApiError> {
@@ -494,13 +725,9 @@ async fn update_staff(
         ));
     }
 
-    // Never let the instance end up without an active admin.
-    let target_is_active_admin = target.role == StaffRole::Admin.as_db() && target.is_active;
-    let loses_admin = role == Some(StaffRole::Operator) || body.is_active == Some(false);
-    if target_is_active_admin && loses_admin && state.db.count_active_admins().await? <= 1 {
-        return Err(ApiError::conflict(
-            "Cannot demote or deactivate the last active admin",
-        ));
+    let sensitive = body.role.is_some() || body.is_active.is_some() || body.password.is_some();
+    if sensitive {
+        require_step_up(&state, &current.id, body.totp_code.as_deref()).await?;
     }
 
     let password_hash = match body.password.as_deref() {
@@ -519,7 +746,8 @@ async fn update_staff(
         return Err(ApiError::bad_request("Names cannot be empty"));
     }
 
-    let Some(row) = state
+    // The last-active-admin rule is checked atomically with the write.
+    let row = match state
         .db
         .update_staff(
             &id,
@@ -530,21 +758,49 @@ async fn update_staff(
             password_hash.as_deref(),
         )
         .await?
-    else {
-        return Err(ApiError::not_found(format!("Staff user not found: {id}")));
+    {
+        StaffUpdate::Updated(row) => *row,
+        StaffUpdate::NotFound => {
+            return Err(ApiError::not_found(format!("Staff user not found: {id}")))
+        }
+        StaffUpdate::LastActiveAdmin => {
+            return Err(ApiError::conflict(
+                "Cannot demote or deactivate the last active admin",
+            ))
+        }
     };
 
-    // Blocking must be immediate: besides `require_jwt` rejecting inactive
-    // accounts, drop every stored refresh session of the blocked staff so a
-    // saved refresh token cannot be replayed later. Their API keys are
-    // revoked too (revocation is permanent — reactivating the account does
-    // not resurrect them).
+    // Blocking must be immediate: every session of the blocked staff is
+    // revoked (access tokens included — they are checked against their
+    // session), and so are their API keys (revocation is permanent —
+    // reactivating the account does not resurrect them). A password set by
+    // an admin also ends the member's sessions.
     if body.is_active == Some(false) {
-        revoke_staff_sessions(&state, &row.id).await?;
+        session::revoke_all_sessions(&state, &row.id).await?;
         state.db.revoke_api_keys_created_by(&row.id).await?;
+    } else if password_hash.is_some() {
+        session::revoke_all_sessions(&state, &row.id).await?;
     }
 
+    jobs::audit::record(
+        &state,
+        &staff_actor(&current, &client_ip),
+        "staff.updated",
+        Some(("staff", &row.id)),
+        json!({
+            "role": role.map(|r| r.as_api()),
+            "is_active": body.is_active,
+            "password_changed": password_hash.is_some(),
+            "name_changed": first_name.is_some() || last_name.is_some(),
+        }),
+    )
+    .await;
     Ok(Json(staff_to_json(&row)))
+}
+
+#[derive(Debug, Deserialize)]
+struct StepUpRequest {
+    totp_code: Option<String>,
 }
 
 /// Recovery path for a lost authenticator: an admin removes another staff
@@ -554,13 +810,16 @@ async fn update_staff(
 async fn reset_staff_totp(
     Extension(current): Extension<CurrentStaff>,
     State(state): State<AppState>,
+    client_ip: ClientIp,
     Path(id): Path<String>,
+    Json(body): Json<StepUpRequest>,
 ) -> Result<Json<Value>, ApiError> {
     if id == current.id {
         return Err(ApiError::bad_request(
             "Use the Account page to disable your own 2FA",
         ));
     }
+    require_step_up(&state, &current.id, body.totp_code.as_deref()).await?;
     let Some(staff) = state.db.find_staff_by_id(&id).await? else {
         return Err(ApiError::not_found(format!("Staff user not found: {id}")));
     };
@@ -573,35 +832,16 @@ async fn reset_staff_totp(
     let Some(row) = state.db.clear_staff_totp(&id).await? else {
         return Err(ApiError::not_found(format!("Staff user not found: {id}")));
     };
-    revoke_staff_sessions(&state, &row.id).await?;
+    session::revoke_all_sessions(&state, &row.id).await?;
+    jobs::audit::record(
+        &state,
+        &staff_actor(&current, &client_ip),
+        "staff.totp_reset",
+        Some(("staff", &row.id)),
+        json!({}),
+    )
+    .await;
     Ok(Json(staff_to_json(&row)))
-}
-
-/// Delete all refresh sessions belonging to `staff_id` from Redis.
-async fn revoke_staff_sessions(state: &AppState, staff_id: &str) -> Result<(), ApiError> {
-    let pattern = state.config.redis_key("auth:refresh:*");
-    let mut redis = state.redis.clone();
-    let mut cursor: u64 = 0;
-    loop {
-        let (next, keys): (u64, Vec<String>) = redis::cmd("SCAN")
-            .arg(cursor)
-            .arg("MATCH")
-            .arg(&pattern)
-            .arg("COUNT")
-            .arg(100)
-            .query_async(&mut redis)
-            .await?;
-        for key in keys {
-            let owner: Option<String> = redis.get(&key).await?;
-            if owner.as_deref() == Some(staff_id) {
-                let _: () = redis.del(&key).await?;
-            }
-        }
-        cursor = next;
-        if cursor == 0 {
-            return Ok(());
-        }
-    }
 }
 
 /// Display status: a key past its deadline reads `expired` even before the
@@ -643,21 +883,38 @@ async fn list_api_keys(State(state): State<AppState>) -> Result<Json<Value>, Api
 #[derive(Debug, Deserialize)]
 struct CreateApiKeyRequest {
     name: String,
-    /// Days until expiry — one of 30/90/180/365; absent or null = no expiry.
+    /// Days until expiry — one of 30/90/180/365; absent or null = no expiry
+    /// (refused with `can_send`).
     expires_in_days: Option<i64>,
     /// Grant the Lightning payout permission (default false).
     #[serde(default)]
     can_send: bool,
+    /// Required with `can_send`.
+    totp_code: Option<String>,
 }
+
+/// Longest API key name.
+const API_KEY_NAME_MAX_CHARS: usize = 100;
 
 async fn create_api_key(
     State(state): State<AppState>,
     Extension(current): Extension<CurrentStaff>,
+    client_ip: ClientIp,
     Json(body): Json<CreateApiKeyRequest>,
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
     let name = body.name.trim();
-    if name.is_empty() {
-        return Err(ApiError::bad_request("Name is required"));
+    if name.is_empty() || name.chars().count() > API_KEY_NAME_MAX_CHARS {
+        return Err(ApiError::bad_request("Name is required (at most 100 characters)"));
+    }
+    // A key that can move funds must expire, and granting it is a step-up
+    // action (#40).
+    if body.can_send {
+        if body.expires_in_days.is_none() {
+            return Err(ApiError::bad_request(
+                "A key allowed to send payouts must have an expiry",
+            ));
+        }
+        require_step_up(&state, &current.id, body.totp_code.as_deref()).await?;
     }
     let expires_at = match body.expires_in_days {
         None => None,
@@ -685,6 +942,20 @@ async fn create_api_key(
         )
         .await?;
 
+    jobs::audit::record(
+        &state,
+        &staff_actor(&current, &client_ip),
+        "api_key.created",
+        Some(("api_key", &row.id)),
+        json!({
+            "name": row.name,
+            "prefix": row.prefix,
+            "can_send": row.can_send,
+            "expires_at": row.expires_at.map(|t| t.to_rfc3339()),
+        }),
+    )
+    .await;
+
     // `key` is shown exactly once — only its hash is stored.
     Ok((
         StatusCode::CREATED,
@@ -704,23 +975,48 @@ async fn create_api_key(
 #[derive(Debug, Deserialize)]
 struct UpdateApiKeyRequest {
     can_send: bool,
+    /// Required to grant the permission (withdrawing needs none).
+    totp_code: Option<String>,
 }
 
-/// Grant or withdraw a key's Lightning payout permission.
+/// Grant or withdraw a key's Lightning payout permission. Granting is a
+/// step-up action and only for keys that expire.
 async fn update_api_key(
     State(state): State<AppState>,
+    Extension(current): Extension<CurrentStaff>,
+    client_ip: ClientIp,
     Path(id): Path<String>,
     Json(body): Json<UpdateApiKeyRequest>,
 ) -> Result<Json<Value>, ApiError> {
+    let Some(key) = state.db.find_api_key(&id).await? else {
+        return Err(ApiError::not_found(format!("API key not found: {id}")));
+    };
+    if body.can_send {
+        if key.expires_at.is_none() {
+            return Err(ApiError::bad_request(
+                "Only keys with an expiry can be allowed to send payouts",
+            ));
+        }
+        require_step_up(&state, &current.id, body.totp_code.as_deref()).await?;
+    }
     if !state.db.set_api_key_can_send(&id, body.can_send).await? {
         return Err(ApiError::not_found(format!("API key not found: {id}")));
     }
-    tracing::info!("API key {id} payout permission set to {}", body.can_send);
+    jobs::audit::record(
+        &state,
+        &staff_actor(&current, &client_ip),
+        "api_key.updated",
+        Some(("api_key", &id)),
+        json!({ "can_send": { "from": key.can_send, "to": body.can_send } }),
+    )
+    .await;
     Ok(Json(json!({ "id": id, "can_send": body.can_send })))
 }
 
 async fn revoke_api_key(
     State(state): State<AppState>,
+    Extension(current): Extension<CurrentStaff>,
+    client_ip: ClientIp,
     Path(id): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
     if !state.db.revoke_api_key(&id).await? {
@@ -728,6 +1024,14 @@ async fn revoke_api_key(
             "API key not found or already revoked: {id}"
         )));
     }
+    jobs::audit::record(
+        &state,
+        &staff_actor(&current, &client_ip),
+        "api_key.revoked",
+        Some(("api_key", &id)),
+        json!({}),
+    )
+    .await;
     Ok(Json(json!({ "status": "revoked", "id": id })))
 }
 
@@ -744,6 +1048,11 @@ struct UpdateSettingsRequest {
     /// Absent = untouched; explicit `null` = keep forever.
     #[serde(default, deserialize_with = "deserialize_some")]
     api_traffic_retention_days: Option<Option<i64>>,
+    /// Lightning payout limits in sats (`0` disables payouts); changing
+    /// either needs `totp_code`.
+    payout_max_sats: Option<u64>,
+    payout_daily_max_sats: Option<u64>,
+    totp_code: Option<String>,
 }
 
 /// Distinguishes a missing JSON field (`None`) from an explicit `null`
@@ -761,8 +1070,25 @@ const TOTP_ISSUER_MAX_LEN: usize = 40;
 
 async fn update_settings(
     State(state): State<AppState>,
+    Extension(current): Extension<CurrentStaff>,
+    client_ip: ClientIp,
     Json(body): Json<UpdateSettingsRequest>,
 ) -> Result<Json<Value>, ApiError> {
+    // Validate everything before writing anything.
+    let payout_limits_changed =
+        body.payout_max_sats.is_some() || body.payout_daily_max_sats.is_some();
+    for value in [body.payout_max_sats, body.payout_daily_max_sats].into_iter().flatten() {
+        if value > domain::BTC_MAX_SATS {
+            return Err(ApiError::bad_request(
+                "Payout limits must be between 0 and 2100000000000000 sats",
+            ));
+        }
+    }
+    if payout_limits_changed {
+        require_step_up(&state, &current.id, body.totp_code.as_deref()).await?;
+    }
+    let before = settings_json(&state).await?.0;
+
     if let Some(minutes) = body.deposit_expiry_minutes {
         if !(1..=config::DEPOSIT_EXPIRY_MAX_MINUTES).contains(&minutes) {
             return Err(ApiError::bad_request(
@@ -821,7 +1147,29 @@ async fn update_settings(
             .await?;
     }
 
-    settings_json(&state).await
+    if let Some(sats) = body.payout_max_sats {
+        state
+            .db
+            .set_setting(db::PAYOUT_MAX_SETTING, &sats.to_string())
+            .await?;
+    }
+    if let Some(sats) = body.payout_daily_max_sats {
+        state
+            .db
+            .set_setting(db::PAYOUT_DAILY_MAX_SETTING, &sats.to_string())
+            .await?;
+    }
+
+    let after = settings_json(&state).await?;
+    jobs::audit::record(
+        &state,
+        &staff_actor(&current, &client_ip),
+        "settings.updated",
+        None,
+        json!({ "before": before, "after": after.0 }),
+    )
+    .await;
+    Ok(after)
 }
 
 async fn settings_json(state: &AppState) -> Result<Json<Value>, ApiError> {
@@ -829,12 +1177,17 @@ async fn settings_json(state: &AppState) -> Result<Json<Value>, ApiError> {
     let api_key_prefix = state.db.api_key_prefix().await?;
     let totp_issuer = state.db.totp_issuer().await?;
     let api_traffic_retention_days = state.db.api_traffic_retention_days().await?;
+    let payout_max_sats = state.db.payout_max_sats().await?;
+    let payout_daily_max_sats = state.db.payout_daily_max_sats().await?;
     Ok(Json(json!({
         "deposit_expiry_minutes": minutes,
         "api_key_prefix": api_key_prefix,
         "totp_issuer": totp_issuer,
         // null = indefinite (never purged).
         "api_traffic_retention_days": api_traffic_retention_days,
+        // 0 = payouts disabled.
+        "payout_max_sats": payout_max_sats,
+        "payout_daily_max_sats": payout_daily_max_sats,
     })))
 }
 
@@ -1044,21 +1397,37 @@ fn parse_events(events: &[String]) -> Result<Vec<WebhookEventType>, ApiError> {
     Ok(parsed)
 }
 
-/// Validate a user-provided signing secret. Empty (after trim) means "no
-/// secret"; otherwise 16–128 printable ASCII chars without whitespace.
-fn validate_webhook_secret(secret: &str) -> Result<Option<String>, ApiError> {
+/// Validate a signing secret: 16–128 printable ASCII chars without
+/// whitespace. Mandatory — deliveries are always signed (#9).
+fn validate_webhook_secret(secret: &str) -> Result<String, ApiError> {
     let secret = secret.trim();
     if secret.is_empty() {
-        return Ok(None);
+        return Err(ApiError::bad_request("The signing secret cannot be removed"));
     }
     let valid = (16..=128).contains(&secret.len())
         && secret.chars().all(|c| c.is_ascii_graphic());
     if !valid {
         return Err(ApiError::bad_request(
-            "Webhook secret must be 16-128 printable ASCII characters without spaces (empty to disable signing)",
+            "Webhook secret must be 16-128 printable ASCII characters without spaces",
         ));
     }
-    Ok(Some(secret.to_string()))
+    Ok(secret.to_string())
+}
+
+/// URL rules of the delivery client (https, no credentials, public host —
+/// relaxed in development) plus a DNS check, so the admin learns at once.
+async fn validate_webhook_url(state: &AppState, url: &str) -> Result<String, ApiError> {
+    let url = url.trim();
+    if url.len() > 2048 {
+        return Err(ApiError::bad_request("Webhook URL is too long"));
+    }
+    let allow_private = state.webhooks.allows_private();
+    let parsed = jobs::validate_webhook_url(url, allow_private)
+        .map_err(|reason| ApiError::new(StatusCode::BAD_REQUEST, reason))?;
+    jobs::check_webhook_host_resolves_publicly(&parsed, allow_private)
+        .await
+        .map_err(|reason| ApiError::new(StatusCode::BAD_REQUEST, reason))?;
+    Ok(url.to_string())
 }
 
 async fn list_webhook_endpoints(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
@@ -1086,24 +1455,23 @@ struct CreateWebhookEndpointRequest {
     url: String,
     /// Subscribed events; absent = paid only (pre-subscription behavior).
     events: Option<Vec<String>>,
-    /// Optional signing secret for X-Webhook-Signature (write-only).
+    /// Signing secret for X-Webhook-Signature(-V2) — required, write-only.
     secret: Option<String>,
 }
 
 async fn create_webhook_endpoint(
     State(state): State<AppState>,
     Extension(current): Extension<CurrentStaff>,
+    client_ip: ClientIp,
     Json(body): Json<CreateWebhookEndpointRequest>,
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
-    let url = validate_webhook_url(&body.url)?;
     let events = match body.events.as_deref() {
         Some(events) => parse_events(events)?,
         None => vec![WebhookEventType::Paid],
     };
-    let secret = match body.secret.as_deref() {
-        Some(secret) => validate_webhook_secret(secret)?,
-        None => None,
-    };
+    let secret = validate_webhook_secret(body.secret.as_deref().unwrap_or_default())?;
+    let url = validate_webhook_url(&state, &body.url).await?;
+    let secret = Some(secret);
 
     if state.db.find_webhook_endpoint_by_url(&url).await?.is_some() {
         return Err(ApiError::conflict(
@@ -1115,6 +1483,14 @@ async fn create_webhook_endpoint(
         .db
         .create_webhook_endpoint(&url, &events, secret.as_deref(), &current.id)
         .await?;
+    jobs::audit::record(
+        &state,
+        &staff_actor(&current, &client_ip),
+        "webhook_endpoint.created",
+        Some(("webhook_endpoint", &row.id)),
+        json!({ "url": row.url, "events": events_to_api(&row.events) }),
+    )
+    .await;
     Ok((
         StatusCode::CREATED,
         Json(json!({
@@ -1133,34 +1509,37 @@ async fn create_webhook_endpoint(
 struct UpdateWebhookEndpointRequest {
     is_active: Option<bool>,
     events: Option<Vec<String>>,
-    /// Present + non-empty = rotate; present + empty = remove signing.
+    /// Present = rotate (signing can no longer be removed).
     secret: Option<String>,
 }
 
 async fn update_webhook_endpoint(
     State(state): State<AppState>,
+    Extension(current): Extension<CurrentStaff>,
+    client_ip: ClientIp,
     Path(id): Path<String>,
     Json(body): Json<UpdateWebhookEndpointRequest>,
 ) -> Result<Json<Value>, ApiError> {
     if body.is_active.is_none() && body.events.is_none() && body.secret.is_none() {
         return Err(ApiError::bad_request("Nothing to update"));
     }
+    // Validate everything before writing anything.
+    let events = body.events.as_deref().map(parse_events).transpose()?;
+    let secret = body.secret.as_deref().map(validate_webhook_secret).transpose()?;
 
     let mut row = None;
-    if let Some(events) = body.events.as_deref() {
-        let events = parse_events(events)?;
-        row = state.db.set_webhook_endpoint_events(&id, &events).await?;
+    if let Some(events) = events.as_deref() {
+        row = state.db.set_webhook_endpoint_events(&id, events).await?;
         if row.is_none() {
             return Err(ApiError::not_found(format!(
                 "Webhook endpoint not found: {id}"
             )));
         }
     }
-    if let Some(secret) = body.secret.as_deref() {
-        let secret = validate_webhook_secret(secret)?;
+    if let Some(secret) = secret.as_deref() {
         row = state
             .db
-            .set_webhook_endpoint_secret(&id, secret.as_deref())
+            .set_webhook_endpoint_secret(&id, Some(secret))
             .await?;
         if row.is_none() {
             return Err(ApiError::not_found(format!(
@@ -1176,6 +1555,18 @@ async fn update_webhook_endpoint(
             "Webhook endpoint not found: {id}"
         )));
     };
+    jobs::audit::record(
+        &state,
+        &staff_actor(&current, &client_ip),
+        "webhook_endpoint.updated",
+        Some(("webhook_endpoint", &row.id)),
+        json!({
+            "is_active": body.is_active,
+            "events": events.as_ref().map(|e| e.iter().map(|e| e.as_api()).collect::<Vec<_>>()),
+            "secret_rotated": secret.is_some(),
+        }),
+    )
+    .await;
     Ok(Json(json!({
         "id": row.id,
         "url": row.url,
@@ -1188,6 +1579,8 @@ async fn update_webhook_endpoint(
 
 async fn delete_webhook_endpoint(
     State(state): State<AppState>,
+    Extension(current): Extension<CurrentStaff>,
+    client_ip: ClientIp,
     Path(id): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
     match state.db.delete_webhook_endpoint_if_unused(&id).await? {
@@ -1197,24 +1590,18 @@ async fn delete_webhook_endpoint(
         Some(false) => Err(ApiError::conflict(
             "This endpoint has delivery history — deactivate it instead",
         )),
-        Some(true) => Ok(Json(json!({ "status": "deleted", "id": id }))),
+        Some(true) => {
+            jobs::audit::record(
+                &state,
+                &staff_actor(&current, &client_ip),
+                "webhook_endpoint.deleted",
+                Some(("webhook_endpoint", &id)),
+                json!({}),
+            )
+            .await;
+            Ok(Json(json!({ "status": "deleted", "id": id })))
+        }
     }
-}
-
-fn validate_webhook_url(url: &str) -> Result<String, ApiError> {
-    let url = url.trim();
-    let host = url
-        .strip_prefix("https://")
-        .or_else(|| url.strip_prefix("http://"));
-    let valid = matches!(host, Some(host) if !host.is_empty())
-        && url.len() <= 2048
-        && !url.chars().any(|c| c.is_whitespace() || c.is_control());
-    if !valid {
-        return Err(ApiError::bad_request(
-            "Invalid webhook URL: must start with http:// or https:// and contain no spaces",
-        ));
-    }
-    Ok(url.to_string())
 }
 
 async fn list_webhooks(
@@ -1291,10 +1678,22 @@ async fn list_webhooks(
 /// the historical per-deposit retry which is PAID-only.
 async fn retry_webhook_delivery(
     State(state): State<AppState>,
+    Extension(current): Extension<CurrentStaff>,
+    client_ip: ClientIp,
     Path(id): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
     match retrigger_delivery(&state, &id).await {
-        Ok(()) => Ok(Json(json!({ "status": "queued", "delivery_id": id }))),
+        Ok(()) => {
+            jobs::audit::record(
+                &state,
+                &staff_actor(&current, &client_ip),
+                "webhook.retried",
+                Some(("webhook_delivery", &id)),
+                json!({}),
+            )
+            .await;
+            Ok(Json(json!({ "status": "queued", "delivery_id": id })))
+        }
         Err(RetriggerError::DeliveryNotFound) => Err(ApiError::not_found(format!(
             "Webhook delivery not found: {id}"
         ))),
@@ -1310,13 +1709,30 @@ async fn retry_webhook_delivery(
         Err(RetriggerError::NoActiveEndpoints) => Err(ApiError::service_unavailable(
             "No active webhook endpoints configured".into(),
         )),
-        Err(RetriggerError::Other(err)) => Err(ApiError::internal(err.to_string())),
+        Err(RetriggerError::NothingToRetry) => {
+            Err(ApiError::conflict("No failed webhook delivery to retry"))
+        }
+        Err(RetriggerError::Other(err)) => Err(ApiError::internal(format!("{err:#}"))),
     }
 }
 
-async fn retry_failed(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
+async fn retry_failed(
+    State(state): State<AppState>,
+    Extension(current): Extension<CurrentStaff>,
+    client_ip: ClientIp,
+) -> Result<Json<Value>, ApiError> {
     match retrigger_failed_webhooks(&state).await {
-        Ok(retried) => Ok(Json(json!({ "retried": retried }))),
+        Ok(retried) => {
+            jobs::audit::record(
+                &state,
+                &staff_actor(&current, &client_ip),
+                "webhook.retried",
+                None,
+                json!({ "scope": "all_failed", "retried": retried }),
+            )
+            .await;
+            Ok(Json(json!({ "retried": retried })))
+        }
         Err(RetriggerError::NoActiveEndpoints) => Err(ApiError::service_unavailable(
             "No active webhook endpoints configured".into(),
         )),
@@ -1369,37 +1785,54 @@ async fn deposits_timeseries(
     Ok(Json(json!({ "days": days, "data": data })))
 }
 
-async fn issue_token_pair(state: &AppState, staff: &StaffUserRow) -> Result<Value, ApiError> {
-    let Some(secret) = state.config.jwt_secret.as_deref() else {
-        return Err(ApiError::service_unavailable(
-            "JWT_SECRET is not configured".into(),
-        ));
-    };
-    let role =
-        StaffRole::from_db(&staff.role).map_err(|e| ApiError::internal(e.to_string()))?;
-    let access_token = auth::issue_access_token(
-        secret,
-        &staff.id,
-        &staff.email,
-        role,
-        state.config.access_token_ttl_minutes,
-    )
-    .map_err(|e| ApiError::internal(e.to_string()))?;
-
-    let (refresh_token, refresh_hash) = auth::generate_refresh_token();
-    let key = state.config.redis_key(&format!("auth:refresh:{refresh_hash}"));
-    let ttl_secs = (state.config.refresh_token_ttl_days.max(1) as u64) * 86_400;
-    let mut redis = state.redis.clone();
-    let _: () = redis.set_ex(key, &staff.id, ttl_secs).await?;
-
-    Ok(json!({
-        "access_token": access_token,
-        "refresh_token": refresh_token,
-        "staff": staff_to_json(staff),
-    }))
+#[derive(Debug, Deserialize)]
+struct AuditLogQuery {
+    action: Option<String>,
+    limit: Option<i64>,
+    offset: Option<i64>,
 }
 
-fn staff_to_json(row: &StaffUserRow) -> Value {
+async fn list_audit_log(
+    State(state): State<AppState>,
+    Query(query): Query<AuditLogQuery>,
+) -> Result<Json<Value>, ApiError> {
+    let limit = query.limit.unwrap_or(50).clamp(1, 100);
+    let offset = query.offset.unwrap_or(0).max(0);
+    let action = query
+        .action
+        .as_deref()
+        .map(str::trim)
+        .filter(|a| !a.is_empty())
+        .map(|a| a.chars().take(64).collect::<String>());
+    let (rows, total) = state
+        .db
+        .list_audit_log(action.as_deref(), limit, offset)
+        .await?;
+    let data = rows
+        .iter()
+        .map(|row| {
+            json!({
+                "id": row.id,
+                "actor_type": match row.actor_type.as_str() {
+                    "STAFF" => "staff",
+                    "API_KEY" => "api_key",
+                    _ => "system",
+                },
+                "actor_id": row.actor_id,
+                "actor_name": row.actor_name,
+                "action": row.action,
+                "target_type": row.target_type,
+                "target_id": row.target_id,
+                "details": row.details,
+                "ip": row.ip,
+                "created_at": row.created_at.to_rfc3339(),
+            })
+        })
+        .collect::<Vec<_>>();
+    Ok(Json(json!({ "data": data, "total": total, "limit": limit, "offset": offset })))
+}
+
+pub(crate) fn staff_to_json(row: &StaffUserRow) -> Value {
     json!({
         "id": row.id,
         "email": row.email,
@@ -1412,12 +1845,21 @@ fn staff_to_json(row: &StaffUserRow) -> Value {
     })
 }
 
+/// `local@domain.tld`: one `@`, no whitespace or control characters, a
+/// dotted domain with non-empty labels, at most 254 characters.
 fn validate_email(email: &str) -> Result<String, ApiError> {
     let email = email.trim().to_lowercase();
-    let valid = email.len() >= 5
-        && email.split('@').count() == 2
-        && !email.starts_with('@')
-        && !email.ends_with('@');
+    let valid = email.len() <= 254
+        && !email.chars().any(|c| c.is_whitespace() || c.is_control())
+        && match email.split_once('@') {
+            Some((local, domain)) => {
+                !local.is_empty()
+                    && !domain.contains('@')
+                    && domain.contains('.')
+                    && domain.split('.').all(|label| !label.is_empty())
+            }
+            None => false,
+        };
     if !valid {
         return Err(ApiError::bad_request("Invalid email address"));
     }
@@ -1432,11 +1874,42 @@ fn validate_names(first_name: &str, last_name: &str) -> Result<(String, String),
     Ok((first_name.to_string(), last_name.to_string()))
 }
 
+/// 12–128 characters (the upper bound caps the argon2 work per attempt).
 fn validate_password(password: &str) -> Result<(), ApiError> {
-    if password.len() < MIN_PASSWORD_LEN {
-        return Err(ApiError::bad_request(
-            "Password must be at least 8 characters",
+    let len = password.chars().count();
+    if !(PASSWORD_MIN_LEN..=PASSWORD_MAX_LEN).contains(&len) {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            format!("Password must be between {PASSWORD_MIN_LEN} and {PASSWORD_MAX_LEN} characters"),
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn emails_need_a_dotted_domain() {
+        assert_eq!(validate_email(" Alice@Example.COM ").unwrap(), "alice@example.com");
+        for bad in ["ab@cd", "a@@b.c", "@b.c", "a@", "a b@c.d", "a@b..c", "a@.c"] {
+            assert!(validate_email(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn passwords_are_bounded() {
+        assert!(validate_password(&"x".repeat(11)).is_err());
+        assert!(validate_password(&"x".repeat(12)).is_ok());
+        assert!(validate_password(&"é".repeat(128)).is_ok());
+        assert!(validate_password(&"x".repeat(129)).is_err());
+    }
+
+    #[test]
+    fn webhook_secrets_are_mandatory() {
+        assert!(validate_webhook_secret("  ").is_err());
+        assert!(validate_webhook_secret("short").is_err());
+        assert_eq!(validate_webhook_secret(&"s".repeat(16)).unwrap(), "s".repeat(16));
+    }
 }

@@ -1,36 +1,49 @@
 use std::collections::HashMap;
 use std::time::Duration as StdDuration;
 
-use axum::extract::{Path, Query, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::extract::{DefaultBodyLimit, Path, Query, State};
+use axum::http::{header, HeaderMap, HeaderName, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Extension, Json, Router};
 use chrono::{DateTime, Duration, Utc};
-use db::{DepositAddressRow, WebhookDeliveryRow};
+use config::{
+    DEPOSIT_EXPIRY_MAX_MINUTES, DEPOSIT_EXPIRY_MIN_MINUTES, MAX_PENDING_ADDRESSES_PER_API_KEY,
+    USDT_MAX_EXPECTED_AMOUNT,
+};
+use db::{AuditActor, DepositAddressRow, WebhookDeliveryRow};
 use domain::{
     decimal_to_raw, format_amount, parse_sats, raw_to_decimal, raw_to_decimal_string,
     round_to_token, supports,
     DepositAddressStatus, Network, Token, WebhookDeliveryStatus, WebhookEventType, BTC_MAX_SATS,
 };
 use jobs::{
-    expire_addresses_and_notify, get_cached_wallet_balances, get_live_balances,
-    lightning_payment_entry, lightning_payment_history, notify_address_event, retrigger_webhook,
-    send_payout, AppState, LightningError, LightningHistoryEntry, RetriggerError,
+    get_cached_wallet_balances, get_live_balances, lightning_payment_entry,
+    lightning_payment_history, notify_address_event, retrigger_failed_deposit_webhooks,
+    retrigger_webhook, Actor, AppState, LightningError, LightningHistoryEntry, PayoutCommand,
+    PayoutError, RetriggerError,
 };
-use middleware::{CurrentApiKey, CurrentStaff};
+use middleware::{ClientIp, CurrentApiKey, CurrentStaff};
 use rust_decimal::Decimal;
 use axum::http::HeaderValue;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use tower_http::cors::{AllowOrigin, Any, CorsLayer};
+use tower_http::cors::{AllowOrigin, CorsLayer};
+use tower_http::set_header::SetResponseHeaderLayer;
+use tower_http::timeout::TimeoutLayer;
 use tower_http::trace::TraceLayer;
 
 mod admin;
 mod middleware;
+mod rate_limit;
+mod session;
 mod traffic;
 
 const READINESS_TIMEOUT: StdDuration = StdDuration::from_secs(2);
+/// Whole-request bound; above the payout call's own timeout.
+const REQUEST_TIMEOUT: StdDuration = StdDuration::from_secs(config::PAYOUT_TIMEOUT_SECS + 15);
+/// JSON bodies are small; axum's implicit 2 MiB is far more than needed.
+const BODY_LIMIT_BYTES: usize = 64 * 1024;
 /// BOLT11 memo cap for `description` (characters).
 const INVOICE_DESCRIPTION_MAX_CHARS: usize = 128;
 
@@ -51,6 +64,7 @@ pub fn router(state: AppState) -> Router {
             "/lightning/payments",
             get(list_lightning_payments).post(create_lightning_payout),
         )
+        .route("/lightning/payments/quote", post(quote_lightning_payout))
         .route("/lightning/payments/{id}", get(get_lightning_payment))
         .route_layer(axum::middleware::from_fn_with_state(
             state.clone(),
@@ -65,10 +79,17 @@ pub fn router(state: AppState) -> Router {
     if state.config.jwt_secret.is_some() {
         app = app.nest("/api/admin/v1", admin::admin_router(&state));
     } else {
-        tracing::warn!(
-            "JWT_SECRET is not set (min 32 chars) — /api/admin/v1 and the dashboard are disabled"
-        );
+        tracing::warn!("JWT_SECRET is not set — /api/admin/v1 and the dashboard are disabled");
     }
+
+    // Inside the traffic layer, so a timed-out request is still recorded.
+    let app = app
+        .layer(DefaultBodyLimit::max(BODY_LIMIT_BYTES))
+        .layer(TimeoutLayer::with_status_code(
+            StatusCode::REQUEST_TIMEOUT,
+            REQUEST_TIMEOUT,
+        ));
+    let mut app = app;
 
     // Traffic log goes on after both `nest`s and outside the auth guards
     // (which are `route_layer`s inside the nested routers): it then sees the
@@ -86,25 +107,63 @@ pub fn router(state: AppState) -> Router {
         ));
     }
 
+    // JSON API: nothing may be sniffed, framed or cached (tokens, keys,
+    // payment data).
+    let mut app = app
+        .layer(SetResponseHeaderLayer::if_not_present(
+            header::X_CONTENT_TYPE_OPTIONS,
+            HeaderValue::from_static("nosniff"),
+        ))
+        .layer(SetResponseHeaderLayer::if_not_present(
+            header::X_FRAME_OPTIONS,
+            HeaderValue::from_static("DENY"),
+        ))
+        .layer(SetResponseHeaderLayer::if_not_present(
+            header::CONTENT_SECURITY_POLICY,
+            HeaderValue::from_static("default-src 'none'; frame-ancestors 'none'"),
+        ))
+        .layer(SetResponseHeaderLayer::if_not_present(
+            header::REFERRER_POLICY,
+            HeaderValue::from_static("no-referrer"),
+        ))
+        .layer(SetResponseHeaderLayer::if_not_present(
+            header::CACHE_CONTROL,
+            HeaderValue::from_static("no-store"),
+        ));
+    if !state.config.is_development() {
+        app = app.layer(SetResponseHeaderLayer::if_not_present(
+            header::STRICT_TRANSPORT_SECURITY,
+            HeaderValue::from_static("max-age=31536000; includeSubDomains"),
+        ));
+    }
+
     let app = app.layer(TraceLayer::new_for_http());
-    let app = match state.config.cors_allowed_origins.as_deref() {
-        Some(origins) => app.layer(cors_layer(origins)),
-        None => app,
+    let app = if state.config.cors_allowed_origins.is_empty() {
+        app
+    } else {
+        app.layer(cors_layer(&state.config.cors_allowed_origins))
     };
     app.with_state(state)
 }
 
 /// Optional safety net for setups where the dashboard is not served behind
-/// the same origin (dev proxy / nginx cover the normal cases).
-fn cors_layer(origins: &str) -> CorsLayer {
+/// the same origin (dev proxy / nginx cover the normal cases). Origins are
+/// validated at startup (`config`).
+fn cors_layer(origins: &[String]) -> CorsLayer {
     let list: Vec<HeaderValue> = origins
-        .split(',')
-        .filter_map(|origin| origin.trim().parse().ok())
+        .iter()
+        .filter_map(|origin| HeaderValue::from_str(origin).ok())
         .collect();
     CorsLayer::new()
         .allow_origin(AllowOrigin::list(list))
-        .allow_methods(Any)
-        .allow_headers(Any)
+        .allow_methods([Method::GET, Method::POST, Method::PATCH, Method::DELETE])
+        .allow_headers([
+            header::CONTENT_TYPE,
+            header::AUTHORIZATION,
+            HeaderName::from_static("x-api-key"),
+            HeaderName::from_static("idempotency-key"),
+            HeaderName::from_static(session::CSRF_HEADER),
+        ])
 }
 
 async fn healthz() -> Json<Value> {
@@ -143,7 +202,11 @@ async fn readyz(State(state): State<AppState>) -> impl IntoResponse {
 async fn check_postgres(state: &AppState) -> String {
     match tokio::time::timeout(READINESS_TIMEOUT, state.db.ping()).await {
         Ok(Ok(())) => "ok".into(),
-        Ok(Err(e)) => format!("error: {e:#}"),
+        Ok(Err(err)) => {
+            // Detail stays in the logs — /readyz is public.
+            tracing::warn!("Postgres readiness check failed: {err:#}");
+            "error".into()
+        }
         Err(_) => "timeout".into(),
     }
 }
@@ -172,26 +235,70 @@ async fn check_redis(state: &AppState) -> String {
     .await
     {
         Ok(Ok(_)) => "ok".into(),
-        Ok(Err(e)) => format!("error: {e}"),
+        Ok(Err(err)) => {
+            tracing::warn!("Redis readiness check failed: {err}");
+            "error".into()
+        }
         Err(_) => "timeout".into(),
+    }
+}
+
+/// The audit actor of a request (merchant key or staff member).
+fn actor(api_key: Option<&CurrentApiKey>, staff: Option<&CurrentStaff>, ip: &ClientIp) -> Actor {
+    let audit = match (api_key, staff) {
+        (Some(key), _) => AuditActor::ApiKey(key.id.clone()),
+        (None, Some(staff)) => AuditActor::Staff(staff.id.clone()),
+        (None, None) => AuditActor::System,
+    };
+    Actor {
+        audit,
+        ip: ip.0.clone(),
     }
 }
 
 async fn create_deposit_address(
     State(state): State<AppState>,
+    api_key: Option<Extension<CurrentApiKey>>,
     Json(body): Json<CreateDepositAddressRequest>,
 ) -> Result<(StatusCode, Json<DepositAddressResponse>), ApiError> {
     let request = validate_create_request(&body)?;
     let network = request.network;
+    // An address nobody polls would never see its payment (#66).
+    if !state.is_network_enabled(network) {
+        return Err(ApiError::service_unavailable(format!(
+            "{} is not configured",
+            network.as_api()
+        )));
+    }
 
-    let expires_at = if let Some(exp) = body.expires_at {
-        chrono::DateTime::parse_from_rfc3339(&exp)
-            .map(|d| d.with_timezone(&Utc))
-            .map_err(|_| ApiError::bad_request("Invalid expires_at"))?
-    } else {
-        let expiry_minutes = state.db.deposit_expiry_minutes().await?;
-        Utc::now() + Duration::minutes(expiry_minutes)
+    let now = Utc::now();
+    let expires_at = match body.expires_at.as_deref() {
+        Some(exp) => {
+            let expires_at = chrono::DateTime::parse_from_rfc3339(exp)
+                .map(|d| d.with_timezone(&Utc))
+                .map_err(|_| ApiError::bad_request("Invalid expires_at"))?;
+            validate_expires_at(expires_at, now)?
+        }
+        None => {
+            let expiry_minutes = state.db.deposit_expiry_minutes().await?;
+            now + Duration::minutes(expiry_minutes)
+        }
     };
+
+    // Each open payment costs a provider call per polling cycle: bound
+    // what one merchant key can open.
+    if let Some(key) = api_key.as_deref() {
+        rate_limit::hit(&state, rate_limit::DEPOSIT_ADDRESS_CREATION, &key.id).await?;
+        let open = state.db.count_pending_addresses_for_api_key(&key.id).await?;
+        if open >= MAX_PENDING_ADDRESSES_PER_API_KEY {
+            return Err(ApiError::new(
+                StatusCode::TOO_MANY_REQUESTS,
+                format!(
+                    "Too many open payments for this API key (max {MAX_PENDING_ADDRESSES_PER_API_KEY})"
+                ),
+            ));
+        }
+    }
 
     // Lightning rows carry no key material; the index is allocated per
     // network all the same, for uniformity.
@@ -238,6 +345,7 @@ async fn create_deposit_address(
             request.expected_amount,
             expires_at,
             metadata,
+            api_key.as_deref().map(|key| key.id.as_str()),
         )
         .await?;
 
@@ -287,11 +395,11 @@ fn validate_create_request(
                     "expected_amount_sats is required on bitcoin/lightning",
                 ));
             };
-            let sats = parse_sats(raw).map_err(|_| ApiError {
-                status: StatusCode::BAD_REQUEST,
-                message: format!(
-                    "Invalid expected_amount_sats (integer string, 1 to {BTC_MAX_SATS})"
-                ),
+            let sats = parse_sats(raw).map_err(|_| {
+                ApiError::new(
+                    StatusCode::BAD_REQUEST,
+                    format!("Invalid expected_amount_sats (integer string, 1 to {BTC_MAX_SATS})"),
+                )
             })?;
             let amount = raw_to_decimal(&sats.to_string(), token).map_err(ApiError::from)?;
             (amount, Some(sats))
@@ -307,7 +415,18 @@ fn validate_create_request(
                 .as_deref()
                 .and_then(|v| v.parse().ok())
                 .ok_or_else(|| ApiError::bad_request("Invalid expected_amount"))?;
-            (round_to_token(amount, token), None)
+            let amount = round_to_token(amount, token);
+            // 0 would be settled by any zero-value transfer (address
+            // poisoning); huge values overflow DECIMAL(24,8).
+            if amount <= Decimal::ZERO || amount > Decimal::from(USDT_MAX_EXPECTED_AMOUNT) {
+                return Err(ApiError::new(
+                    StatusCode::BAD_REQUEST,
+                    format!(
+                        "expected_amount must be greater than 0 and at most {USDT_MAX_EXPECTED_AMOUNT}"
+                    ),
+                ));
+            }
+            (amount, None)
         }
     };
 
@@ -316,12 +435,10 @@ fn validate_create_request(
             return Err(ApiError::bad_request("description is only accepted on lightning"));
         }
         if description.chars().count() > INVOICE_DESCRIPTION_MAX_CHARS {
-            return Err(ApiError {
-                status: StatusCode::BAD_REQUEST,
-                message: format!(
-                    "description must be at most {INVOICE_DESCRIPTION_MAX_CHARS} characters"
-                ),
-            });
+            return Err(ApiError::new(
+                StatusCode::BAD_REQUEST,
+                format!("description must be at most {INVOICE_DESCRIPTION_MAX_CHARS} characters"),
+            ));
         }
     }
 
@@ -332,6 +449,25 @@ fn validate_create_request(
         expected_sats,
         description: body.description.clone(),
     })
+}
+
+/// A client-chosen deadline must leave time to pay and not keep the payment
+/// polled for days.
+fn validate_expires_at(
+    expires_at: DateTime<Utc>,
+    now: DateTime<Utc>,
+) -> Result<DateTime<Utc>, ApiError> {
+    let min = now + Duration::minutes(DEPOSIT_EXPIRY_MIN_MINUTES);
+    let max = now + Duration::minutes(DEPOSIT_EXPIRY_MAX_MINUTES);
+    if expires_at < min || expires_at > max {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "expires_at must be between {DEPOSIT_EXPIRY_MIN_MINUTES} and {DEPOSIT_EXPIRY_MAX_MINUTES} minutes from now"
+            ),
+        ));
+    }
+    Ok(expires_at)
 }
 
 /// BOLT11 expiry matching the gateway expiry, so both lapse together.
@@ -347,8 +483,8 @@ async fn list_deposit_addresses(
     State(state): State<AppState>,
     Query(query): Query<ListQuery>,
 ) -> Result<Json<ListResponse>, ApiError> {
-    let _ = expire_addresses_and_notify(&state).await?;
-
+    // Expiry is the monitor loops' job (after a last poll), never a side
+    // effect of listing.
     let status = query
         .status
         .as_deref()
@@ -384,8 +520,12 @@ async fn list_deposit_addresses(
 
 async fn get_deposit_address(
     State(state): State<AppState>,
+    api_key: Option<Extension<CurrentApiKey>>,
     Path(id): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
+    // Endpoint URLs (and errors quoting them) are admin data: a merchant
+    // key never sees them (#51).
+    let merchant = api_key.is_some();
     let Some(row) = state.db.find_deposit_address(&id).await? else {
         return Err(ApiError::not_found(format!(
             "Deposit address not found: {id}"
@@ -438,19 +578,21 @@ async fn get_deposit_address(
                     // recently updated delivery, legacy rows included).
                     let webhook = entries
                         .first()
-                        .map(|delivery| webhook_to_json(delivery))
+                        .map(|delivery| webhook_to_json(delivery, merchant))
                         .unwrap_or(Value::Null);
                     let webhooks: Vec<Value> = entries
                         .iter()
                         .filter_map(|delivery| {
                             let endpoint_id = delivery.webhook_endpoint_id.as_ref()?;
-                            let mut entry = webhook_to_json(delivery);
+                            let mut entry = webhook_to_json(delivery, merchant);
                             if let Some(entry_obj) = entry.as_object_mut() {
                                 entry_obj.insert("endpoint_id".into(), json!(endpoint_id));
-                                entry_obj.insert(
-                                    "endpoint_url".into(),
-                                    json!(endpoint_urls.get(endpoint_id)),
-                                );
+                                if !merchant {
+                                    entry_obj.insert(
+                                        "endpoint_url".into(),
+                                        json!(endpoint_urls.get(endpoint_id)),
+                                    );
+                                }
                             }
                             Some(entry)
                         })
@@ -474,25 +616,56 @@ async fn get_deposit_address(
     Ok(Json(base))
 }
 
-fn webhook_to_json(delivery: &WebhookDeliveryRow) -> Value {
-    json!({
+/// `merchant`: drop `last_error` (it can quote the endpoint).
+fn webhook_to_json(delivery: &WebhookDeliveryRow, merchant: bool) -> Value {
+    let mut entry = json!({
         "status": WebhookDeliveryStatus::from_db(&delivery.status).map(|s| s.as_api()).unwrap_or("pending"),
         "attempts": delivery.attempts,
         "last_response": delivery.last_response,
         "last_error": delivery.last_error,
         "updated_at": delivery.updated_at.to_rfc3339(),
-    })
+    });
+    if merchant {
+        if let Some(object) = entry.as_object_mut() {
+            object.remove("last_error");
+        }
+    }
+    entry
 }
 
+/// Merchant keys may only re-queue deliveries that FAILED (never resend a
+/// delivered `deposit_confirmed`), at most once a minute per deposit.
+/// Staff (ADMIN-only route) replay every endpoint, delivered ones included.
 async fn retry_deposit_webhook(
     State(state): State<AppState>,
+    api_key: Option<Extension<CurrentApiKey>>,
+    staff: Option<Extension<CurrentStaff>>,
+    client_ip: ClientIp,
     Path(deposit_id): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
-    match retrigger_webhook(&state, &deposit_id).await {
-        Ok(()) => Ok(Json(json!({
-            "status": "queued",
-            "deposit_id": deposit_id,
-        }))),
+    let result = match api_key.as_deref() {
+        Some(_) => {
+            rate_limit::hit(&state, rate_limit::WEBHOOK_REPLAY_PER_DEPOSIT, &deposit_id).await?;
+            retrigger_failed_deposit_webhooks(&state, &deposit_id).await
+        }
+        None => retrigger_webhook(&state, &deposit_id).await.map(|()| 0),
+    };
+    match result {
+        Ok(retried) => {
+            jobs::audit::record(
+                &state,
+                &actor(api_key.as_deref(), staff.as_deref(), &client_ip),
+                "webhook.retried",
+                Some(("deposit", &deposit_id)),
+                json!({ "scope": if api_key.is_some() { "failed" } else { "all" } }),
+            )
+            .await;
+            let mut body = json!({ "status": "queued", "deposit_id": deposit_id });
+            if api_key.is_some() {
+                body["retried"] = json!(retried);
+            }
+            Ok(Json(body))
+        }
         Err(RetriggerError::DepositNotFound) => Err(ApiError::not_found(format!(
             "Deposit not found: {deposit_id}"
         ))),
@@ -502,14 +675,36 @@ async fn retry_deposit_webhook(
         Err(RetriggerError::NoActiveEndpoints) => Err(ApiError::service_unavailable(
             "No active webhook endpoints configured".into(),
         )),
-        Err(RetriggerError::Other(err)) => Err(ApiError::internal(err.to_string())),
+        Err(RetriggerError::NothingToRetry) => {
+            Err(ApiError::conflict("No failed webhook delivery to retry"))
+        }
+        Err(RetriggerError::Other(err)) => Err(ApiError::internal(format!("{err:#}"))),
         Err(err) => Err(ApiError::internal(format!("{err:?}"))),
     }
 }
 
+/// Served from a 5-minute cache, recomputed in the background: the first
+/// call (or the first after expiry) answers 503 with `Retry-After`.
 async fn get_balances(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
-    let resp = get_live_balances(&state).await?;
-    Ok(Json(serde_json::to_value(resp)?))
+    match get_live_balances(&state).await? {
+        Some(balances) => Ok(Json(serde_json::to_value(balances)?)),
+        None => Err(ApiError::service_unavailable(
+            "Balances are being computed — retry shortly".into(),
+        )
+        .with_retry_after(15)),
+    }
+}
+
+/// The Lightning wallet history exposes every payee and payer of the
+/// (possibly shared) wallet: merchant keys need `can_send`; on the admin
+/// surface the routes are ADMIN-only.
+fn authorize_lightning_read(api_key: Option<&CurrentApiKey>) -> Result<(), ApiError> {
+    match api_key {
+        Some(key) if !key.can_send => Err(ApiError::forbidden(
+            "This API key is not allowed to access the Lightning wallet",
+        )),
+        _ => Ok(()),
+    }
 }
 
 /// The whole Lightning wallet history (every direction and status, funds
@@ -517,8 +712,10 @@ async fn get_balances(State(state): State<AppState>) -> Result<Json<Value>, ApiE
 /// `has_more`: the SDK reports no total.
 async fn list_lightning_payments(
     State(state): State<AppState>,
+    api_key: Option<Extension<CurrentApiKey>>,
     Query(query): Query<PageQuery>,
 ) -> Result<Json<Value>, ApiError> {
+    authorize_lightning_read(api_key.as_deref())?;
     let (limit, offset) = history_paging(&query);
     match lightning_payment_history(&state, offset, limit).await {
         Ok(Some(page)) => Ok(Json(json!({
@@ -550,6 +747,8 @@ struct PayoutRequest {
     amount_sats: String,
     /// Sent to the recipient; its maximum length is the recipient's.
     comment: Option<String>,
+    /// Staff only: fresh TOTP code (step-up).
+    totp_code: Option<String>,
 }
 
 #[derive(Debug)]
@@ -571,9 +770,11 @@ fn validate_payout_request(
             "ln_address must be a Lightning address (user@domain)",
         ));
     }
-    let amount_sats = parse_sats(&body.amount_sats).map_err(|_| ApiError {
-        status: StatusCode::BAD_REQUEST,
-        message: format!("Invalid amount_sats (integer string, 1 to {BTC_MAX_SATS})"),
+    let amount_sats = parse_sats(&body.amount_sats).map_err(|_| {
+        ApiError::new(
+            StatusCode::BAD_REQUEST,
+            format!("Invalid amount_sats (integer string, 1 to {BTC_MAX_SATS})"),
+        )
     })?;
     let idempotency_key = idempotency_key
         .map(|key| {
@@ -590,8 +791,11 @@ fn validate_payout_request(
     })
 }
 
-/// Domain suffixes that only resolve inside a private network.
-const LOCAL_TLDS: [&str; 6] = ["local", "localhost", "internal", "lan", "home", "localdomain"];
+/// Domain suffixes that only resolve inside a private network (or never).
+const LOCAL_TLDS: [&str; 13] = [
+    "local", "localhost", "internal", "lan", "home", "localdomain", "arpa", "test", "invalid",
+    "example", "onion", "corp", "intranet",
+];
 
 /// `user@domain` (LUD-16): one `@`, a user part of letters, digits and
 /// `-_.` (what the SDK accepts), and a public DNS name — the SDK fetches
@@ -642,54 +846,169 @@ fn authorize_payout(
     }
 }
 
-/// Pay a Lightning address from the wallet. Answers as soon as the send is
-/// accepted (usually `pending`); the outcome follows as a payout webhook and
-/// through `GET /lightning/payments/{id}`.
+/// The SDK fetches `https://<domain>/.well-known/lnurlp/<user>`: a public
+/// name that resolves to an internal address would make the gateway probe
+/// its own network (#65). Best effort (the SDK resolves again), skipped in
+/// development.
+async fn ensure_public_ln_domain(state: &AppState, ln_address: &str) -> Result<(), ApiError> {
+    if state.config.is_development() {
+        return Ok(());
+    }
+    let host = ln_address.rsplit_once('@').map(|(_, d)| d).unwrap_or_default();
+    let resolved: Vec<std::net::SocketAddr> = tokio::net::lookup_host((host, 443))
+        .await
+        .map_err(|_| ApiError::bad_request("Lightning address domain does not resolve"))?
+        .collect();
+    if resolved.is_empty() || !resolved.iter().all(|addr| domain::is_public_ip(addr.ip())) {
+        return Err(ApiError::bad_request(
+            "Lightning address domain must resolve to public addresses only",
+        ));
+    }
+    Ok(())
+}
+
+fn payout_error(err: PayoutError, quote: bool) -> ApiError {
+    match err {
+        PayoutError::Unavailable => {
+            ApiError::service_unavailable("Lightning is not configured".into())
+        }
+        PayoutError::PayoutsDisabled => {
+            ApiError::unprocessable("Payouts are disabled (limit set to 0)".into())
+        }
+        PayoutError::PerPayoutLimit { max_sats } => ApiError::unprocessable(format!(
+            "Amount exceeds the per-payout limit of {max_sats} sats"
+        )),
+        PayoutError::DailyLimit {
+            used_sats,
+            max_sats,
+        } => ApiError::unprocessable(format!(
+            "Daily payout limit reached: {used_sats} of {max_sats} sats already sent in the last 24 h"
+        )),
+        PayoutError::InProgress => {
+            ApiError::conflict("A payout with this Idempotency-Key is already in progress")
+        }
+        // Also covers a key used by another caller — without saying so.
+        PayoutError::KeyReused => ApiError::unprocessable(
+            "Idempotency-Key was already used with different parameters".into(),
+        ),
+        // Generic on purpose: the SDK detail stays server-side.
+        PayoutError::Failed if quote => ApiError::bad_gateway("Could not get a quote"),
+        PayoutError::Failed => ApiError::bad_gateway("Payment failed"),
+        PayoutError::Internal(err) => ApiError::internal(format!("{err:#}")),
+    }
+}
+
+/// Pay a Lightning address from the wallet, once per `Idempotency-Key`
+/// (required). Answers 202 as soon as the send is accepted (usually
+/// `pending`), 200 for a replayed key; the outcome follows as a payout
+/// webhook and through `GET /lightning/payments/{id}`. Staff need a fresh
+/// TOTP code.
 async fn create_lightning_payout(
     State(state): State<AppState>,
     api_key: Option<Extension<CurrentApiKey>>,
     staff: Option<Extension<CurrentStaff>>,
+    client_ip: ClientIp,
     headers: HeaderMap,
     Json(body): Json<PayoutRequest>,
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
     authorize_payout(api_key.as_deref(), staff.as_deref())?;
     let idempotency_key = headers
         .get("idempotency-key")
-        .map(|value| value.to_str().unwrap_or_default());
-    let payout = validate_payout_request(&body, idempotency_key)?;
-
-    match send_payout(
-        &state,
-        &payout.ln_address,
-        payout.amount_sats,
-        payout.comment,
-        payout.idempotency_key,
-    )
-    .await
-    {
-        Ok(payment) => Ok((
-            StatusCode::ACCEPTED,
-            Json(lightning_history_json(&LightningHistoryEntry {
-                payment,
-                deposit_address_id: None,
-            })),
-        )),
-        Err(LightningError::Disabled) => Err(ApiError::service_unavailable(
-            "Lightning is not configured".into(),
-        )),
-        Err(LightningError::Failed(err)) => {
-            // Generic on purpose: the SDK detail stays server-side.
-            tracing::warn!("Lightning payout to {} failed: {err:#}", payout.ln_address);
-            Err(ApiError::bad_gateway("Payment failed"))
-        }
+        .map(|value| value.to_str().unwrap_or_default())
+        .ok_or_else(|| ApiError::bad_request("Idempotency-Key header is required (UUID)"))?;
+    let payout = validate_payout_request(&body, Some(idempotency_key))?;
+    let caller_id = api_key
+        .as_deref()
+        .map(|key| key.id.clone())
+        .or_else(|| staff.as_deref().map(|staff| staff.id.clone()))
+        .unwrap_or_default();
+    rate_limit::hit(&state, rate_limit::PAYOUTS, &caller_id).await?;
+    if let (None, Some(staff)) = (api_key.as_deref(), staff.as_deref()) {
+        admin::require_step_up(&state, &staff.id, body.totp_code.as_deref()).await?;
     }
+    ensure_public_ln_domain(&state, &payout.ln_address).await?;
+
+    let command = PayoutCommand {
+        ln_address: payout.ln_address,
+        amount_sats: payout.amount_sats,
+        comment: payout.comment,
+        idempotency_key: payout
+            .idempotency_key
+            .ok_or_else(|| ApiError::bad_request("Idempotency-Key header is required (UUID)"))?,
+        api_key_id: api_key.as_deref().map(|key| key.id.clone()),
+        staff_id: match api_key.as_deref() {
+            Some(_) => None,
+            None => staff.as_deref().map(|staff| staff.id.clone()),
+        },
+    };
+    let actor = actor(api_key.as_deref(), staff.as_deref(), &client_ip);
+    let outcome = jobs::request_payout(&state, &actor, &command)
+        .await
+        .map_err(|err| payout_error(err, false))?;
+    let status = if outcome.replayed {
+        StatusCode::OK
+    } else {
+        StatusCode::ACCEPTED
+    };
+    Ok((
+        status,
+        Json(lightning_history_json(&LightningHistoryEntry {
+            payment: outcome.payment,
+            deposit_address_id: None,
+        })),
+    ))
+}
+
+#[derive(Debug, Deserialize)]
+struct PayoutQuoteRequest {
+    ln_address: String,
+    amount_sats: String,
+    comment: Option<String>,
+}
+
+/// What a payout would cost (the recipient's invoice + fee), without
+/// paying — the dashboard's confirmation step.
+async fn quote_lightning_payout(
+    State(state): State<AppState>,
+    api_key: Option<Extension<CurrentApiKey>>,
+    staff: Option<Extension<CurrentStaff>>,
+    Json(body): Json<PayoutQuoteRequest>,
+) -> Result<Json<Value>, ApiError> {
+    authorize_payout(api_key.as_deref(), staff.as_deref())?;
+    let payout = validate_payout_request(
+        &PayoutRequest {
+            ln_address: body.ln_address,
+            amount_sats: body.amount_sats,
+            comment: body.comment,
+            totp_code: None,
+        },
+        None,
+    )?;
+    let caller_id = api_key
+        .as_deref()
+        .map(|key| key.id.clone())
+        .or_else(|| staff.as_deref().map(|staff| staff.id.clone()))
+        .unwrap_or_default();
+    rate_limit::hit(&state, rate_limit::PAYOUTS, &caller_id).await?;
+    ensure_public_ln_domain(&state, &payout.ln_address).await?;
+    let quote = jobs::quote_payout(&state, &payout.ln_address, payout.amount_sats, payout.comment)
+        .await
+        .map_err(|err| payout_error(err, true))?;
+    Ok(Json(json!({
+        "ln_address": payout.ln_address,
+        "amount_sats": quote.amount_sats.to_string(),
+        "fees_sats": quote.fees_sats.to_string(),
+        "total_sats": quote.amount_sats.saturating_add(quote.fees_sats).to_string(),
+    })))
 }
 
 /// One wallet payment (any direction) — e.g. a payout's current status.
 async fn get_lightning_payment(
     State(state): State<AppState>,
+    api_key: Option<Extension<CurrentApiKey>>,
     Path(id): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
+    authorize_lightning_read(api_key.as_deref())?;
     match lightning_payment_entry(&state, &id).await {
         Ok(Some(entry)) => Ok(Json(lightning_history_json(&entry))),
         Ok(None) => Err(ApiError::not_found(format!("Lightning payment not found: {id}"))),
@@ -812,56 +1131,51 @@ struct ListResponse {
 pub struct ApiError {
     status: StatusCode,
     message: String,
+    /// Sent as `Retry-After` (429 / 503).
+    retry_after: Option<u64>,
 }
 
 impl ApiError {
-    fn not_found(message: String) -> Self {
+    fn new(status: StatusCode, message: impl Into<String>) -> Self {
         Self {
-            status: StatusCode::NOT_FOUND,
-            message,
+            status,
+            message: message.into(),
+            retry_after: None,
         }
+    }
+    fn with_retry_after(mut self, secs: u64) -> Self {
+        self.retry_after = Some(secs);
+        self
+    }
+    fn not_found(message: String) -> Self {
+        Self::new(StatusCode::NOT_FOUND, message)
     }
     fn bad_request(message: &str) -> Self {
-        Self {
-            status: StatusCode::BAD_REQUEST,
-            message: message.into(),
-        }
+        Self::new(StatusCode::BAD_REQUEST, message)
     }
     fn unauthorized(message: &str) -> Self {
-        Self {
-            status: StatusCode::UNAUTHORIZED,
-            message: message.into(),
-        }
+        Self::new(StatusCode::UNAUTHORIZED, message)
     }
     fn forbidden(message: &str) -> Self {
-        Self {
-            status: StatusCode::FORBIDDEN,
-            message: message.into(),
-        }
+        Self::new(StatusCode::FORBIDDEN, message)
     }
     fn conflict(message: &str) -> Self {
-        Self {
-            status: StatusCode::CONFLICT,
-            message: message.into(),
-        }
+        Self::new(StatusCode::CONFLICT, message)
     }
-    fn internal(message: String) -> Self {
-        Self {
-            status: StatusCode::INTERNAL_SERVER_ERROR,
-            message,
-        }
+    fn unprocessable(message: String) -> Self {
+        Self::new(StatusCode::UNPROCESSABLE_ENTITY, message)
+    }
+    /// The detail (driver errors, constraint names…) is logged, never sent:
+    /// clients only get a generic message.
+    fn internal(detail: String) -> Self {
+        tracing::error!("Internal error: {detail}");
+        Self::new(StatusCode::INTERNAL_SERVER_ERROR, "Internal server error")
     }
     fn bad_gateway(message: &str) -> Self {
-        Self {
-            status: StatusCode::BAD_GATEWAY,
-            message: message.into(),
-        }
+        Self::new(StatusCode::BAD_GATEWAY, message)
     }
     fn service_unavailable(message: String) -> Self {
-        Self {
-            status: StatusCode::SERVICE_UNAVAILABLE,
-            message,
-        }
+        Self::new(StatusCode::SERVICE_UNAVAILABLE, message)
     }
 }
 
@@ -873,7 +1187,7 @@ impl From<domain::DomainError> for ApiError {
 
 impl From<anyhow::Error> for ApiError {
     fn from(value: anyhow::Error) -> Self {
-        Self::internal(value.to_string())
+        Self::internal(format!("{value:#}"))
     }
 }
 
@@ -895,7 +1209,13 @@ impl IntoResponse for ApiError {
             "statusCode": self.status.as_u16(),
             "message": self.message,
         }));
-        (self.status, body).into_response()
+        let mut response = (self.status, body).into_response();
+        if let Some(secs) = self.retry_after {
+            response
+                .headers_mut()
+                .insert(header::RETRY_AFTER, HeaderValue::from(secs));
+        }
+        response
     }
 }
 
@@ -1184,7 +1504,7 @@ mod tests {
     fn payouts_need_a_permitted_key_or_an_admin() {
         use crate::middleware::{CurrentApiKey, CurrentStaff};
         let key = |can_send| CurrentApiKey { id: "k".into(), can_send };
-        let staff = |role| CurrentStaff { id: "s".into(), email: "s@example.com".into(), role };
+        let staff = |role| CurrentStaff { id: "s".into(), role };
 
         assert!(authorize_payout(Some(&key(true)), None).is_ok());
         let err = authorize_payout(Some(&key(false)), None).unwrap_err();
@@ -1196,6 +1516,69 @@ mod tests {
 
         let err = authorize_payout(None, None).unwrap_err();
         assert_eq!(err.status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn usdt_amounts_must_be_positive_and_bounded() {
+        for amount in ["0", "-5", "0.0000001", "1000000000000.01"] {
+            let err = rejected(json!({
+                "network": "tron", "token": "USDT", "expected_amount": amount
+            }));
+            assert_eq!(err.status, StatusCode::BAD_REQUEST, "{amount}");
+        }
+    }
+
+    #[test]
+    fn expires_at_is_bounded() {
+        let now = Utc::now();
+        assert!(validate_expires_at(now + Duration::minutes(30), now).is_ok());
+        for bad in [
+            now - Duration::minutes(5),
+            now + Duration::seconds(30),
+            now + Duration::minutes(1441),
+            now + Duration::days(365 * 7000),
+        ] {
+            let err = validate_expires_at(bad, now).unwrap_err();
+            assert_eq!(err.status, StatusCode::BAD_REQUEST);
+        }
+    }
+
+    #[test]
+    fn lightning_history_needs_a_sending_key() {
+        assert!(authorize_lightning_read(None).is_ok());
+        let key = |can_send| CurrentApiKey { id: "k".into(), can_send };
+        assert!(authorize_lightning_read(Some(&key(true))).is_ok());
+        assert_eq!(
+            authorize_lightning_read(Some(&key(false))).unwrap_err().status,
+            StatusCode::FORBIDDEN
+        );
+    }
+
+    #[test]
+    fn payout_errors_map_to_client_safe_statuses() {
+        let status = |err| payout_error(err, false).status;
+        assert_eq!(status(PayoutError::PerPayoutLimit { max_sats: 1 }), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(status(PayoutError::DailyLimit { used_sats: 1, max_sats: 2 }), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(status(PayoutError::PayoutsDisabled), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(status(PayoutError::KeyReused), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(status(PayoutError::InProgress), StatusCode::CONFLICT);
+        assert_eq!(status(PayoutError::Failed), StatusCode::BAD_GATEWAY);
+        let internal = payout_error(PayoutError::Internal(anyhow::anyhow!("pg: relation x")), false);
+        assert_eq!(internal.status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(internal.message, "Internal server error");
+    }
+
+    #[test]
+    fn internal_errors_never_leak_details() {
+        let err = ApiError::from(anyhow::anyhow!("duplicate key value violates unique constraint \"x\""));
+        assert_eq!(err.message, "Internal server error");
+    }
+
+    #[test]
+    fn local_lightning_domains_are_refused() {
+        for address in ["alice@node.test", "alice@1.0.0.10.in-addr.arpa", "alice@x.onion", "alice@pay.corp"] {
+            assert!(!is_lightning_address(address), "{address}");
+        }
     }
 
     #[test]
@@ -1211,6 +1594,7 @@ mod tests {
             status: DepositAddressStatus::Pending.as_db().into(),
             expires_at: now,
             metadata: json!({}),
+            api_key_id: None,
             created_at: now,
             updated_at: now,
         };

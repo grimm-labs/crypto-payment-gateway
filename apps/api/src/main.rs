@@ -6,7 +6,7 @@ use http_api::router;
 use chain::ChainClients;
 use config::{AppConfig, API_TRAFFIC_QUEUE_CAPACITY};
 use db::Db;
-use jobs::{spawn_workers, AppState, TrafficRecorder};
+use jobs::{spawn_workers, AppState, TrafficRecorder, WebhookClient};
 use lightning_client::{LightningClient, LightningConfig};
 use redis::aio::ConnectionManager;
 use tracing::info;
@@ -38,6 +38,27 @@ async fn main() -> anyhow::Result<()> {
     if config.bitcoin_esplora_base_url.is_none() {
         tracing::warn!("BITCOIN_ESPLORA_BASE_URL is not set — Bitcoin monitoring disabled");
     }
+    if config.btc_confirmations < config::BTC_CONFIRMATIONS_RECOMMENDED {
+        tracing::warn!(
+            "BTC_CONFIRMATIONS={} is below the recommended {} — replace-by-fee double spends get easier",
+            config.btc_confirmations,
+            config::BTC_CONFIRMATIONS_RECOMMENDED
+        );
+    }
+    if config.insecure_transport() {
+        if config.is_development() {
+            tracing::warn!("Redis/Postgres without verified TLS (tolerated in development)");
+        } else {
+            tracing::warn!(
+                "ALLOW_INSECURE_TRANSPORT=true — Redis/Postgres are reached WITHOUT verified TLS: staff sessions, the webhook queue and payment data travel in clear. Only acceptable on a private network."
+            );
+        }
+    }
+    if config::is_public_test_mnemonic(&config.wallet_mnemonic) {
+        tracing::warn!(
+            "WALLET_MNEMONIC is a public BIP39 test vector — never send real funds to these addresses"
+        );
+    }
 
     let wallet = WalletService::from_mnemonic(&config.wallet_mnemonic)
         .context("Invalid WALLET_MNEMONIC")?;
@@ -62,9 +83,29 @@ async fn main() -> anyhow::Result<()> {
         .await
         .context("Failed to connect to Redis")?;
 
-    let chain = ChainClients::new(config.clone());
+    let mut chain = ChainClients::new(config.clone());
+    // A provider answering for another chain (testnet node, wrong URL,
+    // tampered endpoint) would make up "confirmed" payments: that network
+    // stays disabled. A transient failure (timeout, 429) only warns.
+    for (network, result) in chain.verify_networks().await {
+        match result {
+            Ok(()) => info!("{} provider verified on mainnet", network.as_api()),
+            Err(err) if err.downcast_ref::<chain::WrongChainError>().is_some() => {
+                tracing::error!("{} disabled — {err:#}", network.as_api());
+                chain.disable_network(network);
+            }
+            Err(err) => tracing::warn!(
+                "{} mainnet check could not complete (kept enabled): {err:#}",
+                network.as_api()
+            ),
+        }
+    }
+
     let lightning = connect_lightning(&config).await;
     let (traffic, traffic_rx) = TrafficRecorder::channel(API_TRAFFIC_QUEUE_CAPACITY);
+    // http:// and private receivers are only accepted in development.
+    let webhooks = WebhookClient::new(config.is_development())?;
+    let setup_token = setup_token(&config, &db).await?;
     let state = AppState {
         config: config.clone(),
         db,
@@ -73,14 +114,13 @@ async fn main() -> anyhow::Result<()> {
         redis,
         traffic,
         lightning: lightning.clone(),
+        webhooks,
+        setup_token,
     };
 
-    // Before any expiry sweep (monitor loops, list endpoint): settle invoices
-    // paid while the gateway was down, even if their deadline has passed.
-    if let Err(err) = jobs::reconcile_lightning_backlog(&state).await {
-        tracing::warn!("Boot Lightning reconciliation failed: {err:#}");
-    }
-
+    // No boot-time reconciliation is needed before serving: every monitor
+    // loop (Lightning included) polls its open payments before its first
+    // expiry sweep, and nothing else expires payments.
     spawn_workers(state.clone(), traffic_rx);
 
     let app = router(state);
@@ -107,6 +147,24 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The one-time token `POST /setup` requires while no staff exists:
+/// `SETUP_TOKEN` when set, otherwise a random one printed once in the logs
+/// (the operator reads it there). `None` once an admin exists.
+async fn setup_token(config: &AppConfig, db: &Db) -> anyhow::Result<Option<Arc<String>>> {
+    if config.jwt_secret.is_none() || db.count_staff().await? > 0 {
+        return Ok(None);
+    }
+    if let Some(token) = &config.setup_token {
+        info!("No staff account yet — complete the dashboard setup with SETUP_TOKEN");
+        return Ok(Some(Arc::new(token.clone())));
+    }
+    let token = auth::generate_session_id();
+    tracing::warn!(
+        "No staff account yet — complete the dashboard setup with this one-time setup token: {token}"
+    );
+    Ok(Some(Arc::new(token)))
+}
+
 /// `None` (Lightning disabled) when `BREEZ_API_KEY` is unset or the SDK
 /// cannot connect — never fatal: the other networks keep running.
 async fn connect_lightning(config: &AppConfig) -> Option<LightningClient> {
@@ -114,6 +172,14 @@ async fn connect_lightning(config: &AppConfig) -> Option<LightningClient> {
         tracing::warn!("BREEZ_API_KEY is not set — Lightning disabled");
         return None;
     };
+    // The SDK connects to mainnet: a public mnemonic would put the Spark
+    // wallet in everyone's hands.
+    if config::is_public_test_mnemonic(&config.wallet_mnemonic) {
+        tracing::error!(
+            "WALLET_MNEMONIC is a public test vector — Lightning disabled (use your own mnemonic)"
+        );
+        return None;
+    }
     match LightningClient::connect(LightningConfig {
         api_key,
         mnemonic: config.wallet_mnemonic.clone(),
