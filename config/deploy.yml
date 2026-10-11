@@ -6,6 +6,9 @@
 # Secrets are resolved from .kamal/secrets (environment variables only).
 # Required: GATEWAY_HOST (the environment's server, SSH target), APP_ENV, API_HOST,
 # DASHBOARD_HOST. A missing one stops kamal with a KeyError naming it.
+# Optional: SSH_USER (default root), ALLOW_INSECURE_TRANSPORT, TRUSTED_PROXIES,
+# BITCOIN_ESPLORA_BASE_URL, KAMAL_IMAGE, KAMAL_REGISTRY_USERNAME.
+# Requires Kamal >= 2.12 (ssh.forward_agent); CI pins the exact version.
 #
 # One image (docker/Dockerfile target "all") runs as two roles: `api` (the Rust
 # gateway) and `dashboard` (nginx serving the SPA, /api proxied to the API host).
@@ -31,8 +34,24 @@ builder:
   target: all
   context: .
 
+# SSH: the target is a dedicated deploy user in the `docker` group (no root
+# login), e.g. `adduser --disabled-password deploy && usermod -aG docker deploy`,
+# its authorized_keys holding only the CI deploy key of this environment. Being
+# in the docker group is root-equivalent on the host, but it removes direct root
+# SSH and gives the deploys their own key and audit trail. Defaults to root for
+# existing servers. Switching one: create the user, set SSH_USER, deploy (Kamal
+# re-creates its state under the new user's ~/.kamal), then delete
+# /root/.kamal/apps — it still holds the old env files, secrets included.
+#
+# Host keys are verified: the OpenSSH config files are loaded (config: true),
+# and the Deploy workflow writes a pinned ~/.ssh/known_hosts plus
+# `StrictHostKeyChecking yes` (net-ssh then refuses unknown or changed keys).
+# Locally, keep the server's key in your own known_hosts the same way.
 ssh:
-  user: root
+  user: '<%= ENV["SSH_USER"].to_s.empty? ? "root" : ENV["SSH_USER"] %>'
+  config: true
+  # Never expose the deployer's SSH agent to the server.
+  forward_agent: false
 
 servers:
   api:
@@ -52,16 +71,31 @@ servers:
     # Breez SDK (Lightning) wallet storage, persistent across deploys. During a
     # deploy the old and new containers overlap for a few seconds on this volume
     # (accepted: SQLite locks it, detection and webhooks are idempotent).
-    # Role-level docker option: the dashboard role never mounts it.
+    # Role-level docker options: the dashboard role never mounts it.
+    # Hardening: the gateway runs as uid 10001 and listens on 3000, so it needs
+    # no Linux capability and never gains privileges (no setuid escalation).
     options:
       volume: crypto-payment-gateway-breez:/app/.breez-data
+      security-opt: no-new-privileges=true
+      cap-drop: ALL
     env:
       clear:
         PORT: 3000
         BREEZ_STORAGE_DIR: /app/.breez-data
-        # The API port is only reachable from the docker network, where kamal-proxy
-        # lives: its X-Forwarded-For is trusted (traffic log client IP).
+        # Client IP of the traffic log: the API walks X-Forwarded-For from the
+        # right and keeps the first hop NOT in TRUSTED_PROXIES. The API port is only
+        # reachable from the docker network, where kamal-proxy lives (default:
+        # the private ranges docker allocates from). Dashboard traffic arrives as
+        # browser -> kamal-proxy -> dashboard nginx -> https://API_HOST -> kamal-proxy
+        # -> api: nginx reaches the API through the server's public address, so a
+        # value set here must list the docker ranges AND the server's public
+        # IP(s), e.g. "172.16.0.0/12,192.168.0.0/16,10.0.0.0/8,203.0.113.10/32";
+        # otherwise every dashboard request is logged with the server's own IP.
         TRUSTED_PROXIES: '<%= ENV["TRUSTED_PROXIES"].to_s.empty? ? "172.16.0.0/12,192.168.0.0/16,10.0.0.0/8" : ENV["TRUSTED_PROXIES"] %>'
+        # The API refuses to boot outside APP_ENV=development unless Redis is
+        # rediss:// and Postgres sslmode=verify-full. "true" waives it (loud boot
+        # warning) — only for Redis/Postgres on a private network. Empty = enforced.
+        ALLOW_INSECURE_TRANSPORT: '<%= ENV.fetch("ALLOW_INSECURE_TRANSPORT", "") %>'
         # Empty disables Bitcoin on-chain detection (e.g. https://mempool.space/api).
         BITCOIN_ESPLORA_BASE_URL: '<%= ENV.fetch("BITCOIN_ESPLORA_BASE_URL", "") %>'
       secret:
@@ -70,6 +104,10 @@ servers:
         - DATABASE_URL
         - REDIS_URL
         - JWT_SECRET
+        # First-admin bootstrap token for the dashboard's /setup wizard (>= 16
+        # chars). Empty: the API generates one at boot and logs it while no staff
+        # account exists (read it with `kamal app logs -r api`).
+        - SETUP_TOKEN
         # Empty provider keys disable the matching network (startup warning).
         - TRONGRID_API_KEY
         - ALCHEMY_API_KEY
@@ -83,14 +121,25 @@ servers:
       host: <%= ENV.fetch("DASHBOARD_HOST") %>
       app_port: 8080
       ssl: true
+      # Explicit: kamal-proxy drops client-supplied X-Forwarded-* and sets the real
+      # client IP and scheme itself — the start of the chain the API trusts.
+      forward_headers: false
       healthcheck:
         path: /up
         interval: 3
         timeout: 5
+    # nginx runs as uid 10001 on port 8080 with everything it writes under /tmp:
+    # no capability, no privilege gain, read-only root filesystem.
+    options:
+      security-opt: no-new-privileges=true
+      cap-drop: ALL
+      read-only: true
+      tmpfs: /tmp
     env:
       clear:
         PORT: 8080
-        # nginx proxies /api (same origin for the SPA) to the public API host.
+        # nginx proxies /api (same origin for the SPA) to the public API host and
+        # verifies its certificate (proxy_ssl_verify, docker/dashboard/).
         API_URL: https://<%= ENV.fetch("API_HOST") %>
 
 # Shared by every role. Everything else is declared on the role that reads it.

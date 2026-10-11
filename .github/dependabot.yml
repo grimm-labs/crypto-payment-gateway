@@ -1,0 +1,63 @@
+# Weekly dependency updates. Minor/patch bumps are grouped per ecosystem (one
+# PR each); majors come as their own PRs. `cooldown` waits a week after a
+# release before proposing it, so a hijacked-and-yanked version is never picked
+# up on day one. Security updates (Dependabot alerts) are not delayed.
+version: 2
+updates:
+  # Rust workspace (root Cargo.toml / Cargo.lock). cargo-deny (deny.toml) checks
+  # every PR: advisories, licenses, sources.
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    open-pull-requests-limit: 10
+    groups:
+      cargo-minor-patch:
+        update-types: [minor, patch]
+
+  # pnpm workspace (pnpm-lock.yaml at the root: apps/*, packages/*).
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    open-pull-requests-limit: 10
+    groups:
+      npm-minor-patch:
+        update-types: [minor, patch]
+
+  # Workflows and the composite action: actions are pinned by commit SHA with a
+  # `# vX.Y.Z` comment, which Dependabot updates together.
+  - package-ecosystem: github-actions
+    directories:
+      - /
+      - /.github/actions/*
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    groups:
+      github-actions:
+        patterns: ['*']
+
+  # Base images of docker/Dockerfile, pinned by digest (tag@sha256).
+  - package-ecosystem: docker
+    directory: /docker
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    groups:
+      docker-images:
+        update-types: [minor, patch]
+    ignore:
+      # Odd nginx minors are the mainline branch: stay on the stable line
+      # (1.30.x) and move to the next even minor by hand.
+      - dependency-name: nginx
+        update-types: ['version-update:semver-minor', 'version-update:semver-major']
+      # The Node major follows .tool-versions / .nvmrc (LTS), bumped by hand.
+      - dependency-name: node
+        update-types: ['version-update:semver-major']

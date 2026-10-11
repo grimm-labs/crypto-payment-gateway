@@ -1,5 +1,12 @@
-# Manually bump the workspace SemVer, commit and push a matching git tag.
-# Images are built and pushed by Kamal at deploy time (.github/workflows/deploy.yml).
+# Manually bump the workspace SemVer, commit and push a matching git tag, from
+# main only. Images are built and pushed by Kamal at deploy time
+# (.github/workflows/deploy.yml), which then requires a green CI run on the
+# release commit: this workflow dispatches it (pushes made with GITHUB_TOKEN
+# trigger no workflow). This file can be edited on a branch, so the server-side
+# barriers are main's branch protection and a tag ruleset on v*.
+#
+# Third-party actions are pinned by full commit SHA (the comment names the
+# version); Dependabot (.github/dependabot.yml) proposes the bumps.
 
 name: New App Version
 
@@ -16,17 +23,29 @@ on:
           - minor
           - major
 
+permissions: {}
+
 jobs:
   release:
     name: Create New Version and push new tag
     runs-on: ubuntu-latest
     permissions:
-      contents: write
+      contents: write # push the release commit and its tag
+      actions: write # dispatch CI on the release tag
     outputs:
       version: ${{ steps.version.outputs.version }}
     steps:
+      - name: Only from main
+        env:
+          REF: ${{ github.ref }}
+        run: |
+          if [ "$REF" != "refs/heads/main" ]; then
+            echo "::error::Releases are cut from main only (got $REF)."
+            exit 1
+          fi
+
       - name: Checkout project repo
-        uses: actions/checkout@v4
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           fetch-depth: 0
 
@@ -38,13 +57,15 @@ jobs:
       - name: Setup Rust
         uses: ./.github/actions/setup-rust
 
+      # Built from crates.io at an exact version with its own lockfile: no
+      # third-party installer runs next to this job's write token.
       - name: Install cargo-edit
-        uses: taiki-e/install-action@v2
-        with:
-          tool: cargo-edit
+        run: cargo install --locked cargo-edit@0.13.13
 
       - name: Bump workspace version
-        run: cargo set-version --workspace --bump ${{ inputs.release-type }}
+        env:
+          RELEASE_TYPE: ${{ inputs.release-type }}
+        run: cargo set-version --workspace --bump "$RELEASE_TYPE"
 
       - name: Refresh lockfile metadata
         run: cargo metadata --no-deps --format-version 1 > /dev/null
@@ -58,10 +79,17 @@ jobs:
           echo "New version: ${VERSION}"
 
       - name: Commit, tag and push
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
         run: |
-          VERSION="${{ steps.version.outputs.version }}"
           git add Cargo.toml Cargo.lock
           git commit -m "chore: release v${VERSION}"
           git tag "v${VERSION}"
           git push origin HEAD
           git push origin "v${VERSION}"
+
+      - name: Run CI on the release tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: gh workflow run ci.yml --repo "$GITHUB_REPOSITORY" --ref "v${VERSION}"

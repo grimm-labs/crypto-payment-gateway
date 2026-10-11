@@ -5,8 +5,12 @@ node_modules
 **/node_modules
 **/dist
 .nx
+# Environment files at any depth: a stray apps/dashboard/.env.local would
+# otherwise be copied into the build and inlined into the bundle by Vite.
 .env
 .env.*
+**/.env
+**/.env.*
 !.env.example
 .kamal/secrets*
 compose*.yaml
@@ -14,3 +18,4 @@ docs/
 **/*.md
 .DS_Store
 .breez-data
+**/.breez-data

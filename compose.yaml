@@ -13,8 +13,10 @@ services:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
       POSTGRES_DB: crypto_payment
+    # Loopback only: Docker publishes ports around the host firewall (ufw), so
+    # 0.0.0.0 would expose these default credentials to the whole network.
     ports:
-      - '5432:5432'
+      - '127.0.0.1:5432:5432'
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
@@ -27,8 +29,9 @@ services:
     image: redis:7-alpine
     container_name: crypto-payment-redis
     command: redis-server --appendonly yes
+    # Loopback only (no password: never reachable from outside this machine).
     ports:
-      - '6379:6379'
+      - '127.0.0.1:6379:6379'
     volumes:
       - redis_data:/data
     healthcheck:
@@ -55,8 +58,9 @@ services:
       DATABASE_URL: postgresql://postgres:postgres@postgres:5432/crypto_payment
       REDIS_URL: redis://redis:6379
       BREEZ_STORAGE_DIR: /app/.breez-data
+    # Loopback only, like every port of this local stack.
     ports:
-      - '${PORT:-3000}:3000'
+      - '127.0.0.1:${PORT:-3000}:3000'
     volumes:
       # Breez SDK (Lightning) wallet storage — must survive restarts.
       - breez_data:/app/.breez-data
@@ -78,7 +82,7 @@ services:
       # nginx proxies /api here (rendered at container start by docker/dashboard/start.sh).
       API_URL: http://api:3000
     ports:
-      - '${DASHBOARD_PORT:-8080}:8080'
+      - '127.0.0.1:${DASHBOARD_PORT:-8080}:8080'
     depends_on:
       - api
 

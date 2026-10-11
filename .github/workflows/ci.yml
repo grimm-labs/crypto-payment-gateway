@@ -1,5 +1,8 @@
 name: CI
 
+# Third-party actions are pinned by full commit SHA (the comment names the
+# version); Dependabot (.github/dependabot.yml) proposes the bumps.
+
 on:
   push:
     branches:
@@ -7,6 +10,10 @@ on:
   pull_request:
     branches:
       - '**'
+  # Dispatched by New App Version on the release tag: its commit is pushed with
+  # GITHUB_TOKEN, which triggers no workflow, and Deploy requires a successful
+  # CI run on the exact commit it ships.
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -23,16 +30,16 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           fetch-depth: 0
 
       # Pinned explicitly (matches package.json's packageManager).
-      - uses: pnpm/action-setup@v4
+      - uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320 # v4.4.0
         with:
           version: 11.25.0
 
-      - uses: actions/setup-node@v5
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
         with:
           node-version: 24
           cache: pnpm
@@ -43,13 +50,33 @@ jobs:
 
       - run: pnpm install --frozen-lockfile
 
-      - uses: nrwl/nx-set-shas@v4
+      - uses: nrwl/nx-set-shas@afb73a62d26e41464e9254689e1fd6122ee683c1 # v5.0.1
 
-      # api: cargo clippy / cargo test --workspace / cargo build --release;
-      # dashboard: eslint / tsc + vite build. Only what the change affects runs.
+      # api: cargo clippy -D warnings / cargo test / cargo build --release, all
+      # --locked; dashboard: eslint / tsc + vite build. Only what the change affects runs.
       - run: pnpm nx affected -t lint test build --parallel=2
         env:
           NX_DAEMON: 'false'
+
+  # Supply chain of the Rust workspace, on every run (not Nx-affected: a new
+  # RustSec advisory fails it without any code change). Policy: deny.toml.
+  cargo-deny:
+    name: cargo-deny (advisories, bans, licenses, sources)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+
+      # Prebuilt binary verified against the checksum in the action's manifest;
+      # fallback: none never builds or downloads anything else.
+      - uses: taiki-e/install-action@ab6895351a88b908e96a4697860d4ffea5e57dbe # v2.87.27
+        with:
+          tool: cargo-deny@0.20.2
+          fallback: none
+
+      - name: cargo deny check
+        run: cargo deny --locked check advisories bans licenses sources
 
   docker:
     name: Docker image build
@@ -57,10 +84,12 @@ jobs:
     needs: checks
     if: github.event_name == 'push'
     steps:
-      - uses: actions/checkout@v5
-      - uses: docker/setup-buildx-action@v3
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
       - name: Build the combined image (all targets)
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           file: docker/Dockerfile

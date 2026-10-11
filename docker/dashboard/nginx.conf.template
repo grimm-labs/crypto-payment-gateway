@@ -1,11 +1,36 @@
 # Dashboard server block, rendered at container start by docker/dashboard/start.sh
 # (envsubst on ${PORT} and ${API_URL} only — nginx's own $variables are kept).
+
+# Scheme the browser used. Under Kamal, kamal-proxy terminates TLS and sets
+# X-Forwarded-Proto itself (the dashboard role does not forward client headers),
+# so the API sees `https` for dashboard traffic; without a proxy in front
+# (docker compose), nginx's own scheme.
+map $http_x_forwarded_proto $cpg_forwarded_proto {
+    default $http_x_forwarded_proto;
+    ''      $scheme;
+}
+
 server {
     listen ${PORT};
     server_name _;
 
     root /app/dashboard/html;
     index index.html;
+
+    # CSP, HSTS, X-Frame-Options… on every response. Locations that add a header
+    # of their own include the file again (add_header inheritance, see the file).
+    include /app/dashboard/security-headers.conf;
+
+    # TLS to the API when API_URL is https:// (Kamal: https://<API_HOST>, through
+    # kamal-proxy): the certificate chain and the host name are verified. The CA
+    # bundle path is the same in both images (nginx alpine: ca-certificates-bundle;
+    # Debian `all` image: ca-certificates). Ignored for http:// (docker compose).
+    proxy_ssl_server_name on;
+    proxy_ssl_verify on;
+    proxy_ssl_verify_depth 3;
+    proxy_ssl_trusted_certificate /etc/ssl/certs/ca-certificates.crt;
+    proxy_ssl_protocols TLSv1.2 TLSv1.3;
+    proxy_ssl_session_reuse on;
 
     # Kamal / compose health check: answered by nginx itself, never by the API.
     location = /up {
@@ -14,26 +39,64 @@ server {
         return 200 "ok\n";
     }
 
-    # Same-origin proxy to the backend — the SPA never needs CORS.
+    # Same-origin proxy to the backend — the SPA never needs CORS. Cookies
+    # (the HttpOnly refresh cookie), Set-Cookie and request headers such as
+    # X-CSRF-Protection pass through unchanged.
     location /api/ {
+        # API bodies are small JSON documents.
+        client_max_body_size 64k;
+
         proxy_pass ${API_URL};
         proxy_http_version 1.1;
         proxy_set_header Host $proxy_host;
         proxy_set_header X-Real-IP $remote_addr;
+        # Appends the peer (kamal-proxy under Kamal) to the chain; the API walks
+        # X-Forwarded-For from the right, skipping TRUSTED_PROXIES hops.
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto $scheme;
-        proxy_ssl_server_name on;
+        proxy_set_header X-Forwarded-Proto $cpg_forwarded_proto;
         proxy_read_timeout 120s;
+
+        # One copy of each header: the API's own are replaced by nginx's.
+        proxy_hide_header Cache-Control;
+        proxy_hide_header Content-Security-Policy;
+        proxy_hide_header Strict-Transport-Security;
+        proxy_hide_header X-Frame-Options;
+        proxy_hide_header X-Content-Type-Options;
+        proxy_hide_header Referrer-Policy;
+        proxy_hide_header Permissions-Policy;
+        proxy_hide_header Cross-Origin-Opener-Policy;
+
+        include /app/dashboard/security-headers.conf;
+        # Tokens, keys and payment data: never stored by the browser or a cache.
+        add_header Cache-Control "no-store" always;
     }
 
     location /healthz {
         proxy_pass ${API_URL};
-        proxy_ssl_server_name on;
+        include /app/dashboard/security-headers.conf;
+        add_header Cache-Control "no-store" always;
     }
 
     location /readyz {
         proxy_pass ${API_URL};
-        proxy_ssl_server_name on;
+        include /app/dashboard/security-headers.conf;
+        add_header Cache-Control "no-store" always;
+    }
+
+    # Vite's content-hashed bundles: cached for a year. No `always`: a 404 must
+    # not be cached as immutable, and a missing asset is never answered with the
+    # SPA's index.html.
+    location /assets/ {
+        try_files $uri =404;
+        include /app/dashboard/security-headers.conf;
+        add_header Cache-Control "public, max-age=31536000, immutable";
+    }
+
+    # The SPA shell (also the target of the fallback below): always revalidated,
+    # so a deploy is picked up immediately.
+    location = /index.html {
+        include /app/dashboard/security-headers.conf;
+        add_header Cache-Control "no-store" always;
     }
 
     # SPA fallback

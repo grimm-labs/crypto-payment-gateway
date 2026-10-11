@@ -12,21 +12,21 @@
         "executor": "nx:run-commands",
         "cache": false,
         "options": {
-          "command": "cargo build --release -p gateway"
+          "command": "cargo build --release --locked -p gateway"
         }
       },
       "test": {
         "executor": "nx:run-commands",
         "inputs": ["default", "rust"],
         "options": {
-          "command": "cargo test --workspace"
+          "command": "cargo test --workspace --locked"
         }
       },
       "lint": {
         "executor": "nx:run-commands",
         "inputs": ["default", "rust"],
         "options": {
-          "command": "cargo clippy --workspace --all-targets"
+          "command": "cargo clippy --workspace --all-targets --locked -- -D warnings"
         }
       },
       "dev": {
