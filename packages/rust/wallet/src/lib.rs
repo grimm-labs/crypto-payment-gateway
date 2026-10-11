@@ -1,17 +1,19 @@
+mod bip32;
+
+use std::fmt;
+use std::sync::Arc;
+
 use bip39::{Language, Mnemonic};
 use domain::Network;
 use ed25519_dalek::SigningKey;
-use hmac::{Hmac, Mac};
 use k256::ecdsa::SigningKey as EthSigningKey;
 use ripemd::Ripemd160;
-use sha2::{Digest, Sha256, Sha512};
+use sha2::{Digest, Sha256};
 use sha3::Keccak256;
 use solana_sdk::pubkey::Pubkey;
 use spl_associated_token_account::get_associated_token_address;
 use thiserror::Error;
-use tiny_hderive::bip32::ExtendedPrivKey;
-
-type HmacSha512 = Hmac<Sha512>;
+use zeroize::{Zeroize, Zeroizing};
 
 const USDT_SOLANA: &str = "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB";
 
@@ -25,17 +27,28 @@ pub enum WalletError {
     Derivation(String),
 }
 
+/// Keeps only the BIP39 seed (never the phrase), computed once at startup.
+/// Clones share it; it is wiped when the last clone drops.
 #[derive(Clone)]
 pub struct WalletService {
-    mnemonic: String,
+    seed: Arc<Zeroizing<[u8; 64]>>,
+}
+
+impl fmt::Debug for WalletService {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("WalletService { seed: [REDACTED] }")
+    }
 }
 
 impl WalletService {
     pub fn from_mnemonic(mnemonic: &str) -> Result<Self, WalletError> {
-        validate_mnemonic(mnemonic)?;
-        Ok(Self {
-            mnemonic: mnemonic.trim().to_string(),
-        })
+        // `Mnemonic` wipes its words on drop (bip39 `zeroize` feature).
+        let mut seed = parse_mnemonic(mnemonic)?.to_seed("");
+        let wallet = Self {
+            seed: Arc::new(Zeroizing::new(seed)),
+        };
+        seed.zeroize();
+        Ok(wallet)
     }
 
     pub fn derive_address(&self, network: Network, index: u32) -> Result<String, WalletError> {
@@ -67,12 +80,8 @@ impl WalletService {
     }
 
     fn derive_solana_ata(&self, index: u32) -> Result<String, WalletError> {
-        let seed = Mnemonic::parse_in_normalized(Language::English, &self.mnemonic)
-            .map_err(|_| WalletError::InvalidMnemonic)?
-            .to_seed("");
-
         let path = format!("m/44'/501'/{index}'/0'");
-        let derived = derive_ed25519_slip10(&seed, &path)?;
+        let derived = derive_ed25519_slip10(self.seed.as_slice(), &path)?;
         let signing_key = SigningKey::from_bytes(&derived);
         let pubkey = Pubkey::new_from_array(signing_key.verifying_key().to_bytes());
         let mint: Pubkey = USDT_SOLANA
@@ -90,25 +99,23 @@ impl WalletService {
 
     /// Generic BIP32 secp256k1 derivation (shared by ETH/Tron and Bitcoin).
     fn derive_secp256k1_key(&self, path: &str) -> Result<EthSigningKey, WalletError> {
-        let seed = Mnemonic::parse_in_normalized(Language::English, &self.mnemonic)
-            .map_err(|_| WalletError::InvalidMnemonic)?
-            .to_seed("");
-
-        let xprv = ExtendedPrivKey::derive(&seed, path)
-            .map_err(|e| WalletError::Derivation(format!("{e:?}")))?;
-        EthSigningKey::from_slice(&xprv.secret())
-            .map_err(|e| WalletError::Derivation(e.to_string()))
+        let path = bip32::parse_path(path)?;
+        let xprv = bip32::ExtendedPrivateKey::derive(self.seed.as_slice(), &path)?;
+        Ok(EthSigningKey::from(xprv.secret_key()))
     }
 }
 
 pub fn validate_mnemonic(mnemonic: &str) -> Result<(), WalletError> {
+    parse_mnemonic(mnemonic).map(|_| ())
+}
+
+fn parse_mnemonic(mnemonic: &str) -> Result<Mnemonic, WalletError> {
     let normalized = mnemonic.trim();
-    let words: Vec<_> = normalized.split_whitespace().collect();
-    if words.len() != 12 && words.len() != 24 {
+    let words = normalized.split_whitespace().count();
+    if words != 12 && words != 24 {
         return Err(WalletError::InvalidWordCount);
     }
     Mnemonic::parse_in_normalized(Language::English, normalized)
-        .map(|_| ())
         .map_err(|_| WalletError::InvalidMnemonic)
 }
 
@@ -157,43 +164,23 @@ fn p2wpkh_address(sk: &EthSigningKey) -> Result<String, WalletError> {
         .map_err(|e| WalletError::Derivation(e.to_string()))
 }
 
-/// SLIP-0010 ed25519 derivation matching `ed25519-hd-key`.
-fn derive_ed25519_slip10(seed: &[u8], path: &str) -> Result<[u8; 32], WalletError> {
-    let mut mac = HmacSha512::new_from_slice(b"ed25519 seed")
-        .map_err(|e| WalletError::Derivation(e.to_string()))?;
-    mac.update(seed);
-    let result = mac.finalize().into_bytes();
-    let mut key = [0u8; 32];
-    let mut chain = [0u8; 32];
-    key.copy_from_slice(&result[..32]);
-    chain.copy_from_slice(&result[32..]);
-
-    for segment in path.trim_start_matches('m').split('/') {
-        if segment.is_empty() {
-            continue;
-        }
-        let hardened = segment.ends_with('\'');
-        let index: u32 = segment
-            .trim_end_matches('\'')
-            .parse()
-            .map_err(|e| WalletError::Derivation(format!("{e}")))?;
-        if !hardened {
+/// SLIP-0010 ed25519 derivation matching `ed25519-hd-key` (hardened only):
+/// `I = HMAC-SHA512(key = "ed25519 seed", seed)`, then per index
+/// `I = HMAC-SHA512(IR, 0x00 || IL || ser32(i))`; the key is the final `IL`.
+fn derive_ed25519_slip10(seed: &[u8], path: &str) -> Result<Zeroizing<[u8; 32]>, WalletError> {
+    let mut i = bip32::hmac_sha512(b"ed25519 seed", &[seed])?;
+    for child in bip32::parse_path(path)? {
+        if !child.is_hardened() {
             return Err(WalletError::Derivation(
                 "ed25519 slip10 only supports hardened derivation".into(),
             ));
         }
-        let index = index | 0x8000_0000;
-
-        let mut mac = HmacSha512::new_from_slice(&chain)
-            .map_err(|e| WalletError::Derivation(e.to_string()))?;
-        mac.update(&[0u8]);
-        mac.update(&key);
-        mac.update(&index.to_be_bytes());
-        let result = mac.finalize().into_bytes();
-        key.copy_from_slice(&result[..32]);
-        chain.copy_from_slice(&result[32..]);
+        let (key, chain) = i.split_at(32);
+        i = bip32::hmac_sha512(chain, &[&[0u8], key, &child.to_be_bytes()])?;
     }
 
+    let mut key = Zeroizing::new([0u8; 32]);
+    key.copy_from_slice(&i[..32]);
     Ok(key)
 }
 
@@ -210,6 +197,19 @@ mod tests {
             validate_mnemonic("short phrase"),
             Err(WalletError::InvalidWordCount)
         ));
+    }
+
+    #[test]
+    fn debug_never_prints_the_seed() {
+        let wallet = WalletService::from_mnemonic(TEST_MNEMONIC).unwrap();
+        let clone = wallet.clone();
+        assert!(
+            Arc::ptr_eq(&wallet.seed, &clone.seed),
+            "clones share one seed"
+        );
+        let shown = format!("{wallet:?}");
+        assert_eq!(shown, "WalletService { seed: [REDACTED] }");
+        assert!(!shown.contains(&hex::encode(&wallet.seed[..8])));
     }
 
     #[test]
@@ -271,5 +271,45 @@ mod tests {
         assert_ne!(a0, a1);
         assert!(a0.len() > 30);
         assert_eq!(wallet.derive_address(Network::Solana, 0).unwrap(), a0);
+    }
+
+    /// Owner keys at `m/44'/501'/{i}'/0'` (the path Phantom/Solflare use) for
+    /// the BIP39 test mnemonic, cross-checked against independent sources:
+    /// - index 0 `HAgk14Jp…` (pubkey `f0362762…`): python-hdwallet README
+    ///   (github.com/hdwallet-io/python-hdwallet, commit 7803b4a0, "Solana
+    ///   (SOL) wallet" output for this mnemonic and path) and the txtx test
+    ///   `test_mnemonic_to_solana_keypair` (github.com/solana-foundation/txtx,
+    ///   addons/svm/core/src/signers/secret_key.rs, commit 972a7b68);
+    /// - index 1 `Hh8QwFUA…` (pubkey `f8029acf…`): Keystone firmware test
+    ///   (github.com/KeystoneHQ/keystone3-firmware,
+    ///   rust/apps/solana/src/address.rs, commit 8a08e232, `m/44'/501'/1'/0'`).
+    ///
+    /// Both owners and their USDT ATAs were also recomputed with an
+    /// independent pure-Python implementation (PBKDF2 seed, SLIP-0010,
+    /// RFC 8032 ed25519, `find_program_address` with the SPL Token and ATA
+    /// program ids). Changing any value here changes issued deposit addresses.
+    #[test]
+    fn derives_solana_golden() {
+        let seed = Mnemonic::parse_in_normalized(Language::English, TEST_MNEMONIC)
+            .unwrap()
+            .to_seed("");
+        for (index, owner) in [
+            (0, "HAgk14JpMQLgt6rVgv7cBQFJWFto5Dqxi472uT3DKpqk"),
+            (1, "Hh8QwFUA6MtVu1qAoq12ucvFHNwCcVTV7hpWjeY1Hztb"),
+        ] {
+            let derived = derive_ed25519_slip10(&seed, &format!("m/44'/501'/{index}'/0'")).unwrap();
+            let pubkey = SigningKey::from_bytes(&derived).verifying_key().to_bytes();
+            assert_eq!(bs58::encode(pubkey).into_string(), owner, "owner {index}");
+        }
+
+        let wallet = WalletService::from_mnemonic(TEST_MNEMONIC).unwrap();
+        assert_eq!(
+            wallet.derive_address(Network::Solana, 0).unwrap(),
+            "6pXYguUixhfdydHDMgsvSy3sAWjStL2eEYh4KeYJAUDk"
+        );
+        assert_eq!(
+            wallet.derive_address(Network::Solana, 1).unwrap(),
+            "BZnBhSRppxtYwkMzjn6brVCEVqPgx7zeRhGuJaPmuv2V"
+        );
     }
 }
