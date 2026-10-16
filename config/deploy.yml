@@ -6,15 +6,16 @@
 # Secrets are resolved from .kamal/secrets (environment variables only).
 # Required: GATEWAY_HOST (the environment's server, SSH target), APP_ENV, API_HOST,
 # DASHBOARD_HOST. A missing one stops kamal with a KeyError naming it.
-# Optional: SSH_USER (default root), ALLOW_INSECURE_TRANSPORT, TRUSTED_PROXIES,
-# BITCOIN_ESPLORA_BASE_URL, OUTFLOWS_FROZEN, KAMAL_IMAGE, KAMAL_REGISTRY_USERNAME.
+# Optional: SSH_USER (default root), TRUSTED_PROXIES, BITCOIN_ESPLORA_BASE_URL,
+# OUTFLOWS_FROZEN, KAMAL_IMAGE, KAMAL_REGISTRY_USERNAME.
 # Requires Kamal >= 2.12 (ssh.forward_agent); CI pins the exact version.
 #
 # One image (docker/Dockerfile target "all") runs as two roles: `api` (the Rust
 # gateway) and `dashboard` (nginx serving the SPA, /api proxied to the API host).
 # kamal-proxy routes each public host to its role, TLS by Let's Encrypt.
-# PostgreSQL and Redis are external services: DATABASE_URL and REDIS_URL point at
-# them. No Kamal accessory runs on the servers.
+# PostgreSQL and Redis run on the same server as Kamal accessories (bottom of
+# this file): one server per environment, as every container and volume name
+# here is the same in all of them.
 
 service: crypto-payment-gateway
 image: <%= ENV.fetch("KAMAL_IMAGE", "nejos97/crypto-payment-gateway") %>
@@ -93,9 +94,10 @@ servers:
         # otherwise every dashboard request is logged with the server's own IP.
         TRUSTED_PROXIES: '<%= ENV["TRUSTED_PROXIES"].to_s.empty? ? "172.16.0.0/12,192.168.0.0/16,10.0.0.0/8" : ENV["TRUSTED_PROXIES"] %>'
         # The API refuses to boot outside APP_ENV=development unless Redis is
-        # rediss:// and Postgres sslmode=verify-full. "true" waives it (loud boot
-        # warning) — only for Redis/Postgres on a private network. Empty = enforced.
-        ALLOW_INSECURE_TRANSPORT: '<%= ENV.fetch("ALLOW_INSECURE_TRANSPORT", "") %>'
+        # rediss:// and Postgres sslmode=verify-full, unless this is "true" (loud
+        # boot warning). The accessories below speak plain text, but only over
+        # the server's own docker network: that traffic never leaves the host.
+        ALLOW_INSECURE_TRANSPORT: 'true'
         # Empty disables Bitcoin on-chain detection (e.g. https://mempool.space/api).
         BITCOIN_ESPLORA_BASE_URL: '<%= ENV.fetch("BITCOIN_ESPLORA_BASE_URL", "") %>'
         # "true" forces the outflow freeze at boot (no withdrawal, sweep or gas
@@ -104,6 +106,7 @@ servers:
       secret:
         # The custodial HD seed: every deposit address and the Lightning wallet.
         - WALLET_MNEMONIC
+        # Built in .kamal/secrets from the accessories' passwords.
         - DATABASE_URL
         - REDIS_URL
         - JWT_SECRET
@@ -150,6 +153,75 @@ env:
   clear:
     APP_ENV: <%= ENV.fetch("APP_ENV") %>
     LOG_LEVEL: info
+
+# How long kamal-proxy waits for a new container to pass its health check
+# (Kamal's default: 30 s). The API only listens once its boot is over:
+# migrations, the providers' chain checks (15 s timeout, in parallel) and the
+# Breez SDK connection.
+deploy_timeout: 120
+
+# PostgreSQL and Redis, on the environment's server. The API reaches them by
+# container name (crypto-payment-gateway-postgres / -redis) over the `kamal`
+# docker network; no port is published, so nothing outside that network can
+# connect (Docker would publish around the host firewall). Their passwords are
+# GitHub secrets; .kamal/secrets builds DATABASE_URL and REDIS_URL from them.
+#
+# Data lives in named docker volumes, which `kamal accessory remove` and
+# `kamal remove` keep (they only delete bind-mounted `directories`). There is
+# no automated backup: README → Deployment (Kamal) → Database.
+#
+# The Deploy workflow runs `kamal accessory boot all` before every deploy; it
+# only creates a missing accessory. A change below (image, env, options) applies
+# with `kamal accessory reboot <name>` (the workflow's `reboot-accessory` input):
+# a few seconds without the database or Redis, the API reconnects. Dependabot
+# does not read this file: bump the digests by hand (`docker buildx imagetools
+# inspect <image>:<tag>`), on the majors of compose.yaml.
+accessories:
+  postgres:
+    image: postgres:16.15-alpine3.24@sha256:721873c34ceb9f8d8fc265984940dc982404c105f19ad51be9fdc5970a6080ea
+    host: <%= ENV.fetch("GATEWAY_HOST") %>
+    env:
+      clear:
+        POSTGRES_USER: gateway
+        POSTGRES_DB: crypto_payment
+        # Page checksums: storage corruption is reported, never read back as data.
+        POSTGRES_INITDB_ARGS: --data-checksums
+      secret:
+        # Like POSTGRES_INITDB_ARGS, only read when the volume is initialized:
+        # changing the secret later needs an ALTER ROLE first (README).
+        - POSTGRES_PASSWORD
+    volumes:
+      - crypto-payment-gateway-postgres:/var/lib/postgresql/data
+    # Runs as the image's postgres user (uid 70, owner of the data directory a
+    # fresh volume inherits): no root step, so no capability is needed.
+    options:
+      user: postgres
+      security-opt: no-new-privileges=true
+      cap-drop: ALL
+      health-cmd: pg_isready -U gateway -d crypto_payment
+  redis:
+    image: redis:7.4.11-alpine3.21@sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499
+    host: <%= ENV.fetch("GATEWAY_HOST") %>
+    # Through the container's shell, so the password comes from the env file
+    # and never appears in the command; `:?` refuses to start without one (an
+    # empty requirepass turns authentication off). The append-only file keeps
+    # the webhook queue and the staff sessions across restarts.
+    cmd: >-
+      sh -c 'exec redis-server --appendonly yes
+      --requirepass "${REDIS_PASSWORD:?REDIS_PASSWORD is empty}"'
+    env:
+      secret:
+        - REDIS_PASSWORD
+    volumes:
+      - crypto-payment-gateway-redis:/data
+    # The image's redis user (owner of /data): no capability needed.
+    options:
+      user: redis
+      security-opt: no-new-privileges=true
+      cap-drop: ALL
+      # Kamal escapes `$VAR` (not `${VAR}`) for the host's shell: the
+      # container's shell reads it from the env file.
+      health-cmd: REDISCLI_AUTH="$REDIS_PASSWORD" redis-cli ping | grep -q PONG
 
 aliases:
   console: app exec --interactive --reuse -r api "sh"

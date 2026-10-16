@@ -527,12 +527,16 @@ kamal-proxy, with Let's Encrypt TLS:
 |---|---|---|---|
 | `api` | `API_HOST` | `/app/gateway`, port 3000, Breez volume `crypto-payment-gateway-breez` | `/readyz` |
 | `dashboard` | `DASHBOARD_HOST` | nginx (`/app/dashboard/start.sh`), port 8080, `/api` → `https://API_HOST` | `/up` |
+| accessory `postgres` | — (docker network only) | PostgreSQL 16, volume `crypto-payment-gateway-postgres` | `pg_isready` |
+| accessory `redis` | — (docker network only) | Redis 7.4 (AOF, password), volume `crypto-payment-gateway-redis` | `redis-cli ping` |
 
-PostgreSQL and Redis are **external** services (`DATABASE_URL`, `REDIS_URL`) and must be
-reached over verified TLS (`rediss://`, `sslmode=verify-full`) unless
-`ALLOW_INSECURE_TRANSPORT=true` (private network only). Migrations run when the api container
-boots. On a fresh database, read the one-time setup token with `kamal app logs -r api` (or set
-the `SETUP_TOKEN` secret).
+PostgreSQL and Redis run as **Kamal accessories** on the environment's server (one server per
+environment). The API reaches them by container name over the `kamal` docker network, with no
+published port; `.kamal/secrets` builds `DATABASE_URL` and `REDIS_URL` from the
+`POSTGRES_PASSWORD` and `REDIS_PASSWORD` secrets. That traffic never leaves the host, so the
+api role sets `ALLOW_INSECURE_TRANSPORT=true` (no TLS between containers; the boot warning is
+expected). Migrations run when the api container boots. On a fresh database, read the one-time
+setup token with `kamal app logs -r api` (or set the `SETUP_TOKEN` secret).
 
 **GitHub Actions → Deploy** (manual, pick the environment) runs `kamal deploy` — only from
 `main` or a `v*` tag, for a commit on `main` whose CI run succeeded (a `guard` job checks it
@@ -545,10 +549,17 @@ before any secret is exposed). Per GitHub environment:
   dedicated deploy user in the `docker` group), `BITCOIN_ESPLORA_BASE_URL`,
   `TRUSTED_PROXIES` (defaults to the private docker ranges kamal-proxy lives in — a custom
   value must also list the server's public IP, which the dashboard's nginx reaches the API
-  through), `ALLOW_INSECURE_TRANSPORT`, `OUTFLOWS_FROZEN` (`true` holds the outflow freeze).
-- Secrets: `SSH_PRIVATE_KEY`, `WALLET_MNEMONIC`, `DATABASE_URL`, `REDIS_URL`, `JWT_SECRET`;
-  optional `SETUP_TOKEN` and provider keys `TRONGRID_API_KEY`, `ALCHEMY_API_KEY`,
-  `HELIUS_API_KEY`, `BREEZ_API_KEY` (empty disables the network).
+  through), `OUTFLOWS_FROZEN` (`true` holds the outflow freeze).
+- Secrets: `SSH_PRIVATE_KEY`, `WALLET_MNEMONIC`, `JWT_SECRET`, `POSTGRES_PASSWORD`,
+  `REDIS_PASSWORD` (at least 32 letters, digits, `-` or `_`, checked before the deploy — they
+  go unencoded into the URLs: `openssl rand -hex 32`); optional `SETUP_TOKEN` and provider keys
+  `TRONGRID_API_KEY`, `ALCHEMY_API_KEY`, `HELIUS_API_KEY`, `BREEZ_API_KEY` (empty disables
+  the network).
+
+Each run boots the missing accessories (`kamal accessory boot all`, a no-op once they run),
+then `kamal deploy`. Its `reboot-accessory` input recreates `postgres` or `redis` first, on the
+same volume: that is how a new image or setting from `config/deploy.yml` is applied (a few
+seconds without it; the API reconnects).
 
 Settings to apply by hand on GitHub: restrict each environment's deployment branches/tags to
 `main` and `v*` and require reviewers on production (the workflow guards cannot stop a
@@ -562,9 +573,43 @@ strict security headers (CSP, HSTS, `X-Frame-Options`, …, `docker/dashboard/se
 — any location adding a header must include it; a new external origin or inline script needs
 a CSP change). Local Kamal must be ≥ 2.12.
 
-A brand-new server needs `kamal setup` once (installs Docker and kamal-proxy); from a
+A brand-new server only needs Docker (installed by hand, or `kamal server bootstrap` once as
+root); the Deploy workflow boots the accessories and kamal-proxy itself. To run kamal from a
 workstation, export the same variables and secrets first (`.kamal/secrets` only references
 them). Useful aliases: `kamal logs`, `kamal console`.
+
+### Database
+
+⚠️ **No automated backup.** The database lives only in the server's
+`crypto-payment-gateway-postgres` volume: losing the server loses the payment, withdrawal and
+webhook history (funds stay recoverable from `WALLET_MNEMONIC`). Dump it regularly and keep the
+dumps off the server. Named volumes survive `kamal accessory remove` and `kamal remove`;
+`docker volume rm` deletes them for good.
+
+```bash
+# Dump to your machine (pg_dump connects over the container's socket: no password)
+ssh <SSH_USER>@<GATEWAY_HOST> docker exec crypto-payment-gateway-postgres \
+  pg_dump -U gateway -d crypto_payment -Fc > crypto_payment-$(date +%F).dump
+
+# Restore (stop the api first: kamal app stop -r api; redeploy afterwards)
+ssh <SSH_USER>@<GATEWAY_HOST> docker exec -i crypto-payment-gateway-postgres \
+  pg_restore -U gateway -d crypto_payment --clean --if-exists --no-owner < crypto_payment-YYYY-MM-DD.dump
+
+# psql
+ssh -t <SSH_USER>@<GATEWAY_HOST> docker exec -it crypto-payment-gateway-postgres psql -U gateway -d crypto_payment
+```
+
+Redis persists to its volume (append-only file). Losing it drops the queued webhook deliveries
+(their rows stay `pending` in Postgres), the staff sessions (everyone signs in again), the
+balance cache and the Lightning payout watermark.
+
+- **Rotating `POSTGRES_PASSWORD`**: the image only reads it when the volume is initialized.
+  Change it in the database first (`psql … -c '\password gateway'`), then update the secret
+  and deploy.
+- **Rotating `REDIS_PASSWORD`**: update the secret and deploy with `reboot-accessory: redis`.
+- **New image**: update the digest in `config/deploy.yml` (Dependabot does not read it; keep
+  the majors of `compose.yaml`), then deploy with `reboot-accessory`. A new PostgreSQL
+  **major** needs a dump and a restore into a fresh volume.
 
 ⚠️ `WALLET_MNEMONIC` — the custodial seed — ends up in the GitHub environment secrets and in
 the env file Kamal writes on the server: restrict access to both accordingly (after moving

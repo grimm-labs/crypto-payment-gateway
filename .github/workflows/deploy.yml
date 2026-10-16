@@ -17,14 +17,16 @@ run-name: Deployment - ${{ fromJSON('{"test":"Test","staging":"Staging","product
 # `ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub` on the server console).
 # Optional: APP_ENV (defaults to the environment name), SSH_USER (default root;
 # a deploy user in the docker group is the target), BITCOIN_ESPLORA_BASE_URL
-# (empty disables Bitcoin), TRUSTED_PROXIES, ALLOW_INSECURE_TRANSPORT ("true"
-# allows plain-text Redis/Postgres outside development; empty = refused),
-# OUTFLOWS_FROZEN ("true" forces the outflow freeze; empty = dashboard-managed).
+# (empty disables Bitcoin), TRUSTED_PROXIES, OUTFLOWS_FROZEN ("true" forces the
+# outflow freeze; empty = dashboard-managed).
 # Secrets (`secrets.*`, every one listed in .kamal/secrets), per environment:
-# SSH_PRIVATE_KEY, WALLET_MNEMONIC, DATABASE_URL, REDIS_URL, JWT_SECRET; optional:
-# SETUP_TOKEN (first-admin bootstrap; empty = generated and logged at boot) and the
-# provider keys (empty disables the network): TRONGRID_API_KEY, ALCHEMY_API_KEY,
-# HELIUS_API_KEY, BREEZ_API_KEY. The image is pushed to ghcr.io with GITHUB_TOKEN.
+# SSH_PRIVATE_KEY, WALLET_MNEMONIC, JWT_SECRET, POSTGRES_PASSWORD and
+# REDIS_PASSWORD (the accessories', >= 32 letters, digits, `-` or `_`, e.g.
+# `openssl rand -hex 32`; DATABASE_URL and REDIS_URL are built from them);
+# optional: SETUP_TOKEN (first-admin bootstrap; empty = generated and logged at
+# boot) and the provider keys (empty disables the network): TRONGRID_API_KEY,
+# ALCHEMY_API_KEY, HELIUS_API_KEY, BREEZ_API_KEY. The image is pushed to ghcr.io
+# with GITHUB_TOKEN.
 #
 # Third-party actions are pinned by full commit SHA (the comment names the
 # version); Dependabot (.github/dependabot.yml) proposes the bumps.
@@ -38,6 +40,12 @@ on:
         type: choice
         # A new environment goes here AND in the JSON table of `run-name` and `jobs.deploy.name`.
         options: [test, staging, production]
+      reboot-accessory:
+        description: Recreate an accessory first, to apply its changed image or settings (seconds of downtime; data kept)
+        required: true
+        type: choice
+        default: none
+        options: [none, postgres, redis]
 
 permissions:
   contents: read
@@ -108,6 +116,20 @@ jobs:
         with:
           persist-credentials: false
 
+      # The passwords go unencoded into DATABASE_URL / REDIS_URL (.kamal/secrets),
+      # where a missing secret would silently become an empty password.
+      - name: Accessory passwords (set, URL-safe)
+        env:
+          POSTGRES_PASSWORD: ${{ secrets.POSTGRES_PASSWORD }}
+          REDIS_PASSWORD: ${{ secrets.REDIS_PASSWORD }}
+        run: |
+          for name in POSTGRES_PASSWORD REDIS_PASSWORD; do
+            if [[ ! "${!name}" =~ ^[A-Za-z0-9_-]{32,}$ ]]; then
+              echo "::error::The $name secret must be at least 32 letters, digits, '-' or '_' (e.g. openssl rand -hex 32)."
+              exit 1
+            fi
+          done
+
       - uses: ruby/setup-ruby@e81a8fa391b11a595c1b7ed84177cc0fe02faf83 # v1.328.0
         with:
           ruby-version: '3.3'
@@ -151,11 +173,20 @@ jobs:
 
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
-      # Servers are already provisioned (Docker and kamal-proxy installed): always `kamal deploy`
-      # (`kamal setup` once by hand for a brand-new server).
+      # The server only needs Docker (installed by hand, or `kamal server bootstrap`
+      # once as root). `accessory boot all` creates the missing accessories
+      # (Postgres and Redis on empty volumes the first time) and leaves running
+      # ones alone; `reboot` recreates one on the same volume. `kamal deploy` then
+      # boots kamal-proxy if needed, and the app.
       - name: kamal deploy
-        run: kamal deploy
+        run: |
+          if [ "$REBOOT_ACCESSORY" != none ]; then
+            kamal accessory reboot "$REBOOT_ACCESSORY"
+          fi
+          kamal accessory boot all
+          kamal deploy
         env:
+          REBOOT_ACCESSORY: ${{ inputs.reboot-accessory }}
           # Kamal prefixes the image with registry.server (ghcr.io) itself.
           KAMAL_IMAGE: ${{ github.repository }}
           KAMAL_REGISTRY_USERNAME: ${{ github.actor }}
@@ -167,11 +198,10 @@ jobs:
           APP_ENV: ${{ vars.APP_ENV || inputs.environment }}
           BITCOIN_ESPLORA_BASE_URL: ${{ vars.BITCOIN_ESPLORA_BASE_URL || '' }}
           TRUSTED_PROXIES: ${{ vars.TRUSTED_PROXIES || '' }}
-          ALLOW_INSECURE_TRANSPORT: ${{ vars.ALLOW_INSECURE_TRANSPORT || '' }}
           OUTFLOWS_FROZEN: ${{ vars.OUTFLOWS_FROZEN || '' }}
           WALLET_MNEMONIC: ${{ secrets.WALLET_MNEMONIC }}
-          DATABASE_URL: ${{ secrets.DATABASE_URL }}
-          REDIS_URL: ${{ secrets.REDIS_URL }}
+          POSTGRES_PASSWORD: ${{ secrets.POSTGRES_PASSWORD }}
+          REDIS_PASSWORD: ${{ secrets.REDIS_PASSWORD }}
           JWT_SECRET: ${{ secrets.JWT_SECRET }}
           SETUP_TOKEN: ${{ secrets.SETUP_TOKEN || '' }}
           TRONGRID_API_KEY: ${{ secrets.TRONGRID_API_KEY || '' }}
