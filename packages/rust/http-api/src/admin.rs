@@ -145,13 +145,11 @@ struct SetupRequest {
     password: String,
     first_name: String,
     last_name: String,
-    setup_token: Option<String>,
 }
 
-/// First-admin bootstrap. Needs the one-time setup token printed in the
-/// API logs at boot (or `SETUP_TOKEN`): an attacker reaching a fresh
-/// instance first can no longer claim it. Every cheap check runs before the
-/// argon2 hash, so the public route cannot be used to burn CPU.
+/// First-admin bootstrap, open to anyone while no staff exists: whoever
+/// reaches a fresh instance first becomes its admin. Every cheap check runs
+/// before the argon2 hash, so the public route cannot be used to burn CPU.
 async fn post_setup(
     State(state): State<AppState>,
     client_ip: ClientIp,
@@ -160,15 +158,6 @@ async fn post_setup(
     rate_limit::hit(&state, rate_limit::SETUP_PER_IP, client_ip.bucket()).await?;
     if state.db.count_staff().await? > 0 {
         return Err(ApiError::conflict("Setup already completed"));
-    }
-    let token_ok = match (&state.setup_token, body.setup_token.as_deref()) {
-        (Some(expected), Some(given)) => {
-            auth::constant_time_eq_hex(&auth::sha256_hex(expected), &auth::sha256_hex(given.trim()))
-        }
-        _ => false,
-    };
-    if !token_ok {
-        return Err(ApiError::forbidden("Invalid setup token"));
     }
     let email = validate_email(&body.email)?;
     let (first_name, last_name) = validate_names(&body.first_name, &body.last_name)?;

@@ -26,8 +26,6 @@ import {
 import type { AuthResponse, LoginResult, Staff } from "@/lib/types"
 
 interface SetupPayload {
-  /** Printed in the API logs at boot, or set with SETUP_TOKEN. */
-  setup_token: string
   email: string
   password: string
   first_name: string

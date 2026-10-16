@@ -110,10 +110,6 @@ servers:
         - DATABASE_URL
         - REDIS_URL
         - JWT_SECRET
-        # First-admin bootstrap token for the dashboard's /setup wizard (>= 16
-        # chars). Empty: the API generates one at boot and logs it while no staff
-        # account exists (read it with `kamal app logs -r api`).
-        - SETUP_TOKEN
         # Empty provider keys disable the matching network (startup warning).
         - TRONGRID_API_KEY
         - ALCHEMY_API_KEY

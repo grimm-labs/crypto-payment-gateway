@@ -227,7 +227,6 @@ pub const AMOUNT_TOLERANCE_PERCENT_MAX: f64 = 5.0;
 pub const ACCESS_TOKEN_TTL_MAX_MINUTES: i64 = 60;
 pub const REFRESH_TOKEN_TTL_MAX_DAYS: i64 = 90;
 pub const JWT_SECRET_MIN_LEN: usize = 32;
-pub const SETUP_TOKEN_MIN_LEN: usize = 16;
 
 /// The `APP_ENV` value under which insecure local conveniences (public test
 /// mnemonic, plain-text Redis/Postgres, `http://` providers and webhooks)
@@ -262,7 +261,7 @@ pub const USDT_TRON: &str = "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t";
 pub const USDT_SOLANA: &str = "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB";
 
 /// Runtime configuration. Secret fields (`wallet_mnemonic`, `database_url`,
-/// `redis_url`, provider keys, `jwt_secret`, `setup_token`) are redacted
+/// `redis_url`, provider keys, `jwt_secret`) are redacted
 /// from `Debug` and zeroized when the config is dropped — never log them.
 #[derive(Clone)]
 pub struct AppConfig {
@@ -300,9 +299,6 @@ pub struct AppConfig {
     pub breez_storage_dir: String,
     /// Reverse proxies whose `X-Forwarded-For` is trusted (empty = none).
     pub trusted_proxies: Vec<IpNet>,
-    /// First-admin bootstrap token for `POST /setup`; generated at boot
-    /// (and logged) when unset while no staff exists.
-    pub setup_token: Option<String>,
     /// Escape hatch for Redis/Postgres without TLS outside development
     /// (`ALLOW_INSECURE_TRANSPORT=true`, warned loudly at boot).
     pub allow_insecure_transport: bool,
@@ -347,7 +343,6 @@ impl std::fmt::Debug for AppConfig {
             .field("breez_api_key", &redact(&self.breez_api_key))
             .field("breez_storage_dir", &self.breez_storage_dir)
             .field("trusted_proxies", &self.trusted_proxies)
-            .field("setup_token", &redact(&self.setup_token))
             .field("allow_insecure_transport", &self.allow_insecure_transport)
             .field("chain", &self.chain)
             .field("outflows_frozen", &self.outflows_frozen)
@@ -366,7 +361,6 @@ impl Drop for AppConfig {
             &mut self.helius_api_key,
             &mut self.jwt_secret,
             &mut self.breez_api_key,
-            &mut self.setup_token,
         ] {
             secret.zeroize();
         }
@@ -437,7 +431,6 @@ impl AppConfig {
             breez_api_key: vars.optional("BREEZ_API_KEY"),
             breez_storage_dir: absolute_path(&vars.string_or("BREEZ_STORAGE_DIR", "./.breez-data"))?,
             trusted_proxies: parse_cidr_list(&vars.optional("TRUSTED_PROXIES").unwrap_or_default())?,
-            setup_token: vars.optional("SETUP_TOKEN"),
             allow_insecure_transport: vars.parse_or("ALLOW_INSECURE_TRANSPORT", false)?,
             chain,
             outflows_frozen: vars.parse_or("OUTFLOWS_FROZEN", false)?,
@@ -471,11 +464,6 @@ impl AppConfig {
         if let Some(secret) = &self.jwt_secret {
             if secret.len() < JWT_SECRET_MIN_LEN {
                 bail!("JWT_SECRET must be at least {JWT_SECRET_MIN_LEN} characters");
-            }
-        }
-        if let Some(token) = &self.setup_token {
-            if token.len() < SETUP_TOKEN_MIN_LEN {
-                bail!("SETUP_TOKEN must be at least {SETUP_TOKEN_MIN_LEN} characters");
             }
         }
         if !(1..=ACCESS_TOKEN_TTL_MAX_MINUTES).contains(&self.access_token_ttl_minutes) {
@@ -937,7 +925,6 @@ mod tests {
             ("ACCESS_TOKEN_TTL_MINUTES", "1440"),
             ("REFRESH_TOKEN_TTL_DAYS", "365"),
             ("POLLING_INTERVAL_SECONDS", "0"),
-            ("SETUP_TOKEN", "short"),
         ] {
             let err = config_with(&[(key, value)]).unwrap_err();
             assert!(format!("{err:#}").contains(key), "{key}={value}");
@@ -969,7 +956,6 @@ mod tests {
             ("JWT_SECRET", "jwt-secret-value-that-is-long-enough!!"),
             ("ALCHEMY_API_KEY", "alchemy-key-value"),
             ("BREEZ_API_KEY", "breez-key-value"),
-            ("SETUP_TOKEN", "setup-token-value-123"),
         ])
         .unwrap();
         let debug = format!("{config:?}");
@@ -980,7 +966,6 @@ mod tests {
             "jwt-secret-value",
             "alchemy-key-value",
             "breez-key-value",
-            "setup-token-value",
         ] {
             assert!(!debug.contains(secret), "{secret} leaked: {debug}");
         }

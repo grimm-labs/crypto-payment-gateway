@@ -21,7 +21,6 @@ import { passwordSchema } from "@/lib/validation"
 
 const schema = z
   .object({
-    setup_token: z.string().trim().min(1, "Setup token is required"),
     first_name: z.string().trim().min(1, "First name is required"),
     last_name: z.string().trim().min(1, "Last name is required"),
     email: z.string().trim().email("Invalid email address"),
@@ -47,7 +46,6 @@ export function SetupPage() {
   async function onSubmit(values: FormValues) {
     try {
       await completeSetup({
-        setup_token: values.setup_token,
         email: values.email,
         password: values.password,
         first_name: values.first_name,
@@ -78,21 +76,6 @@ export function SetupPage() {
         </CardHeader>
         <CardContent>
           <form onSubmit={form.handleSubmit(onSubmit)} className="space-y-4">
-            <div className="space-y-2">
-              <Label htmlFor="setup_token">Setup token</Label>
-              <Input
-                id="setup_token"
-                className="font-mono text-xs"
-                autoComplete="off"
-                spellCheck={false}
-                {...form.register("setup_token")}
-              />
-              <FieldError message={errors.setup_token?.message} />
-              <p className="text-xs text-muted-foreground">
-                Printed in the API logs at boot, or set with the{" "}
-                <code>SETUP_TOKEN</code> environment variable.
-              </p>
-            </div>
             <div className="grid grid-cols-2 gap-4">
               <div className="space-y-2">
                 <Label htmlFor="first_name">First name</Label>

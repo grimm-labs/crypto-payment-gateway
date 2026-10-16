@@ -75,8 +75,6 @@ pub struct AppState {
     pub lightning: Option<LightningClient>,
     /// Outgoing webhook client (SSRF-hardened outside development).
     pub webhooks: WebhookClient,
-    /// First-admin bootstrap token, set at boot while no staff exists.
-    pub setup_token: Option<Arc<String>>,
 }
 
 impl AppState {

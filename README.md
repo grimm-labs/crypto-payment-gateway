@@ -58,9 +58,8 @@ pnpm nx run api:dev        # cargo run -p gateway
 ```
 
 On first boot the binary applies SQL migrations (`packages/rust/db/migrations`) via sqlx.
-While no staff account exists, it also prints a **one-time setup token** in its logs
-(`No staff account yet — complete the dashboard setup with this one-time setup token: …`, or
-set `SETUP_TOKEN` yourself): the dashboard's `/setup` wizard asks for it.
+While no staff account exists, the dashboard's `/setup` wizard is **open to anyone** who
+reaches it: create the first admin right after the first start.
 
 Outside `APP_ENV=development` the service refuses to start with the public test mnemonic of
 `.env.example`, with plain-text Redis/Postgres (`rediss://` and `sslmode=verify-full` are
@@ -82,8 +81,7 @@ pnpm dev                    # api + dashboard together
 
 Set `JWT_SECRET` (min 32 chars) in `.env` first — without it the admin API is disabled.
 On first visit the dashboard walks you through creating the initial admin account
-(first name, last name, email, password of 12–128 characters, and the one-time setup token
-printed in the API logs). Admins can then add staff (role `admin` or `operator`), create API
+(first name, last name, email, password of 12–128 characters). Admins can then add staff (role `admin` or `operator`), create API
 keys, generate deposit addresses, and monitor/retry webhooks. Enable 2FA (Account →
 Security): payouts, payout rights, payout limits and staff management require a fresh code.
 
@@ -350,7 +348,7 @@ per account per 15 min.
 
 | Method | Path | Access | Description |
 |---|---|---|---|
-| GET/POST | `/setup` | public | First-run check / create the initial admin (only while no staff exists; needs `setup_token`, printed in the API logs at boot or set with `SETUP_TOKEN`) |
+| GET/POST | `/setup` | public | First-run check / create the initial admin (only while no staff exists; open to anyone until then) |
 | POST | `/auth/login`, `/auth/login/totp` | public | Email+password login (+ TOTP when enabled); sets the refresh cookie |
 | POST | `/auth/refresh`, `/auth/logout` | public (cookie + CSRF header) | Rotate the session / end it (always `200`, clears the cookie) |
 | POST | `/auth/logout-all` · `/auth/password` · GET `/auth/me` | JWT | Revoke every own session; change own password (`current_password`, `new_password`, `totp_code` when 2FA is on — revokes every session); profile |
@@ -535,8 +533,11 @@ environment). The API reaches them by container name over the `kamal` docker net
 published port; `.kamal/secrets` builds `DATABASE_URL` and `REDIS_URL` from the
 `POSTGRES_PASSWORD` and `REDIS_PASSWORD` secrets. That traffic never leaves the host, so the
 api role sets `ALLOW_INSECURE_TRANSPORT=true` (no TLS between containers; the boot warning is
-expected). Migrations run when the api container boots. On a fresh database, read the one-time
-setup token with `kamal app logs -r api` (or set the `SETUP_TOKEN` secret).
+expected). Migrations run when the api container boots. On a fresh database, the dashboard's
+`/setup` page lets **anyone** create the first admin: open it right after the first deploy. If
+it already says the setup is done and you did not do it, someone else claimed the instance —
+wipe the database before any deposit (`docker volume rm crypto-payment-gateway-postgres`, with
+the accessory stopped) and deploy again.
 
 **GitHub Actions → Deploy** (manual, pick the environment) runs `kamal deploy` — only from
 `main` or a `v*` tag, for a commit on `main` whose CI run succeeded (a `guard` job checks it
@@ -552,7 +553,7 @@ before any secret is exposed). Per GitHub environment:
   through), `OUTFLOWS_FROZEN` (`true` holds the outflow freeze).
 - Secrets: `SSH_PRIVATE_KEY`, `WALLET_MNEMONIC`, `JWT_SECRET`, `POSTGRES_PASSWORD`,
   `REDIS_PASSWORD` (at least 32 letters, digits, `-` or `_`, checked before the deploy — they
-  go unencoded into the URLs: `openssl rand -hex 32`); optional `SETUP_TOKEN` and provider keys
+  go unencoded into the URLs: `openssl rand -hex 32`); optional provider keys
   `TRONGRID_API_KEY`, `ALCHEMY_API_KEY`, `HELIUS_API_KEY`, `BREEZ_API_KEY` (empty disables
   the network).
 
@@ -670,7 +671,6 @@ To report a vulnerability, use [GitHub Security Advisories](https://github.com/n
 | `JWT_SECRET` | No** | — | Secret for staff JWTs (min 32 chars — shorter fails startup); unset disables `/api/admin/v1` |
 | `ACCESS_TOKEN_TTL_MINUTES` | No | `15` | Staff access-token lifetime (1–60) |
 | `REFRESH_TOKEN_TTL_DAYS` | No | `30` | Absolute staff session lifetime from the login (1–90; refresh token stored hashed in Redis, rotated) |
-| `SETUP_TOKEN` | No | random, logged | One-time token for the first-admin `/setup` (≥ 16 chars). Unset: generated at boot and printed in the logs while no staff exists |
 | `ALLOW_INSECURE_TRANSPORT` | No | `false` | Outside development, start even if `REDIS_URL` is not `rediss://` or `DATABASE_URL` lacks `sslmode=verify-full` (loud warning). Only for a private network |
 | `DASHBOARD_PORT` | No | `8080` | Host port of the dashboard container (docker compose) |
 | `CORS_ALLOWED_ORIGINS` | No | — | Comma-separated origins (`scheme://host[:port]`, never `*` — an invalid entry fails startup); only needed if the dashboard is not same-origin |

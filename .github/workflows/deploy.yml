@@ -23,8 +23,7 @@ run-name: Deployment - ${{ fromJSON('{"test":"Test","staging":"Staging","product
 # SSH_PRIVATE_KEY, WALLET_MNEMONIC, JWT_SECRET, POSTGRES_PASSWORD and
 # REDIS_PASSWORD (the accessories', >= 32 letters, digits, `-` or `_`, e.g.
 # `openssl rand -hex 32`; DATABASE_URL and REDIS_URL are built from them);
-# optional: SETUP_TOKEN (first-admin bootstrap; empty = generated and logged at
-# boot) and the provider keys (empty disables the network): TRONGRID_API_KEY,
+# optional: the provider keys (empty disables the network): TRONGRID_API_KEY,
 # ALCHEMY_API_KEY, HELIUS_API_KEY, BREEZ_API_KEY. The image is pushed to ghcr.io
 # with GITHUB_TOKEN.
 #
@@ -203,7 +202,6 @@ jobs:
           POSTGRES_PASSWORD: ${{ secrets.POSTGRES_PASSWORD }}
           REDIS_PASSWORD: ${{ secrets.REDIS_PASSWORD }}
           JWT_SECRET: ${{ secrets.JWT_SECRET }}
-          SETUP_TOKEN: ${{ secrets.SETUP_TOKEN || '' }}
           TRONGRID_API_KEY: ${{ secrets.TRONGRID_API_KEY || '' }}
           ALCHEMY_API_KEY: ${{ secrets.ALCHEMY_API_KEY || '' }}
           HELIUS_API_KEY: ${{ secrets.HELIUS_API_KEY || '' }}

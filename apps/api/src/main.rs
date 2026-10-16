@@ -129,7 +129,11 @@ async fn main() -> anyhow::Result<()> {
     let (traffic, traffic_rx) = TrafficRecorder::channel(API_TRAFFIC_QUEUE_CAPACITY);
     // http:// and private receivers are only accepted in development.
     let webhooks = WebhookClient::new(config.is_development())?;
-    let setup_token = setup_token(&config, &db).await?;
+    if config.jwt_secret.is_some() && db.count_staff().await? == 0 {
+        tracing::warn!(
+            "No staff account yet — create the first admin from the dashboard's /setup page (open to anyone until then)"
+        );
+    }
     let state = AppState {
         config: config.clone(),
         db,
@@ -139,7 +143,6 @@ async fn main() -> anyhow::Result<()> {
         traffic,
         lightning: lightning.clone(),
         webhooks,
-        setup_token,
     };
 
     // No boot-time reconciliation is needed before serving: every monitor
@@ -169,24 +172,6 @@ async fn main() -> anyhow::Result<()> {
     }
     info!("Shutdown complete");
     Ok(())
-}
-
-/// The one-time token `POST /setup` requires while no staff exists:
-/// `SETUP_TOKEN` when set, otherwise a random one printed once in the logs
-/// (the operator reads it there). `None` once an admin exists.
-async fn setup_token(config: &AppConfig, db: &Db) -> anyhow::Result<Option<Arc<String>>> {
-    if config.jwt_secret.is_none() || db.count_staff().await? > 0 {
-        return Ok(None);
-    }
-    if let Some(token) = &config.setup_token {
-        info!("No staff account yet — complete the dashboard setup with SETUP_TOKEN");
-        return Ok(Some(Arc::new(token.clone())));
-    }
-    let token = auth::generate_session_id();
-    tracing::warn!(
-        "No staff account yet — complete the dashboard setup with this one-time setup token: {token}"
-    );
-    Ok(Some(Arc::new(token)))
 }
 
 /// `None` (Lightning disabled) when `BREEZ_API_KEY` is unset or the SDK
