@@ -1,6 +1,6 @@
 # Crypto Payment Gateway
 
-A custodial gateway that receives crypto payments for a merchant on several networks, notifies the merchant through webhooks, and sends funds back out on request.
+A custodial gateway that receives crypto payments for one merchant's projects on several networks, notifies the merchant through webhooks, and sends funds back out on request.
 
 ## Language
 
@@ -66,10 +66,40 @@ _Avoid_: Kill switch, pause
 Sending just enough gas asset from the treasury to a deposit address so its tokens can be swept.
 _Avoid_: Funding, refuel
 
+### Projects
+
+**Project balance**:
+What a project has brought into the gateway and not taken out, per asset and network: its confirmed deposits and the unattributed funds of its deposit addresses, minus its withdrawals and their fees paid in the same asset, plus or minus its internal transfers. It is a ledger figure; the funds themselves are pooled in the treasuries.
+_Avoid_: Project wallet, sub-account, project funds
+
+**Merchant funds**:
+What the gateway holds beyond the sum of the project balances, per asset and network: mostly the gas reserves the merchant funds, less the costs no project is charged for (sweeps, fees paid in a gas asset). A withdrawal that names no project draws on them.
+_Avoid_: Instance funds, operator share, unassigned funds
+
+**Internal transfer**:
+An admin's ledger move of an amount of one asset on one network from one owner to another; nothing moves on chain.
+_Avoid_: Withdrawal, internal withdrawal, reallocation
+
+**Owner**:
+The project a withdrawal, internal transfer side, webhook endpoint or address-book entry belongs to, or the merchant when it belongs to no project.
+_Avoid_: Scope, tenant
+
+**Ledger shortfall**:
+The state in which the project balances of an asset on a network add up to more than the gateway actually holds there, i.e. negative merchant funds.
+_Avoid_: Deficit, negative gap
+
 ### Actors
 
+**Merchant**:
+The operator of the gateway: the single owner of its funds and of every project.
+_Avoid_: Tenant, client, customer
+
+**Project**:
+One of the merchant's applications that takes payments through the gateway.
+_Avoid_: Tenant, workspace, account, merchant
+
 **Merchant key**:
-An API key through which the merchant's own systems call the gateway.
+An API key through which a project's systems call the gateway.
 _Avoid_: API client, token
 
 **Staff**:
