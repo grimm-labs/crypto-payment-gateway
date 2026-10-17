@@ -4,15 +4,25 @@
 
 Rust service for accepting USDT deposits on **Tron**, **Ethereum**, and **Solana**, native
 **ETH** on Ethereum, and bitcoin payments **on-chain** and over **Lightning** — and for
-sending funds back out (**withdrawals**) on every one of them.
+sending funds back out (**withdrawals**) on every one of them. One instance serves several
+**projects** (the merchant's applications), each with its own API keys, payments, webhooks
+and a per-asset balance kept as a ledger over the pooled treasuries.
 
 ## Features
 
 - Create unique deposit addresses per payment (`POST /api/v1/deposit-addresses`)
 - Monitor blockchain transfers and confirm deposits
+- **Projects**: several applications on one instance. Every API key, payment, webhook
+  endpoint and address-book entry belongs to a project (endpoints, entries and admin
+  withdrawals may belong to the **merchant funds** instead); a key only sees its project, a
+  project balance is derived per asset from its deposits, sweeps, withdrawals and transfers,
+  and a key cannot withdraw beyond it. Admins move funds between projects with **internal
+  transfers** and reconcile the balances against the holdings — see [Projects](#projects)
 - Send webhooks for payment lifecycle events — `pending` (address created), `paid`
-  (deposit confirmed), `expired` — to every active endpoint **subscribed to that event**;
-  endpoints are managed from the dashboard (**Webhooks**, admin), with per-endpoint delivery state
+  (deposit confirmed), `expired` — to every active endpoint **subscribed to that event** and
+  **owned by the payment's project** (alerts and Lightning payouts go to the merchant's
+  endpoints); endpoints are managed from the dashboard (**Webhooks**, admin), with
+  per-endpoint delivery state
 - HD wallet derivation from `WALLET_MNEMONIC`
 - Multi-network support: Tron (TRC-20), Ethereum (ERC-20 and native ETH), Solana (SPL),
   Bitcoin (BIP84 on-chain) and Lightning (BOLT11 via the Breez SDK) — see
@@ -22,9 +32,10 @@ sending funds back out (**withdrawals**) on every one of them.
   automatic **sweeps** — with limits, an address book, approval by a second admin, step-up
   TOTP, idempotency, an audit trail and an emergency **outflow freeze** — see
   [Withdrawals](#withdrawals) and the [operator runbook](#treasury-sweeps--withdrawals-operator-runbook)
-- **Admin dashboard** (`apps/dashboard`, React + shadcn/ui): wallet balances, payments,
-  withdrawals and approvals, treasury and sweeps, address book, webhook monitoring/retry,
-  API key and staff management — served on its own port
+- **Admin dashboard** (`apps/dashboard`, React + shadcn/ui): projects and their balances,
+  wallet balances, payments, withdrawals and approvals, internal transfers, treasury, sweeps
+  and the ledger, address book, webhook monitoring/retry, API key and staff management —
+  served on its own port
 - Merchant API protected by **API keys** (`x-api-key`) created from the dashboard;
   admin API (`/api/admin/v1`) protected by staff **JWT** (roles: admin / operator)
 
@@ -59,7 +70,10 @@ pnpm nx run api:dev        # cargo run -p gateway
 
 On first boot the binary applies SQL migrations (`packages/rust/db/migrations`) via sqlx.
 While no staff account exists, the dashboard's `/setup` wizard is **open to anyone** who
-reaches it: create the first admin right after the first start.
+reaches it: create the first admin right after the first start. The first sign-in then
+blocks on **Create your first project** (admins only; operators see a waiting screen) —
+on an instance upgraded with existing keys and payments the step offers to attach them to
+that project, see [Projects](#projects).
 
 Outside `APP_ENV=development` the service refuses to start with the public test mnemonic of
 `.env.example`, with plain-text Redis/Postgres (`rediss://` and `sslmode=verify-full` are
@@ -81,9 +95,11 @@ pnpm dev                    # api + dashboard together
 
 Set `JWT_SECRET` (min 32 chars) in `.env` first — without it the admin API is disabled.
 On first visit the dashboard walks you through creating the initial admin account
-(first name, last name, email, password of 12–128 characters). Admins can then add staff (role `admin` or `operator`), create API
-keys, generate deposit addresses, and monitor/retry webhooks. Enable 2FA (Account →
-Security): payouts, payout rights, payout limits and staff management require a fresh code.
+(first name, last name, email, password of 12–128 characters), then the first project.
+Admins can then add staff (role `admin` or `operator`), create projects and API keys,
+generate deposit addresses, and monitor/retry webhooks. Enable 2FA (Account → Security):
+withdrawals, internal transfers, withdrawal grants, limits, the address book and staff
+management require a fresh code.
 
 ### Docker
 
@@ -98,7 +114,7 @@ Both images come from `docker/Dockerfile` (targets `api` and `dashboard`).
 
 ## Testing
 
-Unit tests live in the `domain`, `wallet`, `config`, `chain`, `lightning-client`, `jobs`, `auth` and `http-api` crates (BIP39 / BIP84 / HD address golden vectors, amount tolerance and per-token decimals, enum roundtrips, Esplora parsing and confirmation math, the Breez SDK wrapper against a mocked `LightningOps`, webhook retry schedule, request validation). None needs a database or network access. CI runs the same suite:
+Unit tests live in the `domain`, `wallet`, `config`, `chain`, `lightning-client`, `jobs`, `auth` and `http-api` crates (BIP39 / BIP84 / HD address golden vectors, amount tolerance and per-token decimals, enum roundtrips, project validators, the webhook owner rule and the legacy-endpoint split, project-balance arithmetic, Esplora parsing and confirmation math, the Breez SDK wrapper against a mocked `LightningOps`, webhook retry schedule, request validation, and the router's surfaces through `tower::ServiceExt::oneshot` against a stub Redis). None needs a database or network access. CI runs the same suite:
 
 ```bash
 pnpm nx affected -t lint test build   # what CI runs (only the affected apps)
@@ -113,6 +129,56 @@ digest, and Dependabot proposes updates weekly.
 
 There are no integration tests for the API or chain providers yet.
 
+## Projects
+
+One gateway instance serves several **projects** — the applications of a single merchant
+(the operator). The design is a **ledger over pooled custody**
+([ADR 0004](docs/adr/0004-projects-ledger-over-pooled-custody.md),
+[spec](docs/projects-spec.md)): funds still sit on the shared treasuries and deposit
+addresses of one seed, and each project's balance is recomputed from source rows, never
+stored. Projects are not tenants and not separate wallets.
+
+- **Owners.** An API key, a payment (deposit address) and the withdrawals a key makes belong
+  to **one project, forever**. A webhook endpoint, an address-book entry and an admin
+  withdrawal belong to a project or to the **merchant funds** (`project_id: "merchant"`),
+  chosen explicitly at creation. Treasuries, sweeps, gas reserves, the freeze, asset
+  settings, alerts, staff and the audit log stay instance-level.
+- **Project balance**, per (network, token): confirmed deposits + the unattributed funds
+  swept from its addresses (on Bitcoin, never swept, found by an address scan) − withdrawn
+  amounts − their network fees when paid in the withdrawn asset (BTC, ETH) + transfers in −
+  transfers out. `available` also subtracts what its open withdrawals reserve. A **key
+  withdrawal** must fit in `available` — amount plus the fee cap when the fee is paid in the
+  same asset (`422 project_insufficient_funds`, re-checked at approval); an admin's may
+  exceed it.
+- **Merchant funds** = what the gateway holds of an asset (treasury + unswept deposit
+  addresses) − the sum of the project balances: gas reserves, sweep fees and whatever no
+  project is charged for. TRX and SOL are always merchant funds.
+- **Internal transfers** move an amount between two owners of the same (network, token)
+  (project ↔ project, project ↔ merchant funds) without touching the chain: admin + TOTP,
+  idempotent, append-only, allowed during the outflow freeze; a mistake is undone with the
+  reverse transfer. Both sides are notified with `transfer_completed`.
+- **Reconciliation.** Dashboard → Treasury → **Ledger** compares the holdings with the
+  project balances per asset (`unknown` for a disabled network, a provider error or a pair
+  whose sweeps are off). A shortfall — project balances above the holdings — on three
+  consecutive 5-minute checks raises the `ledger_shortfall` alert.
+- **Visibility.** A key sees only its project (another project's object answers `404`, like
+  a missing one) and never a custody figure. Staff see every project; the header selector
+  only filters the view, and instance-level pages show "Instance" instead.
+- **Key tag.** A project may carry its own key tag (`[{tag}_]…`), falling back to the global
+  one of Settings; it only affects keys created afterwards.
+
+**First run.** After `/setup`, the dashboard blocks on **Create your first project** (admin
+only; operators see a waiting screen). On an instance upgraded with existing data the step
+offers to **attach** that data to the new project (checked by default): keys, payments, key
+withdrawals and address-book entries move to it, and each webhook endpoint goes to the owner
+its events imply — one subscribed to both project events (payments, withdrawals, transfers)
+and merchant events (alerts, payouts) is split into two endpoints with the same URL and
+secret, withdrawals and transfers kept on both. Unchecked, the legacy keys are **revoked** (a
+key must belong to a project), payments and key withdrawals count in the merchant funds, and
+endpoints and entries become the merchant's. Until the first project exists the instance
+behaves as before projects: legacy keys work unscoped, webhooks are not owner-filtered, and
+every route that creates an owned object answers `409 "Create a project first"`.
+
 ## API
 
 > **Breaking change:** every `/api/v1` endpoint now requires an API key sent as
@@ -121,6 +187,14 @@ There are no integration tests for the API or chain providers yet.
 > are not affected. Keys are `[{tag}_]{8}_{40}` — the optional tag (max 5
 > alphanumeric chars) is configurable in **Settings → API key prefix**; changing
 > it only affects newly created keys, existing keys keep working.
+
+> **Breaking change (projects):** `/api/v1` is **scoped to the key's project**. Lists and
+> lookups only return that project's payments, withdrawals, address-book entries and
+> transfers (another project's object is a `404`), responses carry `project_id`, and the
+> custody routes left the merchant surface: `GET /balances`, `GET /wallet-balances` and the
+> Lightning wallet history `GET /lightning/payments` answer `404` (they remain on the admin
+> API). New: `GET /project` (the key's project and balances) and the read-only
+> `GET /transfers`.
 
 ### Create deposit address
 
@@ -166,7 +240,7 @@ Creation returns `503 "<network> is not configured"` when the network is disable
 provider key, Breez SDK not connected…) and a generic `500` when the Lightning SDK fails
 (details are only logged). The invoice expiry equals the payment's `expires_at`. Every
 response carries `expected_amount_raw` (base units: sats for BTC, 10⁻⁶ for USDT, wei for
-ETH) next to `expected_amount`.
+ETH) next to `expected_amount`, and `project_id`: the payment belongs to the key's project.
 
 Limits: `expected_amount` must be > 0 and ≤ 10¹² USDT (10⁵ ETH); an explicit `expires_at` must fall
 between now + 1 min and now + 1440 min (the default comes from Settings). A key may hold at
@@ -183,6 +257,7 @@ with a `detected` deposit waiting for confirmations is held up to 24 h past its 
 curl "http://localhost:3000/api/v1/deposit-addresses?status=pending&limit=20"
 ```
 
+The project's payments only (every key of the project sees them), each with `project_id`.
 Query params (optional):
 
 - `status`: `pending`, `paid`, `expired`
@@ -196,7 +271,7 @@ Query params (optional):
 curl http://localhost:3000/api/v1/deposit-addresses/<id>
 ```
 
-Each entry in the returned `deposits[]` includes a `webhook` object with the delivery state (`status`: `pending` / `delivered` / `failed`, `attempts`, `last_response`, `updated_at`), or `null` if no delivery was attempted yet. Endpoint URLs and delivery errors are admin data: they only appear on the dashboard (`/api/admin/v1`), never on `/api/v1`.
+`404` for another project's payment. Each entry in the returned `deposits[]` includes a `webhook` object with the delivery state (`status`: `pending` / `delivered` / `failed`, `attempts`, `last_response`, `updated_at`), or `null` if no delivery was attempted yet. Endpoint URLs and delivery errors are admin data: they only appear on the dashboard (`/api/admin/v1`), never on `/api/v1`.
 
 ### Retry a webhook delivery
 
@@ -204,25 +279,32 @@ Each entry in the returned `deposits[]` includes a `webhook` object with the del
 curl -X POST http://localhost:3000/api/v1/deposits/<deposit_id>/webhooks/retry
 ```
 
-`<deposit_id>` is the `id` of an entry in `deposits[]` above. A merchant key only re-queues the deliveries that ended **`failed`** (towards endpoints still active and subscribed) — a delivered webhook is never resent from `/api/v1` — at most once a minute per deposit; the answer carries `retried` (count). Errors: `404` unknown deposit, `400` deposit not confirmed, `409` nothing failed to retry, `429` too soon, `503` no active webhook endpoints configured. (Admins can replay delivered webhooks from the dashboard.)
+`<deposit_id>` is the `id` of an entry in `deposits[]` above. A merchant key only re-queues the deliveries that ended **`failed`** (towards endpoints still active and subscribed) — a delivered webhook is never resent from `/api/v1` — at most once a minute per deposit; the answer carries `retried` (count). Errors: `404` unknown deposit (another project's included), `400` deposit not confirmed, `409` nothing failed to retry, `429` too soon, `503` no active webhook endpoints configured. (Admins can replay delivered webhooks from the dashboard.)
 
-### Get balances (deposit addresses in database)
+### Your project
 
 ```bash
-curl http://localhost:3000/api/v1/balances
+curl http://localhost:3000/api/v1/project -H "x-api-key: $API_KEY"
 ```
 
-One entry **per (network, token)** — Ethereum appears twice (`USDT`, `ETH`), and the gas
-reserves show up as `TRX` (tron) and `SOL` (solana). Each entry is the **treasury plus the
-unswept deposit addresses**, broken out in `treasury_amount` / `deposits_amount` (raw
-variants alongside). Lightning reports the Breez/Spark wallet balance (`addresses_checked:
-0`). Totals never mix assets: `total_usdt`, `total_btc`, `total_eth`, and `total_trx` /
-`total_sol` for the gas reserves. The cached `/wallet-balances` payload (every derived
-index, synced hourly) has the same shape.
+`{ id, name, color, key_tag, balances: [...] }` — one entry per payment (network, token) the
+project touched, each with `deposits`, `unattributed`, `withdrawn`, `fees`, `transfers_in`,
+`transfers_out`, `balance`, `reserved`, `available`, `pending` (decimal strings, signed, with
+`_raw` variants in base units). Nothing about the treasuries, the merchant funds or other
+projects is in here. A legacy key that belongs to no project answers `409 "This API key
+belongs to no project"`.
 
-Querying every issued address costs one provider call each, so the result is computed in
-the background and cached for 5 minutes (`updated_at`): when no fresh figure exists the call
-answers `503 "Balances are being computed — retry shortly"` with `Retry-After: 15`.
+### Internal transfers (read-only)
+
+```bash
+curl "http://localhost:3000/api/v1/transfers?network=bitcoin&token=BTC&limit=50" -H "x-api-key: $API_KEY"
+```
+
+The transfers where the project is `from` or `to` (`GET /transfers/{id}` for one, `404` for
+another project's), each with `transfer_id`, `network`, `token`, `amount` / `amount_raw`,
+`from` and `to` (`{ "type": "project" | "merchant", "id": <uuid> | null }`), `note`,
+`created_at`. Admins create them from the dashboard; the project is notified with
+`transfer_completed`.
 
 ### Withdrawals
 
@@ -256,8 +338,13 @@ Gateway-owned addresses (deposit addresses, treasuries, their token accounts) ar
   an admin in Dashboard → API Keys, for keys that expire — or an **admin** from the
   dashboard with a fresh TOTP code. Operators never withdraw; TRX and SOL (gas reserves) are
   admin-only. A key without a policy gets `403`.
+- **Owner**: a key's withdrawal belongs to the key's project and must fit in the project's
+  available balance — `amount` plus the fee cap when the fee is paid in the withdrawn asset
+  (`422 project_insufficient_funds`, checked inside the admission transaction and again at
+  approval). An admin names the owner (`project_id`: a UUID or `"merchant"`, no default) and
+  may exceed a project's balance; TRX and SOL withdrawals are always merchant funds.
 - **Destination policy**: an `open` key may send anywhere within its own per-token limits; a
-  `book` key only to active address-book entries (`GET /api/v1/address-book`). At or above
+  `book` key only to active address-book entries of its project (`GET /api/v1/address-book`). At or above
   the asset's **approval threshold** any withdrawal waits for a second admin
   (`pending_approval`, 72 h); an admin's must then go to an active address-book entry
   (below it, anywhere).
@@ -270,8 +357,8 @@ Gateway-owned addresses (deposit addresses, treasuries, their token accounts) ar
 - **Idempotency**: the `Idempotency-Key` header (UUID) is required and bound to the caller
   and the parameters: a replay answers `200` with the stored withdrawal (nothing is sent
   again), other parameters `422`.
-- **Response**: `202` with the withdrawal (`status` `queued` or `pending_approval`). It then
-  moves through `signed` → `broadcast` → `confirmed` (or `failed`, `cancelled`, `stuck`):
+- **Response**: `202` with the withdrawal (`status` `queued` or `pending_approval`,
+  `project_id`). It then moves through `signed` → `broadcast` → `confirmed` (or `failed`, `cancelled`, `stuck`):
   follow it with `GET /withdrawals/{id}` and the `withdrawal_*` webhooks. `503 "Outflows are
   frozen"` while the outflow freeze holds, `503` when the network is not configured, `502`
   when a provider cannot be reached (details only in the logs).
@@ -279,45 +366,29 @@ Gateway-owned addresses (deposit addresses, treasuries, their token accounts) ar
 | Method | Path | |
 |---|---|---|
 | POST | `/withdrawals` | Create (above) |
-| POST | `/withdrawals/quote` | Same body, no `Idempotency-Key`: `fee_estimate` / `fee_token`, `approval_required`, `destination_acceptable` for this key, `available` — nothing is reserved |
-| GET | `/withdrawals?status=&network=&token=&limit=&offset=` | This key's withdrawals only |
-| GET | `/withdrawals/{id}` | `404` for another key's |
-| POST | `/withdrawals/{id}/cancel` | Own withdrawal, while `pending_approval` / `queued` |
-| GET | `/address-book` | Active entries (`id`, `network`, `destination`, `label`) |
+| POST | `/withdrawals/quote` | Same body, no `Idempotency-Key`: `fee_estimate` / `fee_token`, `approval_required`, `destination_acceptable` for this key, `available` (the instance), `project_available` and `project_check_ok` — nothing is reserved |
+| GET | `/withdrawals?status=&network=&token=&limit=&offset=` | The project's withdrawals (every key of the project, admin withdrawals attributed to it included) |
+| GET | `/withdrawals/{id}` | `404` for another project's |
+| POST | `/withdrawals/{id}/cancel` | A withdrawal of the project, while `pending_approval` / `queued` |
+| GET | `/address-book` | Active entries of the project (`id`, `network`, `destination`, `label`) |
 
 Creation and quotes share a limit of 10 calls per minute per caller.
 
 **Deprecated: `POST /lightning/payments`** (and `/lightning/payments/quote`) keeps working for
-one release: it creates a Lightning withdrawal to `ln_address` (`amount_sats`, `comment`)
-under the same rules and answers the former shape plus `withdrawal_id`, with
+one release: it creates a Lightning withdrawal of the key's project to `ln_address`
+(`amount_sats`, `comment`) under the same rules and answers the former shape plus `withdrawal_id`, with
 `Deprecation: true` and a `Sunset` header. Keys that could send payouts were migrated to an
 `open` policy for BTC on Lightning only, with the former payout limits as their key limits. An
 `Idempotency-Key` used before the upgrade is answered from the wallet, never paid again.
 Sends of the Lightning wallet the gateway did not make still fire `payout_succeeded` /
 `payout_failed`; its own fire `withdrawal_*`.
 
-### Lightning wallet history
+### Removed from the merchant surface
 
-```bash
-curl "http://localhost:3000/api/v1/lightning/payments?limit=50&offset=0" -H "x-api-key: $API_KEY"
-```
-
-Requires a key whose withdrawal policy allows BTC on Lightning (`403` otherwise; admin-only
-on the dashboard).
-Every payment of the Breez/Spark wallet, newest first — received and sent, completed,
-pending or failed, **including funds unrelated to gateway invoices** (anything else using
-the same seed shows up too). Each entry carries `direction`, `status`, `amount` (BTC) /
-`amount_sats`, `fees_sats`, `method`, the `invoice` (Lightning) or `tx_id` (on-chain
-deposit/withdrawal), `created_at`, and `deposit_address_id` when it settled a gateway
-invoice. The SDK reports no total: page with `limit` (1–100, default 50) / `offset` and the
-returned `has_more`. `503` when Lightning is not configured. The dashboard shows it under
-**Lightning**.
-
-### Get HD wallet balances (cached, synced hourly)
-
-```bash
-curl http://localhost:3000/api/v1/wallet-balances
-```
+`GET /balances`, `GET /wallet-balances` and the Lightning wallet history
+`GET /lightning/payments` are custody figures of the whole instance: they answer `404` on
+`/api/v1` and are served on the admin API only (see [Balances and the Lightning wallet
+history](#balances-and-the-lightning-wallet-history-staff-only)).
 
 All the `curl` examples above also need `-H "x-api-key: $API_KEY"`.
 
@@ -336,15 +407,22 @@ most `REFRESH_TOKEN_TTL_DAYS` from the login (never extended). Access tokens are
 their session: logout, password change, 2FA reset and deactivation revoke them at once.
 
 **Step-up.** Sensitive admin actions need a fresh TOTP code in the body (`totp_code`):
-creating, approving, rejecting, cancelling, bumping or abandoning a withdrawal; granting a key
-a withdrawal policy; the asset settings (limits, thresholds, caps, sweeps); address-book
+creating, approving, rejecting, cancelling, bumping or abandoning a withdrawal; creating an
+internal transfer; granting a key a withdrawal policy; the asset settings (limits, thresholds, caps, sweeps); address-book
 changes; lifting the outflow freeze; running sweeps; creating staff, changing a member's role
 / activation / password, resetting their 2FA. An admin without 2FA gets `403` on those (the
 rest of the dashboard works).
 
 **Rate limits** (`429` + `Retry-After`): login 20/15 min per IP and 10/15 min per account,
-setup 10/h per IP, refresh 60/min per IP, 10 wrong TOTP codes and 5 wrong current passwords
-per account per 15 min.
+setup 10/h per IP, refresh 60/min per IP, internal transfers 10/min per staff member, 10
+wrong TOTP codes and 5 wrong current passwords per account per 15 min.
+
+**Owners.** Routes that create an owned object take `project_id`: a project UUID for API
+keys and payments; a UUID or `"merchant"` for webhook endpoints, address-book entries and
+admin withdrawals. List routes filter with `?project_id=<uuid>` (and `?project_id=merchant`
+where the merchant can own rows: withdrawals, endpoints, deliveries, address book), and
+responses carry `project_id` (UUID or `null`). Before the first project exists every such
+creation answers `409 "Create a project first"`.
 
 | Method | Path | Access | Description |
 |---|---|---|---|
@@ -354,30 +432,60 @@ per account per 15 min.
 | POST | `/auth/logout-all` · `/auth/password` · GET `/auth/me` | JWT | Revoke every own session; change own password (`current_password`, `new_password`, `totp_code` when 2FA is on — revokes every session); profile |
 | POST | `/auth/totp/setup` (`password`), `/auth/totp/enable` (`code`), `/auth/totp/disable` (`password` + `code`) | JWT | Own 2FA management |
 | GET/POST/PATCH | `/staff`, `/staff/{id}`, `/staff/{id}/totp/reset` | admin | List/create/update staff (roles `admin` / `operator`, activation, password — 12 to 128 characters); the last active admin cannot be demoted |
-| GET/POST/PATCH/DELETE | `/api-keys`, `/api-keys/{id}` | admin | List/create/revoke merchant API keys (secret shown once; optional `expires_in_days` 30/90/180/365, omit for no expiry — expired keys get status `expired` and stop working); PATCH sets the withdrawal grant: `withdrawal_policy` (`none` / `book` / `open`), `withdrawal_tokens` (`USDT` / `BTC` / `ETH`), `withdrawal_networks` (`null` = all of them), `withdrawal_limits` (per token, required for `open`) — only on keys that expire, TOTP unless `none` |
+| GET · POST/PATCH/DELETE | `/projects` · `/projects`, `/projects/{id}` | JWT · admin | List (`{ projects: [{ id, name, color, key_tag, counts: { api_keys, deposit_addresses, withdrawals, webhook_endpoints, address_book_entries } }], unassigned }`, `unassigned` = the legacy rows while no project exists) · create (`name` 1–60, optional `color` from the 8-colour palette, `key_tag` ≤ 5 alphanumerics, `attach_existing` on the first project only — see [Projects](#projects)), rename / recolour / retag (`key_tag: null` clears it), delete (`409` while anything references it, or for the last project). No TOTP, audited |
+| GET | `/projects/{id}/balance` | JWT | The project's balances, same shape as `GET /api/v1/project` |
+| GET | `/ledger` | JWT | Per payment (network, token): `holdings`, `projects: [{ project_id, balance, available }]`, `project_total`, `merchant_funds`, `status` (`ok` / `shortfall` / `unknown`), each amount with `_raw`; cached 30 s |
+| GET · POST | `/transfers`, `/transfers/{id}` · `/transfers` | JWT · admin | List (`project_id` UUID or `merchant`, matched on either side; `network`, `token`) and detail · create: `from_project_id`, `to_project_id` (UUID or `merchant`), `network`, `token`, `amount` or `amount_sats`, `note` (1–200), `totp_code`, header `Idempotency-Key` (a replay by the same staff member with the same parameters answers the stored transfer, other reuse `422`). `422 project_insufficient_funds` / `merchant_insufficient_funds`, `503 "Holdings unavailable, retry later"` while the pair's holdings are unknown; allowed during the freeze |
+| GET/POST/PATCH/DELETE | `/api-keys`, `/api-keys/{id}` | admin | List (`?project_id`) / create (`project_id` required — the key's tag comes from the project, else from Settings) / revoke merchant API keys (secret shown once; optional `expires_in_days` 30/90/180/365, omit for no expiry — expired keys get status `expired` and stop working); PATCH sets the withdrawal grant: `withdrawal_policy` (`none` / `book` / `open`), `withdrawal_tokens` (`USDT` / `BTC` / `ETH`), `withdrawal_networks` (`null` = all of them), `withdrawal_limits` (per token, required for `open`) — only on keys that expire, TOTP unless `none` |
 | GET/PATCH | `/settings` | admin | Read/update system settings (`deposit_expiry_minutes` 1–1440, `api_key_prefix` ≤ 5 alphanum, `api_traffic_retention_days` 1–3650 or `null` = keep forever; PATCH is partial) |
 | GET · PATCH | `/settings/assets` | JWT · admin | Per-asset limits (per withdrawal, rolling 24 h), approval threshold, hot-wallet cap, gas reserve floor and alert threshold, and per-(network, token) sweep minimums and switches — decimal token amounts, `0` disables |
-| GET/POST/PATCH/DELETE | `/webhook-endpoints`, `/webhook-endpoints/{id}` | admin | Manage outgoing webhook endpoints (subscribed `events` — see [Webhook events](#webhook-events--payloads) — required signing `secret`, activate/deactivate; delete only when unused) |
-| GET | `/webhooks?status=&limit=&offset=` | JWT | Latest delivery per event key, joined with deposit (if any) + address |
+| GET/POST/PATCH/DELETE | `/webhook-endpoints`, `/webhook-endpoints/{id}` | admin | Manage outgoing webhook endpoints: owner `project_id` (UUID or `merchant`, fixed at creation — PATCH refuses it), subscribed `events` validated per owner — see [Webhook events](#webhook-events--payloads) — required signing `secret`, activate/deactivate; delete only when unused; list filter `?project_id` |
+| GET | `/webhooks?status=&project_id=&limit=&offset=` | JWT | Latest delivery per event key, joined with deposit (if any) + address; `project_id` (through the endpoint's owner) and `transfer_id` on each row |
 | POST | `/webhooks/retry-failed`, `/webhook-deliveries/{id}/retry`, `/deposits/{id}/webhooks/retry` | admin | Bulk-requeue failed deliveries (still subscribed endpoints only); replay one delivery row; replay a deposit's `paid` webhook |
-| GET | `/audit-log?action=&limit=&offset=` | admin | Append-only audit trail (actor, action, target, details, IP): setup, sessions, 2FA, staff, API keys and their withdrawal grants, settings, webhook endpoints, withdrawals (requested → approved / rejected / cancelled → signed → broadcast → confirmed / failed / stuck, bumps, abandons), address book, sweeps and gas top-ups, outflow freeze, webhook replays |
-| GET · POST | `/withdrawals`, `/withdrawals/{id}` · `/withdrawals`, `/withdrawals/quote` | JWT · admin | List (`status`, `network`, `token`, `api_key_id`) and detail with every signed transaction (fee bumps included) · create (`totp_code`) and quote — the merchant body, gas assets included |
+| GET | `/audit-log?action=&limit=&offset=` | admin | Append-only audit trail (actor, action, target, details, IP): setup, sessions, 2FA, staff, projects, API keys and their withdrawal grants, settings, webhook endpoints, internal transfers, withdrawals (requested → approved / rejected / cancelled → signed → broadcast → confirmed / failed / stuck, bumps, abandons), address book, sweeps and gas top-ups, outflow freeze, webhook replays |
+| GET · POST | `/withdrawals`, `/withdrawals/{id}` · `/withdrawals`, `/withdrawals/quote` | JWT · admin | List (`status`, `network`, `token`, `api_key_id`, `project_id` UUID or `merchant`) and detail with every signed transaction (fee bumps included) · create (`totp_code`, `project_id` UUID or `merchant` — gas assets merchant only) and quote — the merchant body, gas assets included |
 | POST | `/withdrawals/{id}/approve`, `/reject`, `/cancel`, `/bump`, `/abandon` | admin | Approve as an admin other than the requester (a single active admin may approve their own 24 h after creation); cancel while `pending_approval` / `queued`; on a `stuck` one, bump (doubles its fee cap) or abandon (only once the network proves none of its transactions can land) |
-| GET · POST/DELETE | `/address-book` · `/address-book`, `/address-book/{id}` | JWT · admin | List · add (`network`, `destination`, `label`, `is_cold_storage`; usable 24 h later) / remove |
+| GET · POST/DELETE | `/address-book` · `/address-book`, `/address-book/{id}` | JWT · admin | List (`?project_id`) · add (`project_id` UUID or `merchant`, `network`, `destination`, `label`, `is_cold_storage`; usable 24 h later; a destination is allowed once per owner) / remove |
 | GET | `/treasury` | JWT | Per (network, token): treasury address, confirmed, reserved, available, unswept, unattributed, gas reserve and cap status, plus `outflows_frozen` |
 | GET · POST | `/sweeps` · `/sweeps/run` | JWT · admin | Sweep history · plan sweeps now (optional `network`) |
 | GET · POST · POST | `/outflows` · `/outflows/freeze` · `/outflows/unfreeze` | JWT · JWT · admin | Freeze state · freeze every outflow (any staff, no TOTP) · lift it (TOTP; impossible while `OUTFLOWS_FROZEN=true`) |
-| GET | `/alerts` | JWT | Gas reserve low, treasury cap exceeded, address-book entry added, withdrawal stuck |
+| GET | `/alerts` | JWT | Gas reserve low, treasury cap exceeded, address-book entry added, withdrawal stuck, ledger shortfall |
 | GET | `/payout-requests` | admin | Former Lightning payout requests (read-only history) |
-| GET | `/stats` | JWT | Counters (addresses/deposits/webhooks by status) + confirmed volume |
-| GET | `/traffic/overview?surface=merchant\|admin\|all&window=15m\|1h\|24h` | JWT | API traffic aggregates: req/min, error rate, p50/p95 latency, per-bucket time series, top routes, top API keys |
-| GET | `/traffic/requests?surface=&status=2xx..5xx&route=&method=&api_key_id=&limit=&offset=` | JWT | Paginated request log (method, matched route, status, duration, key/staff identity, IP — no bodies, never the raw key) |
-| — | `/deposit-addresses*`, `/balances`, `/wallet-balances` | JWT | Same handlers as `/api/v1`, JWT-authenticated for the dashboard |
-| — | `/lightning/payments*` (history, deprecated payout alias and quote) | admin | Same handlers as `/api/v1`; the alias needs `totp_code` |
+| GET | `/stats?project_id=` · `/stats/deposits-timeseries?days=&project_id=` | JWT | Counters (addresses/deposits/webhooks by status) + confirmed volume · daily series |
+| GET | `/traffic/overview?surface=merchant\|admin\|all&window=15m\|1h\|24h&project_id=` | JWT | API traffic aggregates: req/min, error rate, p50/p95 latency, per-bucket time series, top routes, top API keys (`project_id` through the key's project; staff requests have none) |
+| GET | `/traffic/requests?surface=&status=2xx..5xx&route=&method=&api_key_id=&project_id=&limit=&offset=` | JWT | Paginated request log (method, matched route, status, duration, key/staff identity, IP — no bodies, never the raw key) |
+| — | `/deposit-addresses*` | JWT | Same handlers as `/api/v1`, unscoped: creation takes `project_id` (required), the list `?project_id` |
+| GET | `/balances`, `/wallet-balances` | JWT | The instance's holdings (below) — staff only since projects |
+| — | `/lightning/payments*` (history, deprecated payout alias and quote) | admin | The wallet history (below, staff only since projects) and the alias, which needs `totp_code` |
+
+### Balances and the Lightning wallet history (staff only)
+
+`GET /balances`: one entry **per (network, token)** — Ethereum appears twice (`USDT`, `ETH`),
+and the gas reserves show up as `TRX` (tron) and `SOL` (solana). Each entry is the
+**treasury plus the unswept deposit addresses**, broken out in `treasury_amount` /
+`deposits_amount` (raw variants alongside). Lightning reports the Breez/Spark wallet balance
+(`addresses_checked: 0`). Totals never mix assets: `total_usdt`, `total_btc`, `total_eth`,
+and `total_trx` / `total_sol` for the gas reserves. The cached `/wallet-balances` payload
+(every derived index, synced hourly) has the same shape. Querying every issued address costs
+one provider call each, so the result is computed in the background and cached for 5 minutes
+(`updated_at`): when no fresh figure exists the call answers `503 "Balances are being
+computed — retry shortly"` with `Retry-After: 15`. Project balances are the ledger view of the
+same funds: `GET /projects/{id}/balance` and `GET /ledger`.
+
+`GET /lightning/payments` (admin): every payment of the Breez/Spark wallet, newest first —
+received and sent, completed, pending or failed, **including funds unrelated to gateway
+invoices** (anything else using the same seed shows up too). Each entry carries `direction`,
+`status`, `amount` (BTC) / `amount_sats`, `fees_sats`, `method`, the `invoice` (Lightning) or
+`tx_id` (on-chain deposit/withdrawal), `created_at`, and `deposit_address_id` when it settled a
+gateway invoice. The SDK reports no total: page with `limit` (1–100, default 50) / `offset`
+and the returned `has_more`. `503` when Lightning is not configured. The dashboard shows it
+under **Lightning**.
 
 ## Webhook events & payloads
 
-Webhook endpoints are managed in Dashboard → Webhooks (admin). Each endpoint subscribes to one or more events and only receives those:
+Webhook endpoints are managed in Dashboard → Webhooks (admin). Each endpoint belongs to an
+**owner** — a project or the merchant — fixed at creation, subscribes to one or more events
+and only receives those **about its owner**:
 
 | Event | Fired when | `event_type` in payload |
 |---|---|---|
@@ -395,9 +503,25 @@ Webhook endpoints are managed in Dashboard → Webhooks (admin). Each endpoint s
 | `treasury_cap_exceeded` | An asset's treasuries hold more than its hot-wallet cap | `treasury_cap_exceeded` |
 | `address_book_entry_added` | A destination was added to the address book | `address_book_entry_added` |
 | `withdrawal_stuck` | A withdrawal reached its fee cap (or its expiry cannot be proven) | `withdrawal_stuck` |
+| `transfer_completed` | An internal transfer was recorded (both owners are notified) | `transfer_completed` |
+| `ledger_shortfall` | An asset's project balances exceeded the holdings on three consecutive checks | `ledger_shortfall` |
 
 Sweeps and gas top-ups are not notified. Alerts are deduplicated: once a day per condition
-(gas reserve, cap) while it holds, once per subject for the others.
+(gas reserve, cap, shortfall) while it holds, once per subject for the others.
+
+**Owner rule.** Events follow the owner of their subject: payment events go to the
+endpoints of the payment's project; withdrawal events to the endpoints of the withdrawal's
+owner (its project, or the merchant's endpoints for a merchant-funds withdrawal);
+`transfer_completed` to the endpoints of both sides; alerts and `payout_*` to the merchant's
+endpoints only. Hence the events an endpoint may subscribe to depend on its owner:
+
+| Endpoint owner | Allowed events |
+|---|---|
+| project | `pending`, `paid`, `expired`, the five `withdrawal_*`, `transfer_completed` |
+| merchant | the five `withdrawal_*` (merchant-funds withdrawals only), `transfer_completed`, `payout_succeeded`, `payout_failed`, `gas_reserve_low`, `treasury_cap_exceeded`, `address_book_entry_added`, `withdrawal_stuck`, `ledger_shortfall` |
+
+Other events are refused with `422`. Before the first project exists (an upgraded instance)
+every active subscribed endpoint receives every event, as before projects.
 
 Every payload also carries a top-level `event_id` (the delivery id — stable across retries
 of that delivery, identical to the `X-Webhook-Id` header; deduplicate on it) and
@@ -419,13 +543,14 @@ Payload:
 }
 ```
 
-Withdrawal payload (the withdrawal's current state; `fee` / `fee_raw` once known):
+Withdrawal payload (the withdrawal's current state; `fee` / `fee_raw` once known;
+`project_id` is `null` for a merchant-funds withdrawal):
 
 ```json
 {
   "event_type": "withdrawal_confirmed",
   "data": {
-    "withdrawal_id": "uuid", "status": "confirmed", "network": "tron", "token": "USDT",
+    "withdrawal_id": "uuid", "project_id": "uuid", "status": "confirmed", "network": "tron", "token": "USDT",
     "amount": "250.000000", "amount_raw": "250000000", "fee": "6.773500", "fee_raw": "6773500",
     "fee_token": "TRX", "destination": "TJDENsf…", "address_book_entry_id": null,
     "tx_hash": "98f8aa28…", "confirmations": 19, "reference": "payout-42",
@@ -435,15 +560,33 @@ Withdrawal payload (the withdrawal's current state; `fee` / `fee_raw` once known
 ```
 
 Alert payload: `{ "event_type": "gas_reserve_low", "data": { "alert_id", "type", "network",
-"token", "details": { … } } }`.
+"token", "details": { … } } }`. For `ledger_shortfall`, `details` holds `holdings_raw`,
+`project_balances_raw`, `shortfall_raw` and `consecutive_checks` for the alert's (network,
+token).
 
-Payload on confirmed deposit (`paid`, unchanged historical shape):
+Internal transfer payload (`from` / `to`: `{ "type": "project", "id": "uuid" }` or
+`{ "type": "merchant", "id": null }`):
+
+```json
+{
+  "event_type": "transfer_completed",
+  "data": {
+    "transfer_id": "uuid", "network": "bitcoin", "token": "BTC",
+    "amount": "0.0001", "amount_raw": "10000",
+    "from": { "type": "merchant", "id": null }, "to": { "type": "project", "id": "uuid" },
+    "note": "refund of the sweep fee", "created_at": "2026-10-17T12:00:00+00:00"
+  }
+}
+```
+
+Payload on confirmed deposit (`paid`, historical shape plus `project_id`):
 
 ```json
 {
   "event_type": "deposit_confirmed",
   "data": {
     "deposit_id": "uuid",
+    "project_id": "uuid",
     "address": "T...",
     "network": "tron",
     "token": "USDT",
@@ -463,6 +606,7 @@ Payload for `pending` / `expired` (no deposit yet — `deposit_id` is the deposi
   "event_type": "payment_pending",
   "data": {
     "deposit_id": "uuid",
+    "project_id": "uuid",
     "address": "T...",
     "network": "tron",
     "token": "USDT",
@@ -510,7 +654,7 @@ creation and again at every connection, after DNS resolution). Redirects are nev
 a `3xx` answer counts as a failed attempt. Plain `http://` and local receivers are accepted in
 development only.
 
-If no active webhook endpoint is configured, a warning is logged at startup and webhooks are disabled. Each delivery is tracked per (deposit, endpoint) pair for `paid` and per (address, event, endpoint) for `pending`/`expired`; `deposits[].webhooks[]` in the deposit-address detail exposes the per-endpoint state, while `deposits[].webhook` keeps the historical single-object shape (most recent delivery).
+If no active webhook endpoint is configured, a warning is logged at startup and webhooks are disabled. Each delivery is tracked per (deposit, endpoint) pair for `paid`, per (address, event, endpoint) for `pending`/`expired`, and per (subject, event, endpoint) for the withdrawal, transfer, payout and alert events; before every attempt the endpoint must still be active, subscribed and the owner of the subject, otherwise the delivery is closed as `failed`; `deposits[].webhooks[]` in the deposit-address detail exposes the per-endpoint state, while `deposits[].webhook` keeps the historical single-object shape (most recent delivery).
 
 Delivery is attempted up to 5 times with increasing gaps — 90s, 4m30, 13m30, 40m30 — so the 5th and final attempt starts ~1h after the first. After that the delivery is marked `failed` and can only be resent via the retry endpoint. Delivery is **at least once**: a worker stopped mid-delivery (deploy, crash) leaves a 60 s lease after which the delivery is retried, so receivers must treat replays as the same event (deduplicate on `event_id`). Up to 16 deliveries run concurrently.
 
@@ -632,6 +776,8 @@ Treat production deployments accordingly:
   admin
 - Keep the withdrawal limits and hot-wallet caps (Settings → Assets) as low as your use
   allows, move the excess to cold storage, and review the audit log
+- Give each application its own **project** and key: a key only sees and spends its
+  project, so a leaked key is bounded by that project's balance and limits
 - Know where the **Freeze** button is: any staff member stops every outflow at once
 
 [`.env.example`](.env.example) uses only the well-known BIP39 test vector (`abandon … about`): the service refuses it outside `APP_ENV=development`, and never connects the (mainnet) Lightning wallet with it.
@@ -640,14 +786,18 @@ Hardening in place: TLS required to Redis/Postgres outside development, provider
 checked against mainnet at boot (a network whose provider answers for another chain stays
 disabled), session cookies + CSRF header, step-up TOTP, rate limits, SSRF-safe webhook
 client, generic error messages (details only in the logs), security headers, an
-append-only audit log. Known limits: no per-merchant data isolation (every key sees every
-payment), no reorg handling beyond confirmation thresholds, secrets (TOTP, webhook signing)
-stored in clear in the database, a single seed for on-chain and Lightning funds.
+append-only audit log, a merchant API scoped to the key's project in SQL (another project's
+object is a `404`, never a `403`, and no custody figure reaches a key or a project endpoint).
+Known limits: projects are a ledger over **pooled** custody, not isolated wallets (an admin
+may spend beyond a project's balance; a shortfall is detected, not prevented), no reorg
+handling beyond confirmation thresholds, secrets (TOTP, webhook signing) stored in clear in
+the database, a single seed for on-chain and Lightning funds.
 
 Scope today: inbound USDT / ETH / BTC / Lightning deposit detection and webhooks, and
-withdrawals from hot treasuries signed in-process. This is not a multi-tenant or
-non-custodial vault: compromising the API process means compromising every hot fund, bounded
-only by the guard rails above. See the [custody note](#custody-note) for Lightning funds.
+withdrawals from hot treasuries signed in-process, for several projects of one merchant.
+This is not a multi-tenant or non-custodial vault: compromising the API process means
+compromising every hot fund, bounded only by the guard rails above. See the
+[custody note](#custody-note) for Lightning funds.
 
 To report a vulnerability, use [GitHub Security Advisories](https://github.com/nejos97/crypto-payment-gateway/security/advisories/new) rather than a public issue when possible.
 
@@ -689,10 +839,12 @@ To report a vulnerability, use [GitHub Security Advisories](https://github.com/n
 
 Advanced overrides (code defaults if unset): `POLLING_INTERVAL_SECONDS` (10), `ETH_CONFIRMATIONS` (12, minimum 12), `TRON_CONFIRMATIONS` (19, minimum 19), `AMOUNT_TOLERANCE_PERCENT` (1, between 0 and 5). An unparsable or out-of-range value fails startup instead of falling back to the default. Provider base URLs must use `https://` outside development.
 
-Webhook endpoints (Dashboard → Webhooks), the default payment expiry (60 min, max 24 h;
-Dashboard → Settings) and every withdrawal guard rail (limits, approval thresholds, caps, gas
-reserve thresholds, sweep minimums — Dashboard → Settings → Assets) are **not** environment
-variables — they are stored in the database and managed from the dashboard (admin only).
+Projects (Dashboard → Projects), webhook endpoints (Dashboard → Webhooks), the default
+payment expiry (60 min, max 24 h; Dashboard → Settings) and every withdrawal guard rail
+(limits, approval thresholds, caps, gas reserve thresholds, sweep minimums — Dashboard →
+Settings → Assets) are **not** environment variables — they are stored in the database and
+managed from the dashboard (admin only). The ledger tuning is fixed in code: balances cached
+30 s, holdings 5 min, the shortfall alert after 3 consecutive checks of the 5-minute monitor.
 
 ## Bitcoin & Lightning
 
@@ -751,10 +903,11 @@ Before going live:
    first TRX transfer **activates** the account), SOL on the Solana treasury — above the
    floors of Settings → Assets (defaults 0.05 ETH, 50 TRX, 0.1 SOL; alerts below 0.1 ETH,
    200 TRX, 0.5 SOL). Under its floor a network stops top-ups and gas-asset withdrawals.
-2. Add at least one **cold-storage** entry to the address book (usable 24 h later). When an
-   asset's treasuries exceed its hot-wallet cap an alert fires, and Dashboard → Treasury
-   offers to send the excess to cold storage — a normal withdrawal (TOTP, approval above the
-   threshold).
+2. Add a **cold-storage** entry to the address book for every owner that should use one —
+   each project, and the merchant funds — each usable 24 h later. When an asset's treasuries
+   exceed its hot-wallet cap an alert fires, and Dashboard → Treasury offers to send the
+   excess to cold storage — a normal withdrawal (TOTP, approval above the threshold) debited
+   from the owner you pick (see *Projects and cold storage* below).
 3. Enable **2FA for at least two admins** (approvals need a second admin; alone, the
    requester may approve after 24 h).
 4. Review the default limits — per withdrawal / 24 h / approval at / cap: USDT 10 000 /
@@ -769,6 +922,23 @@ Before going live:
 Sending uses the monitoring providers (TronGrid, Alchemy — on a plan serving
 `alchemy_getAssetTransfers` and wide `eth_getLogs` ranges —, Helius, Esplora): a network
 without its provider has its withdrawals and sweeps disabled.
+
+**Projects and cold storage.** Funds sent to cold storage are a withdrawal, so they are
+debited from an owner: the dialog requires one like any admin withdrawal and lists only that
+owner's `is_cold_storage` entries. When no single project's available balance covers the
+excess, send several withdrawals, one per project (the dialog shows each project's available
+balance), or debit the merchant funds. To **bring funds back**, send them to the treasury
+address — a treasury deposit raises the merchant funds — then make an internal transfer from
+the merchant funds to the project (Treasury → Ledger → *New internal transfer*). The
+**Ledger** card of the Treasury page is the reconciliation: holdings (confirmed treasury
+balance plus the unswept deposit addresses at the confirmation depth) against the sum of the
+project balances, per asset; the difference is the merchant funds. A negative difference is a
+**shortfall** — the project balances promise more than the gateway holds (an admin spent
+beyond a project, an unswept address was emptied by hand…): after three consecutive 5-minute
+checks the `ledger_shortfall` alert fires, and the fix is an internal transfer from the
+merchant funds (once they exist again) or a treasury deposit. `unknown` means the pair cannot
+be reconciled for now: network disabled, provider error, or sweeping switched off for it
+(unswept addresses are then not counted).
 
 **Execution.** Withdrawals run asynchronously. Workers claim them, re-check the approval, the
 destination rules and the requesting key right before signing, and track each transaction to
