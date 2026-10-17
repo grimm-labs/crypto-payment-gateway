@@ -32,6 +32,7 @@ pub mod alerts;
 pub mod audit;
 pub mod fees;
 pub mod freeze;
+pub mod ledger;
 pub mod outbound;
 pub mod payouts;
 pub mod projects;

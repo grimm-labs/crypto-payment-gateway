@@ -3,6 +3,7 @@ import { ArrowLeft } from "lucide-react"
 import { useNavigate } from "react-router-dom"
 import { toast } from "sonner"
 
+import { ProjectDot } from "@/components/shared/ProjectBadge"
 import { StepUpCodeField } from "@/components/shared/StepUpCodeField"
 import { QuoteSummary } from "@/components/withdrawals/QuoteSummary"
 import { Button } from "@/components/ui/button"
@@ -24,10 +25,12 @@ import {
   SelectValue,
 } from "@/components/ui/select"
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group"
+import { useProjectBalance } from "@/hooks/projects"
 import { useAddressBook, useCreateWithdrawal, useWithdrawalQuote } from "@/hooks/withdrawals"
 import { useNow } from "@/hooks/use-now"
 import { toastError } from "@/lib/errors"
 import {
+  formatAmount,
   formatCountdown,
   isValidDecimalAmount,
   networkLabel,
@@ -36,8 +39,15 @@ import {
   shortHash,
   tokenDecimals,
 } from "@/lib/format"
-import { NETWORKS, WITHDRAWABLE_TOKENS, isBtcNetwork } from "@/lib/networks"
-import type { Network, Token, WithdrawalQuote, WithdrawalRequest } from "@/lib/types"
+import { NETWORKS, WITHDRAWABLE_TOKENS, isBtcNetwork, isGasOnlyToken } from "@/lib/networks"
+import { useProjectScope } from "@/lib/project-scope"
+import {
+  MERCHANT_OWNER,
+  type Network,
+  type Token,
+  type WithdrawalQuote,
+  type WithdrawalRequest,
+} from "@/lib/types"
 import { isTotpCode } from "@/lib/validation"
 
 const REFERENCE_MAX_CHARS = 128
@@ -74,6 +84,8 @@ export interface WithdrawalPreset {
   /** Base units — rendered into the amount field (sats on bitcoin/lightning). */
   amountRaw?: string
   addressBookEntryId?: string
+  /** The owner debited: a project id or "merchant". No default otherwise. */
+  owner?: string
 }
 
 interface WithdrawalDialogProps {
@@ -126,6 +138,10 @@ function WithdrawalForm({
   const now = useNow(60_000)
   const initialNetwork = preset?.network ?? "tron"
   const initialToken = preset?.token ?? WITHDRAWABLE_TOKENS[initialNetwork][0]
+  // The owner debited (spec §14.4): the first field, no default. Gas assets
+  // (TRX, SOL) are always merchant funds.
+  const { projects } = useProjectScope()
+  const [owner, setOwner] = useState(preset?.owner ?? "")
   const [network, setNetwork] = useState<Network>(initialNetwork)
   const [token, setToken] = useState<Token>(initialToken)
   const [mode, setMode] = useState<"book" | "destination">(
@@ -139,7 +155,15 @@ function WithdrawalForm({
   const [quote, setQuote] = useState<WithdrawalQuote | null>(null)
   const [code, setCode] = useState("")
   const getQuote = useWithdrawalQuote()
-  const book = useAddressBook(network)
+  const gasAsset = isGasOnlyToken(token)
+  const effectiveOwner = gasAsset ? MERCHANT_OWNER : owner
+  const ownerProject = projects.find((p) => p.id === effectiveOwner)
+  // Address-book choices follow the owner (spec §8.2).
+  const book = useAddressBook(network, effectiveOwner || undefined)
+  const projectBalance = useProjectBalance(ownerProject?.id)
+  const ownerAvailable = projectBalance.data?.balances.find(
+    (b) => b.network === network && b.token === token,
+  )?.available
 
   const isBtc = isBtcNetwork(network)
   const isLightning = network === "lightning"
@@ -153,9 +177,11 @@ function WithdrawalForm({
   const destinationValid = mode === "book" ? Boolean(entryId) : destination.trim() !== ""
   const referenceValid = reference.trim().length <= REFERENCE_MAX_CHARS
   const commentValid = comment.trim().length <= COMMENT_MAX_CHARS
-  const formValid = amountValid && destinationValid && referenceValid && commentValid
+  const formValid =
+    effectiveOwner !== "" && amountValid && destinationValid && referenceValid && commentValid
 
   const request: WithdrawalRequest = {
+    project_id: effectiveOwner,
     network,
     token,
     ...(isBtc ? { amount_sats: trimmedAmount } : { amount: trimmedAmount }),
@@ -172,6 +198,12 @@ function WithdrawalForm({
     setEntryId("")
     setDestination("")
     setComment("")
+  }
+
+  function changeOwner(next: string) {
+    setOwner(next)
+    // Book entries are per owner.
+    setEntryId("")
   }
 
   async function review(event: React.FormEvent) {
@@ -274,6 +306,34 @@ function WithdrawalForm({
         </DialogDescription>
       </DialogHeader>
 
+      <div className="space-y-2">
+        <Label>Owner</Label>
+        <Select value={effectiveOwner} onValueChange={changeOwner} disabled={gasAsset}>
+          <SelectTrigger className="w-full">
+            <SelectValue placeholder="Choose the project debited, or the merchant funds" />
+          </SelectTrigger>
+          <SelectContent>
+            {projects.map((project) => (
+              <SelectItem key={project.id} value={project.id}>
+                <ProjectDot color={project.color} /> {project.name}
+              </SelectItem>
+            ))}
+            <SelectItem value={MERCHANT_OWNER}>Merchant funds (no project)</SelectItem>
+          </SelectContent>
+        </Select>
+        <p className="text-xs text-muted-foreground">
+          {gasAsset
+            ? "Gas assets always draw on the merchant funds."
+            : ownerProject
+              ? ownerAvailable !== undefined
+                ? `Project available on ${networkLabel(network)}: ${formatAmount(ownerAvailable, token)}. An admin may exceed it; the balance then turns negative.`
+                : "The project's available balance is debited; an admin may exceed it."
+              : effectiveOwner === MERCHANT_OWNER
+                ? "Draws on the merchant funds — what the gateway holds beyond the project balances (see the Treasury page)."
+                : "A withdrawal is always debited from a project, or from the merchant funds."}
+        </p>
+      </div>
+
       <div className="grid gap-4 sm:grid-cols-2">
         <div className="space-y-2">
           <Label>Network</Label>
@@ -351,7 +411,7 @@ function WithdrawalForm({
             </Select>
             {!book.isLoading && entries.length === 0 && (
               <p className="text-xs text-muted-foreground">
-                No {networkLabel(network)} entry in the address book yet.
+                No {networkLabel(network)} entry in the address book for this owner yet.
               </p>
             )}
           </>

@@ -100,6 +100,7 @@ pub fn admin_router(state: &AppState) -> Router<AppState> {
         .route("/auth/totp/disable", post(totp_disable))
         .route("/webhooks", get(list_webhooks))
         .route("/projects", get(p::list_projects))
+        .route("/projects/{id}/balance", get(p::project_balance))
         .route("/stats", get(stats))
         .route("/stats/deposits-timeseries", get(deposits_timeseries))
         .route("/traffic/overview", get(traffic_overview))

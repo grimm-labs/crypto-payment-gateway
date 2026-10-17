@@ -24,7 +24,7 @@ mod mainnet;
 mod request;
 mod tron;
 
-use esplora::{confirmed_balance_sats, esplora_transfers, EsploraAddress, EsploraTx};
+use esplora::{confirmed_balance_sats, esplora_transfers, received_at_depth, EsploraAddress, EsploraTx};
 pub use mainnet::WrongChainError;
 
 /// keccak256("Transfer(address,address,uint256)")
@@ -203,6 +203,32 @@ impl ChainClients {
             .await
             .context("Esplora address request failed")?;
         Ok(confirmed_balance_sats(&account))
+    }
+
+    /// Everything `address` ever received with at least `depth`
+    /// confirmations, spent outputs included (sats) — the project ledger's
+    /// Bitcoin watermark (spec §7.3). `None` when Bitcoin is not configured.
+    pub async fn bitcoin_received_at_depth(&self, address: &str, depth: i32) -> Result<Option<u128>> {
+        let (Some(tip_url), Some(account_url), Some(txs_url)) = (
+            self.esplora_url("blocks/tip/height"),
+            self.esplora_url(&format!("address/{address}")),
+            self.esplora_url(&format!("address/{address}/txs")),
+        ) else {
+            return Ok(None);
+        };
+        let tip: u64 = request::send_text(self.http.get(tip_url))
+            .await
+            .context("Esplora tip request failed")?
+            .trim()
+            .parse()
+            .context("Esplora returned an invalid tip height")?;
+        let account: EsploraAddress = request::send_json(self.http.get(account_url))
+            .await
+            .context("Esplora address request failed")?;
+        let txs: Vec<EsploraTx> = request::send_json(self.http.get(txs_url))
+            .await
+            .context("Esplora address txs request failed")?;
+        Ok(Some(received_at_depth(&account, &txs, address, tip, depth)))
     }
 
     /// Transfers to `address` among its most recent page of transactions

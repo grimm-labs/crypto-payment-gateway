@@ -83,6 +83,33 @@ pub(crate) fn confirmed_balance_sats(account: &EsploraAddress) -> u128 {
     )
 }
 
+/// Everything ever received by `address` with at least `depth`
+/// confirmations, spent outputs included (the Bitcoin "received"
+/// watermark of the project ledger). `chain_stats.funded_txo_sum` counts
+/// every confirmed funding output (one confirmation or more); the funding
+/// of the recent transactions still short of `depth` — all of them are in
+/// the most recent page Esplora returns — is subtracted from it. Mempool
+/// transactions were never counted.
+pub(crate) fn received_at_depth(
+    account: &EsploraAddress,
+    txs: &[EsploraTx],
+    address: &str,
+    tip: u64,
+    depth: i32,
+) -> u128 {
+    let shallow: u128 = txs
+        .iter()
+        .filter(|tx| match (tx.status.confirmed, tx.status.block_height) {
+            (true, Some(height)) => confirmations_between(tip, height) < depth,
+            _ => false,
+        })
+        .flat_map(|tx| tx.vout.iter())
+        .filter(|out| out.scriptpubkey_address.as_deref() == Some(address))
+        .map(|out| u128::from(out.value))
+        .sum();
+    u128::from(account.chain_stats.funded_txo_sum).saturating_sub(shallow)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -148,6 +175,33 @@ mod tests {
                   "status": {{ "confirmed": true, "block_height": 850001 }} }}]"#
         ));
         assert_eq!(esplora_transfers(txs, ADDRESS, 850000)[0].confirmations, 1);
+    }
+
+    #[test]
+    fn received_at_depth_subtracts_the_fundings_still_short_of_the_depth() {
+        // funded 150 000 (two confirmed fundings: 100 000 deep, 50 000 at
+        // one confirmation), 30 000 spent; a mempool funding never counts.
+        let account: EsploraAddress = serde_json::from_str(
+            r#"{ "chain_stats": { "funded_txo_sum": 150000, "spent_txo_sum": 30000 } }"#,
+        )
+        .unwrap();
+        let txs = txs(&format!(
+            r#"[
+                {{ "txid": "deep", "vout": [{{ "scriptpubkey_address": "{ADDRESS}", "value": 100000 }}],
+                   "status": {{ "confirmed": true, "block_height": 849990 }} }},
+                {{ "txid": "fresh", "vout": [{{ "scriptpubkey_address": "{ADDRESS}", "value": 50000 }},
+                                             {{ "scriptpubkey_address": "{OTHER}", "value": 5 }}],
+                   "status": {{ "confirmed": true, "block_height": 850000 }} }},
+                {{ "txid": "mempool", "vout": [{{ "scriptpubkey_address": "{ADDRESS}", "value": 7 }}],
+                   "status": {{ "confirmed": false }} }}
+            ]"#
+        ));
+        // Tip 850000: "fresh" has 1 confirmation — not at depth 3.
+        assert_eq!(received_at_depth(&account, &txs, ADDRESS, 850000, 3), 100_000);
+        // Two blocks later it reaches the depth; the spend never lowers it.
+        assert_eq!(received_at_depth(&account, &txs, ADDRESS, 850002, 3), 150_000);
+        // Depth 1: every confirmed funding counts, as funded_txo_sum does.
+        assert_eq!(received_at_depth(&account, &txs, ADDRESS, 850000, 1), 150_000);
     }
 
     #[test]

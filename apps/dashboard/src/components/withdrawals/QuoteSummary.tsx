@@ -2,6 +2,7 @@ import { CircleCheck, CircleX, ShieldAlert, TriangleAlert } from "lucide-react"
 
 import { formatRaw, networkLabel, toBigInt } from "@/lib/format"
 import type { AddressBookEntry, WithdrawalQuote } from "@/lib/types"
+import { cn } from "@/lib/utils"
 import { DESTINATION_KIND_LABELS } from "@/lib/withdrawals"
 
 /** Review step of a withdrawal: what the quote says before anything is reserved. */
@@ -58,6 +59,17 @@ export function QuoteSummary({
           <>
             <dt className="font-medium">Total</dt>
             <dd className="font-semibold tabular-nums">{formatRaw(amount + fee, quote.token)}</dd>
+          </>
+        )}
+        {quote.project_available_raw !== null && (
+          <>
+            <dt className="text-muted-foreground">Project available</dt>
+            <dd className={cn("tabular-nums", quote.project_check_ok === false && "text-red-600 dark:text-red-400")}>
+              {formatRaw(quote.project_available_raw, quote.token)}
+              {quote.project_check_ok === false && (
+                <span className="block text-xs">Below the amount and fee: the project check would refuse it</span>
+              )}
+            </dd>
           </>
         )}
         <dt className="text-muted-foreground">Available</dt>

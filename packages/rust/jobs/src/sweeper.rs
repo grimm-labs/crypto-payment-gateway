@@ -90,6 +90,25 @@ pub async fn plan(state: &AppState, network: Network) -> Result<usize> {
 
 async fn plan_address(state: &AppState, network: Network, candidate: &SweepCandidate) -> Result<usize> {
     let mut planned = 0;
+    if network == Network::Bitcoin {
+        // The project ledger's received watermark (spec §7.3): everything the
+        // address ever received at the confirmation depth, spent outputs
+        // included; only ever raised.
+        match state
+            .chain
+            .bitcoin_received_at_depth(&candidate.address, state.config.btc_confirmations)
+            .await
+        {
+            Ok(Some(received)) => {
+                state
+                    .db
+                    .raise_btc_received(&candidate.deposit_address_id, received)
+                    .await?;
+            }
+            Ok(None) => {}
+            Err(err) => warn!("Bitcoin received scan of {} failed: {err:#}", candidate.address),
+        }
+    }
     for token in network.payment_tokens() {
         let token = *token;
         let balance = confirmed_deposit_balance(state, network, token, &candidate.address).await?;

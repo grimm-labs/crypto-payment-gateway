@@ -10,14 +10,14 @@ use chrono::Utc;
 use config::{WITHDRAWAL_APPROVAL_EXPIRY_SECS, WITHDRAWAL_SELF_APPROVAL_DELAY_SECS};
 use db::{NewWithdrawal, WithdrawalRow, WithdrawalUpdate};
 use domain::{
-    format_amount, raw_u128_to_string, CancelReason, DestinationKind, Network, Owner, Token,
-    WebhookEventType, WithdrawalPolicy, WithdrawalStatus,
+    format_amount, raw_u128_to_string, reserved_amount, CancelReason, DestinationKind, Network,
+    Owner, ProjectBalance, Token, WebhookEventType, WithdrawalPolicy, WithdrawalStatus,
 };
 use serde_json::{json, Value};
 use tracing::{error, info, warn};
 
 use crate::audit::{self, Actor};
-use crate::{enqueue_webhook, fees, treasury, webhooks, AppState};
+use crate::{enqueue_webhook, fees, ledger, treasury, webhooks, AppState};
 
 pub mod resolve;
 pub mod rules;
@@ -115,6 +115,30 @@ pub struct WithdrawalQuote {
     pub available_raw: Option<u128>,
     /// Gas still available for the fee (when paid in another asset).
     pub fee_available_raw: Option<u128>,
+    /// Merchant keys: the project's available balance of the asset (spec
+    /// §8.3), signed, and whether the project check would pass. `None` for
+    /// staff (admins may exceed the balance).
+    pub project_available_raw: Option<i128>,
+    pub project_check_ok: Option<bool>,
+}
+
+/// The project check of a key withdrawal (spec §8.3, invariant 3): what the
+/// withdrawal reserves against the project balance — amount plus the fee
+/// cap when the fee is paid in the same asset.
+fn project_reservation(input: &WithdrawalInput, fee_estimate: u128) -> u128 {
+    ProjectBalance::reservation_for(
+        input.amount_raw,
+        input.token,
+        input.network.fee_token(),
+        rules::fee_cap(fee_estimate),
+    )
+}
+
+fn project_insufficient() -> RuleError {
+    RuleError::Refused {
+        code: "project_insufficient_funds",
+        message: "Insufficient project balance for this withdrawal".into(),
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -334,6 +358,17 @@ pub async fn quote_withdrawal(
             (None, None)
         }
     };
+    // Merchant keys: the project's own figure (never cached, spec §7.2).
+    let (project_available_raw, project_check_ok) = match (requester, &prepared.owner) {
+        (Requester::ApiKey { .. }, Owner::Project(project_id)) => {
+            let balance = ledger::project_balance(state, project_id, input.network, input.token).await?;
+            (
+                Some(balance.available),
+                Some(balance.covers(project_reservation(input, prepared.fee_estimate))),
+            )
+        }
+        _ => (None, None),
+    };
     Ok(WithdrawalQuote {
         network: input.network,
         token: input.token,
@@ -347,6 +382,8 @@ pub async fn quote_withdrawal(
         destination_refusal: refusal,
         available_raw: token_balance.map(|b| b.available()),
         fee_available_raw: fee_balance.map(|b| b.available()),
+        project_available_raw,
+        project_check_ok,
     })
 }
 
@@ -458,6 +495,15 @@ pub async fn create_withdrawal(
         fee_balance = fresh_fee;
         rules::check_funds(input.token, input.amount_raw, &token_balance, prepared.fee_estimate, fee_balance.as_ref())?;
     }
+    // Key withdrawals only: the project's available balance must cover the
+    // amount plus the fee cap when paid in the same asset (spec §8.3,
+    // invariant 3) — read on the locked admission connection, never cached.
+    if let (Requester::ApiKey { .. }, Owner::Project(project_id)) = (requester, &prepared.owner) {
+        let balance = ledger::project_balance_on(admission.conn(), project_id, input.network, input.token).await?;
+        if !balance.covers(project_reservation(input, prepared.fee_estimate)) {
+            return Err(project_insufficient().into());
+        }
+    }
 
     let now = Utc::now();
     let status = if prepared.approval_required {
@@ -498,6 +544,7 @@ pub async fn create_withdrawal(
         })
         .await?;
     admission.commit().await?;
+    ledger::invalidate_cache(state).await;
 
     info!(
         "Withdrawal {} admitted: {} {} on {} to {} ({})",
@@ -634,6 +681,22 @@ pub async fn approve_withdrawal(
     }
     let (token_balance, fee_balance) = balances(state, Some(&mut admission), network, token, Some(id), true).await?;
     rules::check_funds(token, amount, &token_balance, fee, fee_balance.as_ref())?;
+    // Key withdrawals: the project check again (spec §8.3), its own
+    // reservation excluded (it is part of `reserved` already).
+    if let (Some(_), Some(project_id)) = (&locked.api_key_id, &locked.project_id) {
+        let balance = ledger::project_balance_on(admission.conn(), project_id, network, token).await?;
+        let own = reserved_amount(
+            amount,
+            token,
+            locked.fee_token()?,
+            locked.fee_cap_raw.map(|c| c.0),
+            locked.fee_estimate_raw.map(|f| f.0),
+        );
+        let available_without_own = balance.available.saturating_add(i128::try_from(own).unwrap_or(i128::MAX));
+        if i128::try_from(own).map(|own| available_without_own < own).unwrap_or(true) {
+            return Err(project_insufficient().into());
+        }
+    }
     let approved = admission
         .transition(
             id,
@@ -756,6 +819,8 @@ pub async fn bump_withdrawal(state: &AppState, actor: &Actor, id: &str) -> Resul
         )
         .await?
         .ok_or_else(|| WithdrawalError::Conflict("Only a stuck withdrawal can be bumped".into()))?;
+    // A bumped cap raises the project's reservation (spec §8.4).
+    ledger::invalidate_cache(state).await;
     audit::record(
         state,
         actor,
@@ -896,6 +961,9 @@ pub fn requested_by(row: &WithdrawalRow) -> Value {
 /// event, endpoint). A queueing failure is logged: the withdrawal itself
 /// already moved.
 pub async fn notify_withdrawal(state: &AppState, row: &WithdrawalRow, event: WebhookEventType) {
+    // Every notified move (broadcast, confirmed, failed, cancelled, pending
+    // approval) changes what the project ledger shows.
+    ledger::invalidate_cache(state).await;
     let result: anyhow::Result<()> = async {
         let owners = webhooks::SubjectOwners::One(row.owner());
         for endpoint in webhooks::endpoints_for(state, event, &owners).await? {

@@ -1,4 +1,5 @@
 import { ChartAreaInteractive } from "@/components/chart-area-interactive"
+import { ProjectBalanceCards, ProjectBalanceTables } from "@/components/projects/ProjectBalanceCards"
 import { SectionCards } from "@/components/section-cards"
 import { BalanceSplit } from "@/components/shared/BalanceSplit"
 import { StatusBadge } from "@/components/shared/StatusBadge"
@@ -13,15 +14,24 @@ import { Skeleton } from "@/components/ui/skeleton"
 import { useWalletBalances } from "@/hooks/queries"
 import { formatAmount, networkLabel } from "@/lib/format"
 import { assetKey } from "@/lib/networks"
+import { useProjectScope } from "@/lib/project-scope"
 
 export function OverviewPage() {
   const balances = useWalletBalances()
+  const { projects, selectedProject } = useProjectScope()
 
   return (
     <div className="flex flex-col gap-4 py-4 md:gap-6 md:py-6">
       <SectionCards />
       <div className="px-4 lg:px-6">
         <ChartAreaInteractive />
+      </div>
+      <div className="px-4 lg:px-6">
+        {selectedProject ? (
+          <ProjectBalanceCards project={selectedProject} />
+        ) : (
+          <ProjectBalanceTables projects={projects} />
+        )}
       </div>
       <div className="px-4 lg:px-6">
         <Card>

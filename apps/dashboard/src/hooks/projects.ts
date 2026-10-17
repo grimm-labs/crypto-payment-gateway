@@ -1,8 +1,8 @@
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
+import { useMutation, useQueries, useQuery, useQueryClient } from "@tanstack/react-query"
 
 import { api } from "@/lib/api"
 import { useAuth } from "@/lib/auth"
-import type { Project, ProjectColor, ProjectsResponse } from "@/lib/types"
+import type { Project, ProjectBalances, ProjectColor, ProjectsResponse } from "@/lib/types"
 
 export const PROJECTS_QUERY_KEY = ["projects"] as const
 
@@ -65,5 +65,26 @@ export function useDeleteProject() {
     mutationFn: (id: string) =>
       api<{ status: string; id: string }>(`/projects/${id}`, { method: "DELETE" }),
     onSuccess: () => queryClient.invalidateQueries({ queryKey: PROJECTS_QUERY_KEY }),
+  })
+}
+
+/** One project's balances, one entry per payment (network, token). */
+export function useProjectBalance(projectId: string | undefined) {
+  return useQuery({
+    queryKey: ["project-balance", projectId],
+    queryFn: () => api<ProjectBalances>(`/projects/${projectId}/balance`),
+    enabled: Boolean(projectId),
+    refetchInterval: 30_000,
+  })
+}
+
+/** The balances of several projects at once (the "All projects" overview). */
+export function useProjectBalancesOf(projectIds: string[]) {
+  return useQueries({
+    queries: projectIds.map((id) => ({
+      queryKey: ["project-balance", id],
+      queryFn: () => api<ProjectBalances>(`/projects/${id}/balance`),
+      refetchInterval: 30_000,
+    })),
   })
 }

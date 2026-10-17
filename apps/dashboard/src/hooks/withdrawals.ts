@@ -30,6 +30,8 @@ import type { WithdrawalAction } from "@/lib/withdrawals"
 function invalidateWithdrawals(queryClient: QueryClient) {
   queryClient.invalidateQueries({ queryKey: ["withdrawals"] })
   queryClient.invalidateQueries({ queryKey: ["treasury"] })
+  queryClient.invalidateQueries({ queryKey: ["project-balance"] })
+  queryClient.invalidateQueries({ queryKey: ["ledger"] })
 }
 
 // ---------------------------------------------------------------- withdrawals

@@ -90,6 +90,12 @@ pub(crate) fn validate_withdrawal_request(body: &WithdrawalRequest, merchant: bo
             ))
         }
         Some(value) => Some(parse_owner_field(value)?),
+        // Staff name the owner explicitly, no default (spec §8.1).
+        None if !merchant => {
+            return Err(ApiError::unprocessable(
+                "project_id is required: a project UUID or \"merchant\"".into(),
+            ))
+        }
         None => None,
     };
     let network = Network::parse_api(&body.network).map_err(|_| ApiError::bad_request("Invalid network"))?;
@@ -269,6 +275,11 @@ fn quote_json(quote: &WithdrawalQuote) -> Value {
         "available_raw": quote.available_raw.map(|raw| raw.to_string()),
         "fee_available": quote.fee_available_raw.map(|raw| render(raw, quote.fee_token)),
         "fee_available_raw": quote.fee_available_raw.map(|raw| raw.to_string()),
+        // Merchant keys only: the project's available balance and whether
+        // the project check would pass (null for staff).
+        "project_available": quote.project_available_raw.map(|raw| domain::signed_raw_to_string(raw, quote.token)),
+        "project_available_raw": quote.project_available_raw.map(|raw| raw.to_string()),
+        "project_check_ok": quote.project_check_ok,
     })
 }
 
@@ -1239,9 +1250,10 @@ mod tests {
         serde_json::from_value(body).expect("valid shape")
     }
 
-    /// Staff caller (a merchant key may not name an owner, see below).
+    /// Staff caller; the bodies below name no owner, so they are validated
+    /// as a merchant key would be (the owner rule has its own test).
     fn validate_withdrawal_request(body: &WithdrawalRequest) -> Result<WithdrawalInput, ApiError> {
-        super::validate_withdrawal_request(body, false)
+        super::validate_withdrawal_request(body, body.project_id.is_none())
     }
 
     #[test]
@@ -1262,6 +1274,8 @@ mod tests {
         assert_eq!(super::validate_withdrawal_request(&body, true).unwrap_err().status, StatusCode::UNPROCESSABLE_ENTITY);
         let none = request(json!({ "network": "tron", "token": "USDT", "amount": "1", "destination": "T" }));
         assert_eq!(super::validate_withdrawal_request(&none, true).unwrap().owner, None);
+        // Staff must name the owner: no default (spec §8.1).
+        assert_eq!(super::validate_withdrawal_request(&none, false).unwrap_err().status, StatusCode::UNPROCESSABLE_ENTITY);
         let bad = request(json!({ "network": "tron", "token": "USDT", "amount": "1", "destination": "T", "project_id": "shop" }));
         assert_eq!(validate_withdrawal_request(&bad).unwrap_err().status, StatusCode::UNPROCESSABLE_ENTITY);
     }

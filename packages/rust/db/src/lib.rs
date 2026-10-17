@@ -17,6 +17,7 @@ mod api_keys;
 mod api_traffic;
 mod asset_settings;
 mod audit;
+pub mod ledger;
 pub mod outbound;
 mod payouts;
 mod projects;
@@ -41,6 +42,7 @@ pub use api_traffic::{
     TrafficRouteStat, TrafficSummary,
 };
 pub use audit::{AuditActor, AuditLogRow, NewAuditEntry};
+pub use ledger::{LedgerFilter, ProjectComponentsRow};
 pub use payouts::PayoutRequestRow;
 pub use projects::{
     CreatedProject, LegacyData, LegacyOutcome, NewProject, ProjectCounts, ProjectCreate,

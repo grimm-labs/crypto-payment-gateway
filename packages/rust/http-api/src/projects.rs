@@ -11,7 +11,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::admin::{deserialize_some, staff_actor};
-use crate::middleware::{ClientIp, CurrentStaff};
+use crate::middleware::{ClientIp, CurrentApiKey, CurrentStaff};
 use crate::ApiError;
 
 /// A body's `project_id`: a project UUID or `"merchant"`.
@@ -264,6 +264,44 @@ pub(crate) async fn delete_project(
     )
     .await;
     Ok(Json(json!({ "status": "deleted", "id": id })))
+}
+
+/// `GET /projects/{id}/balance` (any staff): the project's balances, one
+/// entry per payment (network, token), from the 30 s cache.
+pub(crate) async fn project_balance(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    if state.db.find_project(&id).await?.is_none() {
+        return Err(ApiError::not_found(format!("Project not found: {id}")));
+    }
+    let balances = jobs::ledger::project_balances(&state, &db::LedgerFilter::Project(id.clone()), true).await?;
+    Ok(Json(json!({
+        "project_id": id,
+        "balances": balances.iter().map(jobs::ledger::balance_json).collect::<Vec<_>>(),
+    })))
+}
+
+/// `GET /api/v1/project`: the key's project and its balances (spec §11,
+/// Q21). Nothing about custody is in here (invariant 7).
+pub(crate) async fn merchant_project(
+    State(state): State<AppState>,
+    Extension(key): Extension<CurrentApiKey>,
+) -> Result<Json<Value>, ApiError> {
+    let Some(project_id) = key.project_id.as_deref() else {
+        return Err(ApiError::conflict("This API key belongs to no project"));
+    };
+    let Some(project) = state.db.find_project(project_id).await? else {
+        return Err(ApiError::conflict("This API key belongs to no project"));
+    };
+    let balances = jobs::ledger::project_balances(&state, &db::LedgerFilter::Project(project.id.clone()), true).await?;
+    Ok(Json(json!({
+        "id": project.id,
+        "name": project.name,
+        "color": project.color,
+        "key_tag": project.key_tag,
+        "balances": balances.iter().map(jobs::ledger::balance_json).collect::<Vec<_>>(),
+    })))
 }
 
 #[derive(Debug, Deserialize)]

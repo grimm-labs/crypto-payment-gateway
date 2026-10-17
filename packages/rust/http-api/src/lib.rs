@@ -72,6 +72,8 @@ fn merchant_router(state: &AppState) -> Router<AppState> {
         .route("/withdrawals/{id}", get(withdrawals::get_withdrawal))
         .route("/withdrawals/{id}/cancel", post(withdrawals::cancel_withdrawal))
         .route("/address-book", get(withdrawals::merchant_address_book))
+        // The key's project and its balances (spec §11).
+        .route("/project", get(projects::merchant_project))
         // Deprecated alias of POST /withdrawals (Lightning addresses).
         .route("/lightning/payments", post(withdrawals::create_lightning_payout))
         .route("/lightning/payments/quote", post(withdrawals::quote_lightning_payout))

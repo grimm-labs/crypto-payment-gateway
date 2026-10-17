@@ -520,6 +520,12 @@ async fn reservations(
 }
 
 impl WithdrawalAdmission {
+    /// The admission's connection — the project balance check (spec §8.3)
+    /// runs on it, inside the per-asset locks.
+    pub fn conn(&mut self) -> &mut PgConnection {
+        &mut self.tx
+    }
+
     /// An earlier withdrawal under this Idempotency-Key, locked.
     pub async fn find_by_idempotency_key(&mut self, key: &str) -> Result<Option<WithdrawalRow>> {
         let row = sqlx::query_as::<_, WithdrawalRow>(&format!(

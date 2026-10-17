@@ -89,6 +89,40 @@ export interface ProjectsResponse {
 /** The literal `project_id` takes to name the merchant funds / endpoints. */
 export const MERCHANT_OWNER = "merchant"
 
+/** One project's balance of one asset (spec §7): a ledger figure derived
+ *  from its rows. `balance` and `available` are signed decimal strings;
+ *  every `_raw` is the integer in base units. */
+export interface ProjectAssetBalance {
+  network: Network
+  token: Token
+  deposits: string
+  deposits_raw: string
+  unattributed: string
+  unattributed_raw: string
+  withdrawn: string
+  withdrawn_raw: string
+  fees: string
+  fees_raw: string
+  transfers_in: string
+  transfers_in_raw: string
+  transfers_out: string
+  transfers_out_raw: string
+  balance: string
+  balance_raw: string
+  reserved: string
+  reserved_raw: string
+  available: string
+  available_raw: string
+  /** Detected, unconfirmed deposits — informational. */
+  pending: string
+  pending_raw: string
+}
+
+export interface ProjectBalances {
+  project_id: string
+  balances: ProjectAssetBalance[]
+}
+
 export type DepositAddressStatus = "pending" | "paid" | "expired"
 export type DepositStatus = "detected" | "confirmed"
 export type WebhookStatus = "pending" | "delivered" | "failed"
@@ -571,6 +605,11 @@ export interface WithdrawalQuote {
   /** Available balance of the fee token. */
   fee_available: string | null
   fee_available_raw: string | null
+  /** Merchant keys only: the project's available balance (signed) and
+   *  whether the project check would pass; null for staff. */
+  project_available: string | null
+  project_available_raw: string | null
+  project_check_ok: boolean | null
 }
 
 export interface WithdrawalRequest {
@@ -586,7 +625,7 @@ export interface WithdrawalRequest {
   /** Lightning only. */
   comment?: string
   metadata?: Record<string, unknown>
-  /** Staff only: the owner debited — a project id or "merchant". */
+  /** Staff: the owner debited — a project id or "merchant" (required). */
   project_id?: string
 }
 
