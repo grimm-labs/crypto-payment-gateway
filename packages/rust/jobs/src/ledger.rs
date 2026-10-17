@@ -14,9 +14,113 @@ use serde_json::{json, Value};
 use sqlx::PgConnection;
 use tracing::warn;
 
-use crate::AppState;
+use crate::{treasury, AppState};
 
 const LEDGER_CACHE_KEY: &str = "ledger:projects";
+
+/// What the gateway really holds of one payment pair (spec §10.4): the
+/// confirmed treasury balance plus the unswept balance of the deposit
+/// addresses (Bitcoin: the spendable UTXOs of both, Lightning: the SDK
+/// balance). `None` = unknown: network or Lightning disabled, provider
+/// error, or sweeping disabled for the pair (the unswept balance is not
+/// scanned then).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Holdings {
+    pub amount: Option<u128>,
+}
+
+/// The reconciliation of one pair: holdings against the project balances.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MerchantFunds {
+    pub holdings: Option<u128>,
+    /// Σ project balances (signed).
+    pub project_total: i128,
+    /// holdings − project_total; `None` when the holdings are unknown.
+    pub merchant_funds: Option<i128>,
+}
+
+impl MerchantFunds {
+    /// `ok`, `shortfall` or `unknown` (spec §10.4).
+    pub fn status(&self) -> &'static str {
+        match self.merchant_funds {
+            Some(funds) if funds >= 0 => "ok",
+            Some(_) => "shortfall",
+            None => "unknown",
+        }
+    }
+}
+
+/// The holdings of `(network, token)`, from the treasury's 30 s balance
+/// cache plus the sweeper's last deposit scan.
+pub async fn holdings(state: &AppState, network: Network, token: Token) -> Holdings {
+    if !state.is_network_enabled(network) {
+        return Holdings { amount: None };
+    }
+    let confirmed = match treasury::confirmed_balance(state, network, token, false).await {
+        Ok(value) => value,
+        Err(err) => {
+            warn!("Holdings of {} {} unreadable: {err:#}", network.as_api(), token.as_api());
+            return Holdings { amount: None };
+        }
+    };
+    // Bitcoin's confirmed balance already spans the deposit UTXOs; Lightning
+    // has no deposit addresses.
+    if matches!(network, Network::Bitcoin | Network::Lightning) {
+        return Holdings { amount: Some(confirmed) };
+    }
+    let sweeping = match state.db.sweep_setting(network, token).await {
+        Ok(Some(setting)) => setting.enabled,
+        Ok(None) => false,
+        Err(err) => {
+            warn!("Sweep setting of {} {} unreadable: {err:#}", network.as_api(), token.as_api());
+            return Holdings { amount: None };
+        }
+    };
+    if !sweeping {
+        return Holdings { amount: None };
+    }
+    let unswept: u128 = match treasury::scanned_deposit_balances(state, network).await {
+        Ok(scanned) => scanned
+            .iter()
+            .filter(|s| s.token == token.as_db())
+            .filter_map(|s| s.amount_raw.parse::<u128>().ok())
+            .fold(0, u128::saturating_add),
+        Err(err) => {
+            warn!("Deposit scan of {} unreadable: {err:#}", network.as_api());
+            return Holdings { amount: None };
+        }
+    };
+    Holdings { amount: Some(confirmed.saturating_add(unswept)) }
+}
+
+/// Merchant funds of one pair on `conn` (the transfer admission reads the
+/// project balances inside its lock).
+pub async fn merchant_funds(
+    state: &AppState,
+    conn: &mut PgConnection,
+    network: Network,
+    token: Token,
+) -> Result<MerchantFunds> {
+    let rows = db::ledger::project_components(conn, &LedgerFilter::Pair { network, token }).await?;
+    let project_total = rows
+        .iter()
+        .map(|row| ProjectBalance::from_components(row.components).balance)
+        .fold(0i128, i128::saturating_add);
+    let held = holdings(state, network, token).await;
+    Ok(reconcile(held, project_total))
+}
+
+/// The pure reconciliation: holdings (unknown or not) against the project
+/// total.
+pub fn reconcile(holdings: Holdings, project_total: i128) -> MerchantFunds {
+    MerchantFunds {
+        holdings: holdings.amount,
+        project_total,
+        merchant_funds: holdings
+            .amount
+            .map(|held| i128::try_from(held).unwrap_or(i128::MAX).saturating_sub(project_total)),
+    }
+}
 
 /// One project's balance of one asset.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -283,6 +387,23 @@ mod tests {
         let json = serde_json::to_string(&[to_cached(&row)]).unwrap();
         let back: Vec<CachedRow> = serde_json::from_str(&json).unwrap();
         assert_eq!(from_cached(back.into_iter().next().unwrap()).unwrap(), row);
+    }
+
+    #[test]
+    fn reconciliation_status_follows_the_sign_of_the_merchant_funds() {
+        let ok = reconcile(Holdings { amount: Some(1_000) }, 400);
+        assert_eq!(ok.merchant_funds, Some(600));
+        assert_eq!(ok.status(), "ok");
+        let exact = reconcile(Holdings { amount: Some(1_000) }, 1_000);
+        assert_eq!(exact.status(), "ok");
+        let short = reconcile(Holdings { amount: Some(1_000) }, 1_001);
+        assert_eq!(short.merchant_funds, Some(-1));
+        assert_eq!(short.status(), "shortfall");
+        // Negative project balances raise the merchant funds.
+        assert_eq!(reconcile(Holdings { amount: Some(100) }, -50).merchant_funds, Some(150));
+        let unknown = reconcile(Holdings { amount: None }, 5);
+        assert_eq!(unknown.merchant_funds, None);
+        assert_eq!(unknown.status(), "unknown");
     }
 
     #[test]

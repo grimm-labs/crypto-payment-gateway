@@ -40,6 +40,7 @@ mod session;
 #[cfg(test)]
 mod test_support;
 mod traffic;
+mod transfers;
 mod withdrawals;
 
 const READINESS_TIMEOUT: StdDuration = StdDuration::from_secs(2);
@@ -72,8 +73,11 @@ fn merchant_router(state: &AppState) -> Router<AppState> {
         .route("/withdrawals/{id}", get(withdrawals::get_withdrawal))
         .route("/withdrawals/{id}/cancel", post(withdrawals::cancel_withdrawal))
         .route("/address-book", get(withdrawals::merchant_address_book))
-        // The key's project and its balances (spec §11).
+        // The key's project and its balances (spec §11), and the internal
+        // transfers it is a side of (read-only).
         .route("/project", get(projects::merchant_project))
+        .route("/transfers", get(transfers::merchant_list_transfers))
+        .route("/transfers/{id}", get(transfers::merchant_get_transfer))
         // Deprecated alias of POST /withdrawals (Lightning addresses).
         .route("/lightning/payments", post(withdrawals::create_lightning_payout))
         .route("/lightning/payments/quote", post(withdrawals::quote_lightning_payout))

@@ -21,6 +21,7 @@ use crate::projects::{
     OwnerListQuery,
 };
 use crate::session::{self, set_cookie_header};
+use crate::transfers as t;
 use crate::withdrawals as w;
 use crate::{
     create_deposit_address, get_balances, get_deposit_address, get_lightning_payment,
@@ -87,6 +88,8 @@ pub fn admin_router(state: &AppState) -> Router<AppState> {
         .route("/address-book", post(w::create_address_book_entry))
         .route("/address-book/{id}", delete(w::delete_address_book_entry))
         .route("/sweeps/run", post(w::run_sweeps))
+        // Internal transfers: ADMIN + TOTP (spec §9).
+        .route("/transfers", post(t::create_transfer))
         .route("/outflows/unfreeze", post(w::unfreeze_outflows))
         .route("/settings/assets", patch(w::update_asset_settings))
         .route_layer(axum::middleware::from_fn(require_admin));
@@ -101,6 +104,8 @@ pub fn admin_router(state: &AppState) -> Router<AppState> {
         .route("/webhooks", get(list_webhooks))
         .route("/projects", get(p::list_projects))
         .route("/projects/{id}/balance", get(p::project_balance))
+        .route("/transfers", get(t::list_transfers))
+        .route("/transfers/{id}", get(t::get_transfer))
         .route("/stats", get(stats))
         .route("/stats/deposits-timeseries", get(deposits_timeseries))
         .route("/traffic/overview", get(traffic_overview))

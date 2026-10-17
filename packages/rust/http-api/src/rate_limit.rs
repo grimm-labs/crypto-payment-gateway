@@ -39,6 +39,8 @@ pub const WEBHOOK_REPLAY_PER_DEPOSIT: Limit = Limit { scope: "webhook-replay", m
 /// Withdrawal creations and quotes (the Lightning payout alias included),
 /// per caller.
 pub const WITHDRAWALS: Limit = Limit { scope: "withdrawal", max: 10, window_secs: 60 };
+/// Internal transfers, per staff member (spec §9).
+pub const TRANSFERS: Limit = Limit { scope: "transfer", max: 10, window_secs: 60 };
 
 fn window_key(state: &AppState, limit: Limit, id: &str, now: i64) -> (String, i64) {
     let window = now.div_euclid(limit.window_secs);
@@ -112,6 +114,7 @@ mod tests {
             DEPOSIT_ADDRESS_CREATION,
             WEBHOOK_REPLAY_PER_DEPOSIT,
             WITHDRAWALS,
+            TRANSFERS,
         ] {
             assert!(limit.max >= 1 && limit.window_secs >= 1, "{}", limit.scope);
         }

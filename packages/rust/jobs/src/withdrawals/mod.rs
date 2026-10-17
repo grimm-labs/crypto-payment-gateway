@@ -25,6 +25,8 @@ pub mod rules;
 pub use resolve::{DestinationInput, ResolvedDestination, SolanaRoute};
 pub use rules::{Balance, Requester, RuleError};
 
+// `WithdrawalError` doubles as the transfer error (same HTTP mapping).
+
 /// A withdrawal request that passed the HTTP-level checks (shapes,
 /// amount syntax, Idempotency-Key format).
 #[derive(Debug, Clone)]

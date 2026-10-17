@@ -19,6 +19,7 @@ import { SettingsPage } from "@/pages/SettingsPage"
 import { SetupPage } from "@/pages/SetupPage"
 import { StaffPage } from "@/pages/StaffPage"
 import { TrafficPage } from "@/pages/TrafficPage"
+import { TransfersPage } from "@/pages/TransfersPage"
 import { TreasuryPage } from "@/pages/TreasuryPage"
 import { WalletsPage } from "@/pages/WalletsPage"
 import { WebhooksPage } from "@/pages/WebhooksPage"
@@ -44,6 +45,7 @@ export default function App() {
             {/* Read-only for operators, who may only freeze outflows. */}
             <Route path="/withdrawals" element={<WithdrawalsPage />} />
             <Route path="/withdrawals/:id" element={<WithdrawalDetailPage />} />
+            <Route path="/transfers" element={<TransfersPage />} />
             <Route path="/treasury" element={<TreasuryPage />} />
             <Route path="/address-book" element={<AddressBookPage />} />
             <Route path="/settings/assets" element={<AssetSettingsPage />} />

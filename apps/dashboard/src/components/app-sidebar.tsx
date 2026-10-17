@@ -1,6 +1,7 @@
 import * as React from "react"
 import {
   ActivityIcon,
+  ArrowLeftRightIcon,
   ArrowUpFromLineIcon,
   BookUserIcon,
   CoinsIcon,
@@ -48,6 +49,7 @@ const NAV_MAIN: Array<NavItem & { adminOnly?: boolean }> = [
   { title: "Wallets", url: "/wallets", icon: <WalletIcon /> },
   // Read-only for operators (they may only freeze outflows).
   { title: "Withdrawals", url: "/withdrawals", icon: <ArrowUpFromLineIcon /> },
+  { title: "Transfers", url: "/transfers", icon: <ArrowLeftRightIcon /> },
   { title: "Treasury", url: "/treasury", icon: <LandmarkIcon /> },
   { title: "Address book", url: "/address-book", icon: <BookUserIcon /> },
   // The wallet history is admin-only on the API.

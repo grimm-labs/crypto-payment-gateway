@@ -38,6 +38,7 @@ pub mod payouts;
 pub mod projects;
 pub mod sweeper;
 pub mod traffic;
+pub mod transfers;
 pub mod treasury;
 pub mod webhook_client;
 pub mod webhooks;
@@ -1050,10 +1051,14 @@ async fn prepare_delivery(
             Ok(Some((delivery, withdrawals::withdrawal_payload(event, &row)?, occurred_at)))
         }
         WebhookEventType::TransferCompleted => {
-            // Internal transfers are queued once they exist (spec §9); a
-            // member of this shape has no subject yet.
-            warn!("Transfer webhook {subject_id} dropped — internal transfers are not available");
-            Ok(None)
+            let Some(row) = state.db.find_internal_transfer(subject_id).await? else {
+                return Ok(None);
+            };
+            let delivery = state
+                .db
+                .get_or_create_subject_webhook_delivery(event, subject_id, endpoint_id)
+                .await?;
+            Ok(Some((delivery, transfers::transfer_payload(&row)?, row.created_at)))
         }
         _ => {
             let Some(alert) = state.db.find_alert(subject_id).await? else {

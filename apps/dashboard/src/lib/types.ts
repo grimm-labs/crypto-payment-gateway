@@ -123,6 +123,26 @@ export interface ProjectBalances {
   balances: ProjectAssetBalance[]
 }
 
+/** One side of an internal transfer. */
+export interface TransferSide {
+  type: "project" | "merchant"
+  id: string | null
+}
+
+/** An admin's ledger move of one asset on one network between two owners
+ *  (nothing moves on chain); append-only. */
+export interface InternalTransfer {
+  id: string
+  network: Network
+  token: Token
+  amount: string
+  amount_raw: string
+  from: TransferSide
+  to: TransferSide
+  note: string
+  created_at: string
+}
+
 export type DepositAddressStatus = "pending" | "paid" | "expired"
 export type DepositStatus = "detected" | "confirmed"
 export type WebhookStatus = "pending" | "delivered" | "failed"

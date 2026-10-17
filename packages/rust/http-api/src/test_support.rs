@@ -152,6 +152,8 @@ mod router_tests {
             (Method::POST, "/api/v1/withdrawals/some-id/cancel"),
             (Method::GET, "/api/v1/address-book"),
             (Method::GET, "/api/v1/project"),
+            (Method::GET, "/api/v1/transfers"),
+            (Method::GET, "/api/v1/transfers/some-id"),
             // The deprecated payout alias stays.
             (Method::POST, "/api/v1/lightning/payments"),
             (Method::POST, "/api/v1/lightning/payments/quote"),

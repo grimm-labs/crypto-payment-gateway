@@ -137,6 +137,7 @@ const INSTANCE_PATHS = [
   "/account",
   "/projects",
 ]
+// `/transfers` is project-scoped: the selected project on either side.
 
 export type PageScope = "project" | "instance"
 
