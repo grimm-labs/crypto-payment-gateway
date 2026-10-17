@@ -4,6 +4,7 @@ import {
   ArrowUpFromLineIcon,
   BookUserIcon,
   CoinsIcon,
+  FolderKanbanIcon,
   KeyRoundIcon,
   LandmarkIcon,
   LayoutDashboardIcon,
@@ -40,6 +41,7 @@ import { ACCOUNT_SECURITY_PATH } from "@/lib/errors"
 
 const NAV_MAIN: Array<NavItem & { adminOnly?: boolean }> = [
   { title: "Overview", url: "/", icon: <LayoutDashboardIcon /> },
+  { title: "Projects", url: "/projects", icon: <FolderKanbanIcon /> },
   { title: "Payments", url: "/payments", icon: <ReceiptTextIcon /> },
   { title: "Deliveries", url: "/deliveries", icon: <SendIcon /> },
   { title: "Traffic", url: "/traffic", icon: <ActivityIcon /> },

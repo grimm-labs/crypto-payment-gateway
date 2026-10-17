@@ -126,6 +126,8 @@ export function useLightningPayments(page: { limit: number; offset: number }) {
 export interface PaymentFilters {
   status?: string
   network?: string
+  /** The selected project (undefined = all). */
+  project_id?: string
   limit: number
   offset: number
 }
@@ -147,6 +149,8 @@ export function usePayment(id: string | undefined) {
 }
 
 export interface CreatePaymentPayload {
+  /** The owning project (required). */
+  project_id: string
   network: string
   token: string
   /** Decimal string in token units — USDT and ETH. */
@@ -240,10 +244,12 @@ export function useUpdateSettings() {
   })
 }
 
-export function useWebhookEndpoints() {
+/** `projectId`: one project's endpoints, "merchant", or undefined for all. */
+export function useWebhookEndpoints(projectId?: string) {
   return useQuery({
-    queryKey: ["webhook-endpoints"],
-    queryFn: () => api<{ data: WebhookEndpoint[] }>("/webhook-endpoints"),
+    queryKey: ["webhook-endpoints", projectId ?? "all"],
+    queryFn: () =>
+      api<{ data: WebhookEndpoint[] }>(`/webhook-endpoints${listParams({ project_id: projectId })}`),
   })
 }
 
@@ -254,12 +260,15 @@ export function useCreateWebhookEndpoint() {
       url,
       events,
       secret,
+      project_id,
     }: {
       url: string
       events: WebhookEventType[]
       /** Signing secret (16–128 printable chars) — required. */
       secret: string
-    }) => api<WebhookEndpoint>("/webhook-endpoints", { body: { url, events, secret } }),
+      /** The owner, fixed for good: a project id or "merchant". */
+      project_id: string
+    }) => api<WebhookEndpoint>("/webhook-endpoints", { body: { url, events, secret, project_id } }),
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ["webhook-endpoints"] }),
   })
 }
@@ -299,11 +308,12 @@ export function useToggleWebhookEndpoint() {
   })
 }
 
-/** Admin-only endpoint — pass `enabled: false` for non-admin viewers. */
-export function useApiKeys(enabled = true) {
+/** Admin-only endpoint — pass `enabled: false` for non-admin viewers.
+ *  `projectId`: one project's keys (undefined = all). */
+export function useApiKeys(enabled = true, projectId?: string) {
   return useQuery({
-    queryKey: ["api-keys"],
-    queryFn: () => api<{ data: ApiKey[] }>("/api-keys"),
+    queryKey: ["api-keys", projectId ?? "all"],
+    queryFn: () => api<{ data: ApiKey[] }>(`/api-keys${listParams({ project_id: projectId })}`),
     enabled,
   })
 }
@@ -316,6 +326,8 @@ export function useCreateApiKey() {
       name: string
       /** 30/90/180/365; null = never expires (such a key can never withdraw). */
       expires_in_days: number | null
+      /** The owning project (required). */
+      project_id: string
     }) => api<CreatedApiKey>("/api-keys", { body: payload }),
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ["api-keys"] }),
   })

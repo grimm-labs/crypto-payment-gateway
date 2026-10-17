@@ -1,11 +1,13 @@
 import { useLocation } from "react-router-dom"
 
 import { HeaderFreezeControl } from "@/components/outflows/OutflowControls"
+import { ProjectSelector } from "@/components/project-selector"
 import { Separator } from "@/components/ui/separator"
 import { SidebarTrigger } from "@/components/ui/sidebar"
 
 const TITLES: Array<[string, string]> = [
   ["/payments", "Payments"],
+  ["/projects", "Projects"],
   ["/deliveries", "Deliveries"],
   ["/traffic", "Traffic"],
   ["/webhooks", "Webhooks"],
@@ -35,7 +37,13 @@ export function SiteHeader() {
           orientation="vertical"
           className="mx-2 data-[orientation=vertical]:h-4"
         />
-        <h1 className="text-base font-medium">{title}</h1>
+        {/* Global project scope (or "Instance" on instance-wide pages). */}
+        <ProjectSelector />
+        <Separator
+          orientation="vertical"
+          className="mx-2 hidden data-[orientation=vertical]:h-4 sm:block"
+        />
+        <h1 className="hidden text-base font-medium sm:block">{title}</h1>
         {/* Emergency stop, one click away on every page (any staff member). */}
         <div className="ml-auto">
           <HeaderFreezeControl />

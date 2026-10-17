@@ -4,6 +4,7 @@ import { useSearchParams } from "react-router-dom"
 import { toast } from "sonner"
 
 import { CopyButton } from "@/components/shared/CopyButton"
+import { ProjectBadge, ProjectDot } from "@/components/shared/ProjectBadge"
 import { QueryError } from "@/components/shared/QueryError"
 import { StatusBadge } from "@/components/shared/StatusBadge"
 import { StepUpCodeField, StepUpDialog } from "@/components/shared/StepUpCodeField"
@@ -47,7 +48,8 @@ import { useIsAdmin } from "@/lib/auth"
 import { toastError } from "@/lib/errors"
 import { formatCountdown, formatDate, networkLabel } from "@/lib/format"
 import { NETWORKS, isNetwork } from "@/lib/networks"
-import type { AddressBookEntry, Network } from "@/lib/types"
+import { useProjectScope } from "@/lib/project-scope"
+import { MERCHANT_OWNER, type AddressBookEntry, type Network } from "@/lib/types"
 import { isTotpCode } from "@/lib/validation"
 import { DESTINATION_KIND_LABELS } from "@/lib/withdrawals"
 
@@ -60,7 +62,8 @@ export function AddressBookPage() {
   const [searchParams, setSearchParams] = useSearchParams()
   const networkParam = searchParams.get("network") ?? ALL
   const network = isNetwork(networkParam) ? networkParam : undefined
-  const book = useAddressBook(network)
+  const { scopeParam } = useProjectScope()
+  const book = useAddressBook(network, scopeParam)
   const isAdmin = useIsAdmin()
   // Countdowns to the end of the cooling-off delay.
   const now = useNow(30_000)
@@ -86,9 +89,10 @@ export function AddressBookPage() {
           <h1 className="text-2xl font-semibold tracking-tight">Address book</h1>
           <p className="max-w-3xl text-sm text-muted-foreground">
             External destinations withdrawals may be sent to — required at or above
-            an asset&apos;s approval threshold, and for merchant keys in book mode. A
-            new entry only becomes usable after a 24 h cooling-off delay. To change
-            an entry, delete it and add it again (the delay restarts).
+            an asset&apos;s approval threshold, and for merchant keys in book mode.
+            Each entry belongs to a project (its keys and its admin withdrawals) or to
+            the merchant funds. A new entry only becomes usable after a 24 h cooling-off
+            delay. To change an entry, delete it and add it again (the delay restarts).
           </p>
         </div>
         {isAdmin && <AddEntryDialog defaultNetwork={network} />}
@@ -126,6 +130,7 @@ export function AddressBookPage() {
             <TableHeader>
               <TableRow>
                 <TableHead>Label</TableHead>
+                <TableHead>Owner</TableHead>
                 <TableHead>Network</TableHead>
                 <TableHead>Destination</TableHead>
                 <TableHead>Status</TableHead>
@@ -138,7 +143,7 @@ export function AddressBookPage() {
               {book.data?.data.length === 0 && (
                 <TableRow>
                   <TableCell
-                    colSpan={isAdmin ? 7 : 6}
+                    colSpan={isAdmin ? 8 : 7}
                     className="h-24 text-center text-muted-foreground"
                   >
                     No address-book entries yet.
@@ -158,6 +163,9 @@ export function AddressBookPage() {
                           </Badge>
                         )}
                       </div>
+                    </TableCell>
+                    <TableCell>
+                      <ProjectBadge projectId={entry.project_id} merchantLabel="Merchant funds" />
                     </TableCell>
                     <TableCell>{networkLabel(entry.network)}</TableCell>
                     <TableCell>
@@ -230,6 +238,10 @@ export function AddressBookPage() {
 
 function AddEntryDialog({ defaultNetwork }: { defaultNetwork?: Network }) {
   const [open, setOpen] = useState(false)
+  // The owner (required): a project, pre-filled from the header selector,
+  // or the merchant funds.
+  const { projects, scopeParam } = useProjectScope()
+  const [owner, setOwner] = useState(scopeParam ?? "")
   const [network, setNetwork] = useState<Network>(defaultNetwork ?? "tron")
   const [destination, setDestination] = useState("")
   const [label, setLabel] = useState("")
@@ -245,6 +257,7 @@ function AddEntryDialog({ defaultNetwork }: { defaultNetwork?: Network }) {
       ? "Lightning entries are Lightning addresses (user@domain)"
       : null
   const ready =
+    owner !== "" &&
     trimmedDestination !== "" &&
     !destinationProblem &&
     trimmedLabel !== "" &&
@@ -254,8 +267,11 @@ function AddEntryDialog({ defaultNetwork }: { defaultNetwork?: Network }) {
   function handleOpenChange(next: boolean) {
     if (!next && create.isPending) return
     setOpen(next)
-    // Start on the network the list is filtered on.
-    if (next) setNetwork(defaultNetwork ?? "tron")
+    // Start on the network and owner the list is filtered on.
+    if (next) {
+      setNetwork(defaultNetwork ?? "tron")
+      setOwner(scopeParam ?? "")
+    }
     if (!next) {
       setDestination("")
       setLabel("")
@@ -274,6 +290,7 @@ function AddEntryDialog({ defaultNetwork }: { defaultNetwork?: Network }) {
         label: trimmedLabel,
         is_cold_storage: coldStorage,
         totp_code: code.trim(),
+        project_id: owner,
       })
       toast.success(`“${entry.label}” added — usable from ${formatDate(entry.active_at)}`)
       handleOpenChange(false)
@@ -301,6 +318,26 @@ function AddEntryDialog({ defaultNetwork }: { defaultNetwork?: Network }) {
               webhook subscriber is alerted that it was added.
             </DialogDescription>
           </DialogHeader>
+          <div className="space-y-2">
+            <Label>Owner</Label>
+            <Select value={owner} onValueChange={setOwner}>
+              <SelectTrigger className="w-full">
+                <SelectValue placeholder="Choose a project, or the merchant funds" />
+              </SelectTrigger>
+              <SelectContent>
+                {projects.map((project) => (
+                  <SelectItem key={project.id} value={project.id}>
+                    <ProjectDot color={project.color} /> {project.name}
+                  </SelectItem>
+                ))}
+                <SelectItem value={MERCHANT_OWNER}>Merchant funds (no project)</SelectItem>
+              </SelectContent>
+            </Select>
+            <p className="text-xs text-muted-foreground">
+              Only withdrawals of this owner may use the entry: a project&apos;s keys and
+              its admin withdrawals, or merchant-funds withdrawals.
+            </p>
+          </div>
           <div className="space-y-2">
             <Label>Network</Label>
             <Select value={network} onValueChange={(value) => setNetwork(value as Network)}>

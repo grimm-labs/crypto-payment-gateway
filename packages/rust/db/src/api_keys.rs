@@ -4,9 +4,9 @@ use domain::{Network, Token, WithdrawalPolicy};
 use sqlx::FromRow;
 use uuid::Uuid;
 
-use crate::{Db, RawAmount};
+use crate::{owner_condition, Db, OwnerFilter, RawAmount};
 
-const API_KEY_COLUMNS: &str = r#"id, name, prefix, "keyHash", status::text AS status, "createdById", "lastUsedAt" AT TIME ZONE 'UTC' AS "lastUsedAt", "revokedAt" AT TIME ZONE 'UTC' AS "revokedAt", "expiresAt" AT TIME ZONE 'UTC' AS "expiresAt", "withdrawalPolicy"::text AS "withdrawalPolicy", "withdrawalTokens", "withdrawalNetworks", "createdAt" AT TIME ZONE 'UTC' AS "createdAt""#;
+const API_KEY_COLUMNS: &str = r#"id, name, prefix, "keyHash", status::text AS status, "createdById", "projectId", "lastUsedAt" AT TIME ZONE 'UTC' AS "lastUsedAt", "revokedAt" AT TIME ZONE 'UTC' AS "revokedAt", "expiresAt" AT TIME ZONE 'UTC' AS "expiresAt", "withdrawalPolicy"::text AS "withdrawalPolicy", "withdrawalTokens", "withdrawalNetworks", "createdAt" AT TIME ZONE 'UTC' AS "createdAt""#;
 
 #[derive(Debug, Clone, FromRow)]
 pub struct ApiKeyRow {
@@ -18,6 +18,10 @@ pub struct ApiKeyRow {
     pub status: String,
     #[sqlx(rename = "createdById")]
     pub created_by_id: String,
+    /// Owning project; NULL only on a legacy key from before the first
+    /// project (which keeps working unscoped until one exists).
+    #[sqlx(rename = "projectId")]
+    pub project_id: Option<String>,
     #[sqlx(rename = "lastUsedAt")]
     pub last_used_at: Option<DateTime<Utc>>,
     #[sqlx(rename = "revokedAt")]
@@ -67,6 +71,8 @@ pub struct ApiKeyListRow {
     pub created_by_id: String,
     #[sqlx(rename = "createdByName")]
     pub created_by_name: Option<String>,
+    #[sqlx(rename = "projectId")]
+    pub project_id: Option<String>,
     #[sqlx(rename = "lastUsedAt")]
     pub last_used_at: Option<DateTime<Utc>>,
     #[sqlx(rename = "revokedAt")]
@@ -95,15 +101,16 @@ impl Db {
         key_hash: &str,
         created_by_id: &str,
         expires_at: Option<DateTime<Utc>>,
+        project_id: &str,
     ) -> Result<ApiKeyRow> {
         let id = Uuid::new_v4().to_string();
         let now = Utc::now();
         let row = sqlx::query_as::<_, ApiKeyRow>(&format!(
             r#"
             INSERT INTO api_keys
-              (id, name, prefix, "keyHash", status, "createdById", "expiresAt", "createdAt")
+              (id, name, prefix, "keyHash", status, "createdById", "expiresAt", "createdAt", "projectId")
             VALUES
-              ($1, $2, $3, $4, 'ACTIVE'::"ApiKeyStatus", $5, $6, $7)
+              ($1, $2, $3, $4, 'ACTIVE'::"ApiKeyStatus", $5, $6, $7, $8)
             RETURNING {API_KEY_COLUMNS}
             "#
         ))
@@ -114,16 +121,19 @@ impl Db {
         .bind(created_by_id)
         .bind(expires_at)
         .bind(now)
+        .bind(project_id)
         .fetch_one(&self.pool)
         .await?;
         Ok(row)
     }
 
-    pub async fn list_api_keys(&self) -> Result<Vec<ApiKeyListRow>> {
-        let rows = sqlx::query_as::<_, ApiKeyListRow>(
+    pub async fn list_api_keys(&self, owner: &OwnerFilter) -> Result<Vec<ApiKeyListRow>> {
+        let (project_id, merchant_only) = owner.binds();
+        let rows = sqlx::query_as::<_, ApiKeyListRow>(&format!(
             r#"
             SELECT k.id, k.name, k.prefix, k.status::text AS status, k."createdById",
                    s."firstName" || ' ' || s."lastName" AS "createdByName",
+                   k."projectId",
                    k."lastUsedAt" AT TIME ZONE 'UTC' AS "lastUsedAt",
                    k."revokedAt" AT TIME ZONE 'UTC' AS "revokedAt",
                    k."expiresAt" AT TIME ZONE 'UTC' AS "expiresAt",
@@ -138,9 +148,13 @@ impl Db {
                    k."createdAt" AT TIME ZONE 'UTC' AS "createdAt"
             FROM api_keys k
             LEFT JOIN staff_users s ON s.id = k."createdById"
+            WHERE {}
             ORDER BY k."createdAt" DESC
             "#,
-        )
+            owner_condition(r#"k."projectId""#, "$1", "$2")
+        ))
+        .bind(project_id)
+        .bind(merchant_only)
         .fetch_all(&self.pool)
         .await?;
         Ok(rows)

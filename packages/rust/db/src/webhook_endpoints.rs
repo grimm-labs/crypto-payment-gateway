@@ -1,12 +1,12 @@
 use anyhow::Result;
 use chrono::{DateTime, Utc};
-use domain::WebhookEventType;
+use domain::{Owner, WebhookEventType};
 use sqlx::FromRow;
 use uuid::Uuid;
 
-use crate::Db;
+use crate::{owner_condition, Db, OwnerFilter};
 
-const WEBHOOK_ENDPOINT_COLUMNS: &str = r#"id, url, "isActive", events, secret, "createdById", "createdAt" AT TIME ZONE 'UTC' AS "createdAt", "updatedAt" AT TIME ZONE 'UTC' AS "updatedAt""#;
+const WEBHOOK_ENDPOINT_COLUMNS: &str = r#"id, url, "isActive", events, secret, "createdById", "projectId", "createdAt" AT TIME ZONE 'UTC' AS "createdAt", "updatedAt" AT TIME ZONE 'UTC' AS "updatedAt""#;
 
 #[derive(Clone, FromRow)]
 pub struct WebhookEndpointRow {
@@ -21,6 +21,10 @@ pub struct WebhookEndpointRow {
     pub secret: Option<String>,
     #[sqlx(rename = "createdById")]
     pub created_by_id: String,
+    /// Owning project; NULL = a merchant endpoint (instance events), fixed
+    /// at creation.
+    #[sqlx(rename = "projectId")]
+    pub project_id: Option<String>,
     #[sqlx(rename = "createdAt")]
     pub created_at: DateTime<Utc>,
     #[sqlx(rename = "updatedAt")]
@@ -37,6 +41,7 @@ impl std::fmt::Debug for WebhookEndpointRow {
             .field("events", &self.events)
             .field("secret", &self.secret.as_ref().map(|_| "<redacted>"))
             .field("created_by_id", &self.created_by_id)
+            .field("project_id", &self.project_id)
             .field("created_at", &self.created_at)
             .field("updated_at", &self.updated_at)
             .finish()
@@ -52,6 +57,10 @@ impl WebhookEndpointRow {
 impl WebhookEndpointRow {
     pub fn accepts_event(&self, event: WebhookEventType) -> bool {
         self.events.iter().any(|e| e == event.as_db())
+    }
+
+    pub fn owner(&self) -> Owner {
+        Owner::from_project_id(self.project_id.as_deref())
     }
 }
 
@@ -70,6 +79,8 @@ pub struct WebhookEndpointListRow {
     pub created_by_id: String,
     #[sqlx(rename = "createdByName")]
     pub created_by_name: Option<String>,
+    #[sqlx(rename = "projectId")]
+    pub project_id: Option<String>,
     #[sqlx(rename = "createdAt")]
     pub created_at: DateTime<Utc>,
     #[sqlx(rename = "updatedAt")]
@@ -77,22 +88,25 @@ pub struct WebhookEndpointListRow {
 }
 
 impl Db {
+    /// `None` when the owner already has an endpoint with this URL.
     pub async fn create_webhook_endpoint(
         &self,
         url: &str,
         events: &[WebhookEventType],
         secret: Option<&str>,
         created_by_id: &str,
-    ) -> Result<WebhookEndpointRow> {
+        owner: &Owner,
+    ) -> Result<Option<WebhookEndpointRow>> {
         let id = Uuid::new_v4().to_string();
         let now = Utc::now();
         let events_db: Vec<String> = events.iter().map(|e| e.as_db().to_string()).collect();
         let row = sqlx::query_as::<_, WebhookEndpointRow>(&format!(
             r#"
             INSERT INTO webhook_endpoints
-              (id, url, "isActive", events, secret, "createdById", "createdAt", "updatedAt")
+              (id, url, "isActive", events, secret, "createdById", "projectId", "createdAt", "updatedAt")
             VALUES
-              ($1, $2, true, $3, $4, $5, $6, $6)
+              ($1, $2, true, $3, $4, $5, $6, $7, $7)
+            ON CONFLICT DO NOTHING
             RETURNING {WEBHOOK_ENDPOINT_COLUMNS}
             "#
         ))
@@ -101,26 +115,33 @@ impl Db {
         .bind(&events_db)
         .bind(secret)
         .bind(created_by_id)
+        .bind(owner.project_id())
         .bind(now)
-        .fetch_one(&self.pool)
+        .fetch_optional(&self.pool)
         .await?;
         Ok(row)
     }
 
-    pub async fn list_webhook_endpoints(&self) -> Result<Vec<WebhookEndpointListRow>> {
-        let rows = sqlx::query_as::<_, WebhookEndpointListRow>(
+    pub async fn list_webhook_endpoints(&self, owner: &OwnerFilter) -> Result<Vec<WebhookEndpointListRow>> {
+        let (project_id, merchant_only) = owner.binds();
+        let rows = sqlx::query_as::<_, WebhookEndpointListRow>(&format!(
             r#"
             SELECT e.id, e.url, e."isActive", e.events,
                    (e.secret IS NOT NULL AND e.secret <> '') AS "hasSecret",
                    e."createdById",
                    s."firstName" || ' ' || s."lastName" AS "createdByName",
+                   e."projectId",
                    e."createdAt" AT TIME ZONE 'UTC' AS "createdAt",
                    e."updatedAt" AT TIME ZONE 'UTC' AS "updatedAt"
             FROM webhook_endpoints e
             LEFT JOIN staff_users s ON s.id = e."createdById"
+            WHERE {}
             ORDER BY e."createdAt" ASC
             "#,
-        )
+            owner_condition(r#"e."projectId""#, "$1", "$2")
+        ))
+        .bind(project_id)
+        .bind(merchant_only)
         .fetch_all(&self.pool)
         .await?;
         Ok(rows)
@@ -136,14 +157,18 @@ impl Db {
         Ok(row)
     }
 
+    /// The owner's endpoint at `url`, if any (URLs are unique per owner).
     pub async fn find_webhook_endpoint_by_url(
         &self,
+        owner: &Owner,
         url: &str,
     ) -> Result<Option<WebhookEndpointRow>> {
         let row = sqlx::query_as::<_, WebhookEndpointRow>(&format!(
-            "SELECT {WEBHOOK_ENDPOINT_COLUMNS} FROM webhook_endpoints WHERE url = $1"
+            r#"SELECT {WEBHOOK_ENDPOINT_COLUMNS} FROM webhook_endpoints
+               WHERE url = $1 AND "projectId" IS NOT DISTINCT FROM $2"#
         ))
         .bind(url)
+        .bind(owner.project_id())
         .fetch_optional(&self.pool)
         .await?;
         Ok(row)

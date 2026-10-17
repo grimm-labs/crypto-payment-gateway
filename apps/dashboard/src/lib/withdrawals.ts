@@ -29,6 +29,7 @@ export const ALERT_LABELS: Record<AlertType, string> = {
   treasury_cap_exceeded: "Hot-wallet cap exceeded",
   address_book_entry_added: "Address-book entry added",
   withdrawal_stuck: "Withdrawal stuck",
+  ledger_shortfall: "Ledger shortfall",
 }
 
 export type WithdrawalAction = "approve" | "reject" | "cancel" | "bump" | "abandon"

@@ -39,6 +39,15 @@
     --color-card: var(--card);
     --color-foreground: var(--foreground);
     --color-background: var(--background);
+    /* Project palette (docs/projects-spec.md §6.1), light and dark. */
+    --color-project-blue: var(--project-blue);
+    --color-project-emerald: var(--project-emerald);
+    --color-project-amber: var(--project-amber);
+    --color-project-rose: var(--project-rose);
+    --color-project-violet: var(--project-violet);
+    --color-project-cyan: var(--project-cyan);
+    --color-project-orange: var(--project-orange);
+    --color-project-fuchsia: var(--project-fuchsia);
     --radius-sm: calc(var(--radius) * 0.6);
     --radius-md: calc(var(--radius) * 0.8);
     --radius-lg: var(--radius);
@@ -81,6 +90,14 @@
     --sidebar-accent-foreground: oklch(0.205 0 0);
     --sidebar-border: oklch(0.922 0 0);
     --sidebar-ring: oklch(0.708 0 0);
+    --project-blue: oklch(0.62 0.19 260);
+    --project-emerald: oklch(0.64 0.17 160);
+    --project-amber: oklch(0.72 0.17 75);
+    --project-rose: oklch(0.64 0.21 15);
+    --project-violet: oklch(0.6 0.22 295);
+    --project-cyan: oklch(0.68 0.13 215);
+    --project-orange: oklch(0.68 0.19 45);
+    --project-fuchsia: oklch(0.63 0.26 330);
 }
 
 .dark {
@@ -115,6 +132,14 @@
     --sidebar-accent-foreground: oklch(0.985 0 0);
     --sidebar-border: oklch(1 0 0 / 10%);
     --sidebar-ring: oklch(0.556 0 0);
+    --project-blue: oklch(0.72 0.16 260);
+    --project-emerald: oklch(0.74 0.15 160);
+    --project-amber: oklch(0.8 0.15 80);
+    --project-rose: oklch(0.72 0.18 15);
+    --project-violet: oklch(0.72 0.18 295);
+    --project-cyan: oklch(0.76 0.12 215);
+    --project-orange: oklch(0.76 0.16 50);
+    --project-fuchsia: oklch(0.72 0.22 330);
 }
 
 @layer base {

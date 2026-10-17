@@ -37,6 +37,58 @@ export interface Paginated<T> {
   offset: number
 }
 
+// ------------------------------------------------------------------ projects
+
+/** The 8-colour palette of the dashboard (CSS tokens `--project-<color>`). */
+export type ProjectColor =
+  | "blue"
+  | "emerald"
+  | "amber"
+  | "rose"
+  | "violet"
+  | "cyan"
+  | "orange"
+  | "fuchsia"
+
+export interface ProjectCounts {
+  api_keys: number
+  deposit_addresses: number
+  withdrawals: number
+  webhook_endpoints: number
+  address_book_entries: number
+}
+
+/** One of the merchant's applications; owns keys, payments, withdrawals,
+ *  endpoints and address-book entries. */
+export interface Project {
+  id: string
+  name: string
+  color: ProjectColor
+  /** Tag of the project's API keys; null = the global tag. */
+  key_tag: string | null
+  created_at: string
+  updated_at: string
+  counts: ProjectCounts
+}
+
+/** Rows from before the first project, offered to it by the first-project step. */
+export interface UnassignedCounts {
+  api_keys: number
+  deposit_addresses: number
+  withdrawals: number
+  webhook_endpoints: number
+  address_book_entries: number
+}
+
+export interface ProjectsResponse {
+  projects: Project[]
+  /** Set while no project exists; null afterwards. */
+  unassigned: UnassignedCounts | null
+}
+
+/** The literal `project_id` takes to name the merchant funds / endpoints. */
+export const MERCHANT_OWNER = "merchant"
+
 export type DepositAddressStatus = "pending" | "paid" | "expired"
 export type DepositStatus = "detected" | "confirmed"
 export type WebhookStatus = "pending" | "delivered" | "failed"
@@ -47,6 +99,8 @@ export type Token = "USDT" | "BTC" | "ETH" | "TRX" | "SOL"
 // All amounts are decimal strings — never parse them into floats.
 export interface DepositAddress {
   id: string
+  /** Owning project; null only on payments from before projects existed. */
+  project_id: string | null
   /** For lightning: the BOLT11 payment request. */
   address: string
   network: Network
@@ -106,9 +160,15 @@ export type WebhookEventType =
   | "treasury_cap_exceeded"
   | "address_book_entry_added"
   | "withdrawal_stuck"
+  | "transfer_completed"
+  | "ledger_shortfall"
 
 export interface WebhookDelivery {
   id: string
+  /** Owner of the target endpoint; null = merchant endpoint (or a legacy row). */
+  project_id: string | null
+  /** Internal-transfer deliveries only. */
+  transfer_id?: string | null
   /** Address lifecycle event this delivery notifies. */
   event: WebhookEventType
   /** deposits.id — null on pending/expired event deliveries (no deposit). */
@@ -169,6 +229,8 @@ export interface ApiKeyWithdrawalGrant {
 
 export interface ApiKey extends ApiKeyWithdrawalGrant {
   id: string
+  /** Owning project; null only on a legacy key. */
+  project_id: string | null
   name: string
   prefix: string
   status: ApiKeyStatus
@@ -182,6 +244,7 @@ export interface ApiKey extends ApiKeyWithdrawalGrant {
 
 export interface CreatedApiKey extends ApiKeyWithdrawalGrant {
   id: string
+  project_id: string | null
   name: string
   prefix: string
   /** Full secret — shown exactly once at creation. */
@@ -367,6 +430,8 @@ export interface TrafficRequest {
 
 export interface WebhookEndpoint {
   id: string
+  /** The owner, fixed at creation; null = merchant endpoint (instance events). */
+  project_id: string | null
   url: string
   is_active: boolean
   /** Events this endpoint receives. */
@@ -418,6 +483,8 @@ export interface Requester {
 
 export interface Withdrawal {
   id: string
+  /** The owner debited; null = the merchant funds. */
+  project_id: string | null
   status: WithdrawalStatus
   network: Network
   token: Token
@@ -519,10 +586,14 @@ export interface WithdrawalRequest {
   /** Lightning only. */
   comment?: string
   metadata?: Record<string, unknown>
+  /** Staff only: the owner debited — a project id or "merchant". */
+  project_id?: string
 }
 
 export interface AddressBookEntry {
   id: string
+  /** The owner; null = a merchant entry. */
+  project_id: string | null
   network: Network
   destination_kind: DestinationKind
   destination: string
@@ -606,6 +677,7 @@ export type AlertType =
   | "treasury_cap_exceeded"
   | "address_book_entry_added"
   | "withdrawal_stuck"
+  | "ledger_shortfall"
 
 export interface Alert {
   alert_id: string

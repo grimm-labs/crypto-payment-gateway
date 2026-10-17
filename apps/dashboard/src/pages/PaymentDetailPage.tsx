@@ -4,6 +4,7 @@ import { Link, useParams } from "react-router-dom"
 import { toast } from "sonner"
 
 import { CopyButton } from "@/components/shared/CopyButton"
+import { ProjectBadge } from "@/components/shared/ProjectBadge"
 import { StatusBadge } from "@/components/shared/StatusBadge"
 import { Button } from "@/components/ui/button"
 import {
@@ -131,6 +132,7 @@ export function PaymentDetailPage() {
         </Button>
         <h1 className="text-2xl font-semibold tracking-tight">Payment detail</h1>
         <StatusBadge status={data.status} />
+        <ProjectBadge projectId={data.project_id} merchantLabel="No project" />
       </div>
 
       <div className="grid gap-6 lg:grid-cols-2">

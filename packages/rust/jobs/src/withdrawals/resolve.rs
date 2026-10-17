@@ -7,7 +7,7 @@ use chain::destination::{lightning_destination_kind, normalize_destination, Dest
 use chain::solana_tx::{associated_token_account, SolanaAccount, SolanaRpc};
 use chrono::Utc;
 use db::AddressBookEntryRow;
-use domain::{DestinationKind, Network, Token};
+use domain::{DestinationKind, Network, Owner, Token};
 use wallet::{KeyRef, Signer};
 
 use super::WithdrawalError;
@@ -56,9 +56,12 @@ pub fn rules(state: &AppState) -> DestinationRules<'_> {
     }
 }
 
-/// Validate and normalize the destination of a withdrawal of `amount_raw`.
+/// Validate and normalize the destination of a withdrawal of `amount_raw`
+/// by `owner`. Address-book entries are the owner's own (spec §8.2): another
+/// owner's entry is unknown, like a missing one.
 pub async fn resolve_destination(
     state: &AppState,
+    owner: &Owner,
     network: Network,
     token: Token,
     amount_raw: u128,
@@ -70,7 +73,7 @@ pub async fn resolve_destination(
                 .db
                 .find_address_book_entry(id)
                 .await?
-                .filter(|entry| entry.deleted_at.is_none())
+                .filter(|entry| entry.deleted_at.is_none() && entry.owner() == *owner)
                 .ok_or_else(|| WithdrawalError::BadRequest("Unknown address-book entry".into()))?;
             if entry.network()? != network {
                 return Err(WithdrawalError::BadRequest(
@@ -102,10 +105,11 @@ pub async fn resolve_destination(
             };
             let destination = normalize_destination(network, kind, raw, amount_raw, &rules(state))
                 .map_err(|e| WithdrawalError::BadRequest(e.to_string()))?;
-            // A raw destination that is an active book entry counts as one.
+            // A raw destination that is one of the owner's active book
+            // entries counts as one.
             let entry = state
                 .db
-                .find_address_book_entry_by_destination(network, &destination)
+                .find_address_book_entry_by_destination(owner, network, &destination)
                 .await?
                 .filter(|entry| entry.is_active(Utc::now()));
             (kind, destination, entry)

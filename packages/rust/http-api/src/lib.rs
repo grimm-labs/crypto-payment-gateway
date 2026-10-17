@@ -11,7 +11,7 @@ use config::{
     DEPOSIT_EXPIRY_MAX_MINUTES, DEPOSIT_EXPIRY_MIN_MINUTES, ETH_MAX_EXPECTED_AMOUNT,
     MAX_PENDING_ADDRESSES_PER_API_KEY, USDT_MAX_EXPECTED_AMOUNT,
 };
-use db::{AuditActor, DepositAddressRow, WebhookDeliveryRow};
+use db::{AuditActor, DepositAddressRow, OwnerFilter, WebhookDeliveryRow};
 use domain::{
     decimal_to_raw, format_amount, parse_sats, raw_to_decimal, raw_to_decimal_string,
     round_to_token, supports,
@@ -34,6 +34,7 @@ use tower_http::trace::TraceLayer;
 
 mod admin;
 mod middleware;
+mod projects;
 mod rate_limit;
 mod session;
 mod traffic;
@@ -272,6 +273,26 @@ async fn create_deposit_address(
 ) -> Result<(StatusCode, Json<DepositAddressResponse>), ApiError> {
     let request = validate_create_request(&body)?;
     let network = request.network;
+    // The owner (spec §5): the calling key's project, or the staff
+    // member's explicit choice — required once projects exist.
+    let project_id = match api_key.as_deref() {
+        Some(key) => {
+            if body.project_id.is_some() {
+                return Err(ApiError::unprocessable(
+                    "project_id is not accepted from a merchant key: its payments belong to its project".into(),
+                ));
+            }
+            key.project_id.clone()
+        }
+        None => {
+            projects::require_any_project(&state).await?;
+            let id = projects::parse_project_id_field(body.project_id.as_deref())?;
+            if state.db.find_project(&id).await?.is_none() {
+                return Err(ApiError::unprocessable("Unknown project".into()));
+            }
+            Some(id)
+        }
+    };
     // An address nobody polls would never see its payment (#66).
     if !state.is_network_enabled(network) {
         return Err(ApiError::service_unavailable(format!(
@@ -355,6 +376,7 @@ async fn create_deposit_address(
             expires_at,
             metadata,
             api_key.as_deref().map(|key| key.id.as_str()),
+            project_id.as_deref(),
         )
         .await?;
 
@@ -498,6 +520,7 @@ fn invoice_expiry_secs(expires_at: DateTime<Utc>, now: DateTime<Utc>) -> Result<
 
 async fn list_deposit_addresses(
     State(state): State<AppState>,
+    api_key: Option<Extension<CurrentApiKey>>,
     Query(query): Query<ListQuery>,
 ) -> Result<Json<ListResponse>, ApiError> {
     // Expiry is the monitor loops' job (after a last poll), never a side
@@ -517,10 +540,18 @@ async fn list_deposit_addresses(
 
     let limit = query.limit.unwrap_or(50).clamp(1, 100);
     let offset = query.offset.unwrap_or(0).max(0);
+    // Staff filter on the owner; a merchant key is scoped by its project.
+    let owner = match api_key.as_deref() {
+        Some(key) => match &key.project_id {
+            Some(id) => OwnerFilter::Project(id.clone()),
+            None => OwnerFilter::Any,
+        },
+        None => projects::owner_filter_param(query.project_id.as_deref())?,
+    };
 
     let (rows, total) = state
         .db
-        .list_deposit_addresses(status, network, limit, offset)
+        .list_deposit_addresses(status, network, &owner, limit, offset)
         .await?;
     let data = rows
         .iter()
@@ -569,7 +600,7 @@ async fn get_deposit_address(
     }
     let endpoint_urls: HashMap<String, String> = state
         .db
-        .list_webhook_endpoints()
+        .list_webhook_endpoints(&OwnerFilter::Any)
         .await?
         .into_iter()
         .map(|e| (e.id, e.url))
@@ -825,6 +856,7 @@ fn to_response(row: &DepositAddressRow) -> Result<DepositAddressResponse, ApiErr
     let status = DepositAddressStatus::from_db(&row.status).map_err(ApiError::from)?;
     Ok(DepositAddressResponse {
         id: row.id.clone(),
+        project_id: row.project_id.clone(),
         address: row.address.clone(),
         network: network.as_api().to_string(),
         token: token.as_api().to_string(),
@@ -848,6 +880,8 @@ struct CreateDepositAddressRequest {
     metadata: Option<Value>,
     /// Lightning only: BOLT11 memo (≤ 128 chars).
     description: Option<String>,
+    /// Staff only: the owning project (required once projects exist).
+    project_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -860,6 +894,8 @@ struct PageQuery {
 struct ListQuery {
     status: Option<String>,
     network: Option<String>,
+    /// Staff only: `<uuid>` (or `merchant` for legacy rows).
+    project_id: Option<String>,
     limit: Option<i64>,
     offset: Option<i64>,
 }
@@ -867,6 +903,8 @@ struct ListQuery {
 #[derive(Debug, Serialize)]
 struct DepositAddressResponse {
     id: String,
+    /// The owning project; null only on payments from before projects.
+    project_id: Option<String>,
     address: String,
     network: String,
     token: String,
@@ -1203,6 +1241,7 @@ mod tests {
         assert!(authorize_lightning_read(None).is_ok());
         let key = |policy, tokens: Vec<Token>, networks: Option<Vec<Network>>| CurrentApiKey {
             id: "k".into(),
+            project_id: Some("p1".into()),
             withdrawal_policy: policy,
             withdrawal_tokens: tokens,
             withdrawal_networks: networks,
@@ -1261,6 +1300,8 @@ mod tests {
             expires_at: now,
             metadata: json!({}),
             api_key_id: None,
+            project_id: None,
+            btc_received_raw: None,
             created_at: now,
             updated_at: now,
         };

@@ -34,6 +34,7 @@ pub mod fees;
 pub mod freeze;
 pub mod outbound;
 pub mod payouts;
+pub mod projects;
 pub mod sweeper;
 pub mod traffic;
 pub mod treasury;
@@ -758,6 +759,7 @@ pub async fn retrigger_delivery(state: &AppState, delivery_id: &str) -> Result<(
         WebhookSubject::LightningPayment => delivery.lightning_payment_id.clone(),
         WebhookSubject::Withdrawal => delivery.withdrawal_id.clone(),
         WebhookSubject::Alert => delivery.alert_id.clone(),
+        WebhookSubject::Transfer => delivery.transfer_id.clone(),
         WebhookSubject::DepositAddress => delivery.deposit_address_id.clone(),
     }
     .ok_or(RetriggerError::DeliveryNotFound)?;
@@ -860,6 +862,7 @@ pub async fn deliver_webhook(
         WebhookSubject::LightningPayment => format!("payout {subject_id} ({})", event.as_api()),
         WebhookSubject::Withdrawal => format!("withdrawal {subject_id} ({})", event.as_api()),
         WebhookSubject::Alert => format!("alert {subject_id} ({})", event.as_api()),
+        WebhookSubject::Transfer => format!("transfer {subject_id}"),
         WebhookSubject::DepositAddress => format!("address {subject_id} ({})", event.as_api()),
     };
 
@@ -1039,6 +1042,12 @@ async fn prepare_delivery(
                 _ => row.updated_at,
             };
             Ok(Some((delivery, withdrawals::withdrawal_payload(event, &row)?, occurred_at)))
+        }
+        WebhookEventType::TransferCompleted => {
+            // Internal transfers are queued once they exist (spec §9); a
+            // member of this shape has no subject yet.
+            warn!("Transfer webhook {subject_id} dropped — internal transfers are not available");
+            Ok(None)
         }
         _ => {
             let Some(alert) = state.db.find_alert(subject_id).await? else {
@@ -2038,6 +2047,8 @@ mod tests {
             expires_at: now,
             metadata: serde_json::json!({}),
             api_key_id: None,
+            project_id: Some("p1".into()),
+            btc_received_raw: None,
             created_at: now,
             updated_at: now,
         }

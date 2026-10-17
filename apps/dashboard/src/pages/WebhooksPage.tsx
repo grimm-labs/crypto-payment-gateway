@@ -3,6 +3,7 @@ import { KeyRound, Pencil, Plus, ShieldAlert, TriangleAlert, Wand2, Webhook } fr
 import { toast } from "sonner"
 
 import { CopyButton } from "@/components/shared/CopyButton"
+import { ProjectBadge, ProjectDot } from "@/components/shared/ProjectBadge"
 import { QueryError } from "@/components/shared/QueryError"
 import { StatusBadge } from "@/components/shared/StatusBadge"
 import {
@@ -36,6 +37,13 @@ import {
 } from "@/components/ui/dialog"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select"
 import { Skeleton } from "@/components/ui/skeleton"
 import { Switch } from "@/components/ui/switch"
 import {
@@ -54,12 +62,51 @@ import {
 } from "@/hooks/queries"
 import { toastError } from "@/lib/errors"
 import { formatDate, humanize } from "@/lib/format"
-import type { WebhookEndpoint, WebhookEventType } from "@/lib/types"
+import { useProjectScope } from "@/lib/project-scope"
+import { MERCHANT_OWNER, type WebhookEndpoint, type WebhookEventType } from "@/lib/types"
 
 interface EventOption {
   value: WebhookEventType
   label: string
   description: string
+}
+
+type OwnerKind = "project" | "merchant"
+
+/** Events an endpoint may subscribe to, by owner (spec §10.2). Withdrawal
+ *  and transfer events exist on both sides; payment events are a project's,
+ *  alerts and Lightning payouts the merchant's. */
+const ALLOWED_EVENTS: Record<OwnerKind, WebhookEventType[]> = {
+  project: [
+    "pending",
+    "paid",
+    "expired",
+    "withdrawal_pending_approval",
+    "withdrawal_broadcast",
+    "withdrawal_confirmed",
+    "withdrawal_failed",
+    "withdrawal_cancelled",
+    "transfer_completed",
+  ],
+  merchant: [
+    "withdrawal_pending_approval",
+    "withdrawal_broadcast",
+    "withdrawal_confirmed",
+    "withdrawal_failed",
+    "withdrawal_cancelled",
+    "transfer_completed",
+    "payout_succeeded",
+    "payout_failed",
+    "gas_reserve_low",
+    "treasury_cap_exceeded",
+    "address_book_entry_added",
+    "withdrawal_stuck",
+    "ledger_shortfall",
+  ],
+}
+
+function ownerKind(projectId: string | null): OwnerKind {
+  return projectId ? "project" : "merchant"
 }
 
 const EVENT_GROUPS: Array<{ title: string; options: EventOption[] }> = [
@@ -98,6 +145,16 @@ const EVENT_GROUPS: Array<{ title: string; options: EventOption[] }> = [
     ],
   },
   {
+    title: "Internal transfers",
+    options: [
+      {
+        value: "transfer_completed",
+        label: "Transfer completed",
+        description: "An admin moved funds between this owner and another one (ledger only)",
+      },
+    ],
+  },
+  {
     title: "Operational alerts",
     options: [
       {
@@ -119,6 +176,11 @@ const EVENT_GROUPS: Array<{ title: string; options: EventOption[] }> = [
         value: "withdrawal_stuck",
         label: "Withdrawal stuck",
         description: "A withdrawal reached its fee cap without confirming",
+      },
+      {
+        value: "ledger_shortfall",
+        label: "Ledger shortfall",
+        description: "The project balances of an asset exceed what the gateway holds",
       },
     ],
   },
@@ -185,7 +247,8 @@ function urlProblem(raw: string): string | null {
 }
 
 export function WebhooksPage() {
-  const endpoints = useWebhookEndpoints()
+  const { scopeParam } = useProjectScope()
+  const endpoints = useWebhookEndpoints(scopeParam)
   const toggleEndpoint = useToggleWebhookEndpoint()
   const [deactivating, setDeactivating] = useState<WebhookEndpoint | null>(null)
   const [editing, setEditing] = useState<WebhookEndpoint | null>(null)
@@ -207,10 +270,10 @@ export function WebhooksPage() {
         <div>
           <h1 className="text-2xl font-semibold tracking-tight">Webhooks</h1>
           <p className="text-sm text-muted-foreground">
-            Each active endpoint receives a POST for the events it subscribes
-            to — payment lifecycle (pending, paid, expired), withdrawal
-            lifecycle, operational alerts, and Lightning wallet sends made
-            outside the gateway.
+            Each active endpoint belongs to a project — payment and withdrawal
+            lifecycle of that project — or to the merchant: instance events
+            (alerts, merchant-funds withdrawals, Lightning wallet sends made
+            outside the gateway). It receives a POST for the events it subscribes to.
           </p>
         </div>
         <AddEndpointDialog />
@@ -226,6 +289,7 @@ export function WebhooksPage() {
             <TableHeader>
               <TableRow>
                 <TableHead>URL</TableHead>
+                <TableHead>Owner</TableHead>
                 <TableHead>Events</TableHead>
                 <TableHead>Status</TableHead>
                 <TableHead>Created by</TableHead>
@@ -237,7 +301,7 @@ export function WebhooksPage() {
             <TableBody>
               {endpoints.data?.data.length === 0 && (
                 <TableRow>
-                  <TableCell colSpan={7} className="h-24 text-center text-muted-foreground">
+                  <TableCell colSpan={8} className="h-24 text-center text-muted-foreground">
                     No webhook endpoints yet — outgoing webhooks are disabled.
                   </TableCell>
                 </TableRow>
@@ -268,6 +332,9 @@ export function WebhooksPage() {
                         </Badge>
                       )}
                     </div>
+                  </TableCell>
+                  <TableCell>
+                    <ProjectBadge projectId={endpoint.project_id} />
                   </TableCell>
                   <TableCell>
                     <div className="flex items-center gap-1.5">
@@ -353,16 +420,24 @@ export function WebhooksPage() {
   )
 }
 
+/** The checklist of one owner's allowed events (spec §10.2). */
 function EventChecklist({
+  owner,
   selected,
   onToggle,
 }: {
+  owner: OwnerKind
   selected: WebhookEventType[]
   onToggle: (event: WebhookEventType, checked: boolean) => void
 }) {
+  const allowed = ALLOWED_EVENTS[owner]
+  const groups = EVENT_GROUPS.map((group) => ({
+    ...group,
+    options: group.options.filter((option) => allowed.includes(option.value)),
+  })).filter((group) => group.options.length > 0)
   return (
     <div className="max-h-[45vh] space-y-4 overflow-y-auto pr-1">
-      {EVENT_GROUPS.map((group) => (
+      {groups.map((group) => (
         <div key={group.title} className="space-y-3">
           <p className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
             {group.title}
@@ -401,11 +476,27 @@ function AddEndpointDialog() {
   const [events, setEvents] = useState<WebhookEventType[]>(["paid"])
   const [secret, setSecret] = useState("")
   const createEndpoint = useCreateWebhookEndpoint()
+  // The owner, fixed for good: a project (pre-filled from the header
+  // selector) or the merchant for the instance events.
+  const { projects, scopeParam } = useProjectScope()
+  const [owner, setOwner] = useState(scopeParam ?? "")
+  const kind: OwnerKind = owner === MERCHANT_OWNER ? "merchant" : "project"
 
   const plainHttp = url.trim().toLowerCase().startsWith("http://")
 
+  function changeOwner(next: string) {
+    setOwner(next)
+    const nextKind: OwnerKind = next === MERCHANT_OWNER ? "merchant" : "project"
+    // Keep what the new owner may subscribe to; default to its usual events.
+    setEvents((current) => {
+      const kept = current.filter((event) => ALLOWED_EVENTS[nextKind].includes(event))
+      return kept.length > 0 ? kept : nextKind === "project" ? ["paid"] : ["gas_reserve_low", "withdrawal_stuck"]
+    })
+  }
+
   function handleOpenChange(next: boolean) {
     setOpen(next)
+    if (next) setOwner(scopeParam ?? "")
     if (!next) {
       // The secret is write-only: never keep it around once the dialog is gone.
       setUrl("")
@@ -417,6 +508,10 @@ function AddEndpointDialog() {
   async function handleCreate() {
     const trimmed = url.trim()
     const trimmedSecret = secret.trim()
+    if (!owner) {
+      toast.error("Choose the owner of the endpoint")
+      return
+    }
     const problem = urlProblem(trimmed)
     if (problem) {
       toast.error(problem)
@@ -435,7 +530,7 @@ function AddEndpointDialog() {
       return
     }
     try {
-      await createEndpoint.mutateAsync({ url: trimmed, events, secret: trimmedSecret })
+      await createEndpoint.mutateAsync({ url: trimmed, events, secret: trimmedSecret, project_id: owner })
       toast.success("Webhook endpoint added")
       handleOpenChange(false)
     } catch (error) {
@@ -459,6 +554,27 @@ function AddEndpointDialog() {
           </DialogDescription>
         </DialogHeader>
         <div className="space-y-4">
+          <div className="space-y-2">
+            <Label>Owner</Label>
+            <Select value={owner} onValueChange={changeOwner}>
+              <SelectTrigger className="w-full">
+                <SelectValue placeholder="Choose a project, or the merchant" />
+              </SelectTrigger>
+              <SelectContent>
+                {projects.map((project) => (
+                  <SelectItem key={project.id} value={project.id}>
+                    <ProjectDot color={project.color} /> {project.name}
+                  </SelectItem>
+                ))}
+                <SelectItem value={MERCHANT_OWNER}>Merchant — instance events</SelectItem>
+              </SelectContent>
+            </Select>
+            <p className="text-xs text-muted-foreground">
+              {kind === "project"
+                ? "Receives the payment and withdrawal events of this project only. The owner cannot be changed later."
+                : "Receives the instance events: alerts, merchant-funds withdrawals, internal transfers and Lightning wallet sends made outside the gateway."}
+            </p>
+          </div>
           <div className="space-y-2">
             <Label htmlFor="endpoint-url">URL</Label>
             <Input
@@ -485,6 +601,7 @@ function AddEndpointDialog() {
           <div className="space-y-2">
             <Label>Events</Label>
             <EventChecklist
+              owner={kind}
               selected={events}
               onToggle={(event, checked) =>
                 setEvents((current) => toggleEvent(current, event, checked))
@@ -602,9 +719,15 @@ function EditEndpointDialog({
           </DialogDescription>
         </DialogHeader>
         <div className="space-y-4">
+          <div className="flex items-center gap-2 text-sm">
+            <span className="text-muted-foreground">Owner</span>
+            <ProjectBadge projectId={endpoint?.project_id ?? null} />
+            <span className="text-xs text-muted-foreground">(fixed at creation)</span>
+          </div>
           <div className="space-y-2">
             <Label>Events</Label>
             <EventChecklist
+              owner={ownerKind(endpoint?.project_id ?? null)}
               selected={events}
               onToggle={(event, checked) =>
                 setEvents((current) => toggleEvent(current, event, checked))

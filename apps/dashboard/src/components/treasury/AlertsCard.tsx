@@ -26,6 +26,7 @@ const TONES: Record<AlertType, string> = {
   treasury_cap_exceeded: "bg-orange-100 text-orange-900 dark:bg-orange-900/40 dark:text-orange-200",
   address_book_entry_added: "bg-sky-100 text-sky-900 dark:bg-sky-900/40 dark:text-sky-200",
   withdrawal_stuck: "bg-red-100 text-red-900 dark:bg-red-900/40 dark:text-red-200",
+  ledger_shortfall: "bg-red-100 text-red-900 dark:bg-red-900/40 dark:text-red-200",
 }
 
 function detailValue(value: unknown): string {

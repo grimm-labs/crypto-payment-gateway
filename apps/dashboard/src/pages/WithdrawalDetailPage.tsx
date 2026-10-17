@@ -3,6 +3,7 @@ import { Link, useParams } from "react-router-dom"
 
 import { CopyButton } from "@/components/shared/CopyButton"
 import { JsonViewer } from "@/components/shared/JsonViewer"
+import { ProjectBadge } from "@/components/shared/ProjectBadge"
 import { StatusBadge } from "@/components/shared/StatusBadge"
 import { TxHash } from "@/components/shared/TxHash"
 import { RequesterLabel } from "@/components/withdrawals/RequesterLabel"
@@ -60,6 +61,7 @@ export function WithdrawalDetailPage() {
           <BackLink />
           <h1 className="text-2xl font-semibold tracking-tight">Withdrawal</h1>
           <StatusBadge status={data.status} />
+          <ProjectBadge projectId={data.project_id} merchantLabel="Merchant funds" />
         </div>
         <WithdrawalActions withdrawal={data} size="default" />
       </div>

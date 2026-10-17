@@ -306,6 +306,7 @@ mod tests {
             idempotency_key: "k".into(),
             api_key_id: Some("key".into()),
             staff_id: None,
+            project_id: Some("p1".into()),
             params_hash: "h".into(),
             network: "SOLANA".into(),
             token: "USDT".into(),

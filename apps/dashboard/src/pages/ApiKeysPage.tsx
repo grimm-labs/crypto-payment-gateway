@@ -5,6 +5,7 @@ import { toast } from "sonner"
 import { WithdrawalPolicyDialog } from "@/components/api-keys/WithdrawalPolicyDialog"
 import { WithdrawalPolicySummary } from "@/components/api-keys/WithdrawalPolicySummary"
 import { CopyButton } from "@/components/shared/CopyButton"
+import { ProjectBadge, ProjectDot } from "@/components/shared/ProjectBadge"
 import { QueryError } from "@/components/shared/QueryError"
 import { StatusBadge } from "@/components/shared/StatusBadge"
 import {
@@ -62,10 +63,12 @@ import {
 } from "@/hooks/queries"
 import { toastError } from "@/lib/errors"
 import { formatDate } from "@/lib/format"
+import { useProjectScope } from "@/lib/project-scope"
 import type { ApiKey, CreatedApiKey } from "@/lib/types"
 
 export function ApiKeysPage() {
-  const keys = useApiKeys()
+  const { scopeParam } = useProjectScope()
+  const keys = useApiKeys(true, scopeParam)
   const revokeKey = useRevokeApiKey()
   // Editing a key's withdrawal grant (destination policy, tokens, limits).
   const [editing, setEditing] = useState<ApiKey | null>(null)
@@ -102,6 +105,7 @@ export function ApiKeysPage() {
             <TableHeader>
               <TableRow>
                 <TableHead>Name</TableHead>
+                <TableHead>Project</TableHead>
                 <TableHead>Prefix</TableHead>
                 <TableHead>Status</TableHead>
                 <TableHead>Expires</TableHead>
@@ -115,7 +119,7 @@ export function ApiKeysPage() {
             <TableBody>
               {keys.data?.data.length === 0 && (
                 <TableRow>
-                  <TableCell colSpan={9} className="h-24 text-center text-muted-foreground">
+                  <TableCell colSpan={10} className="h-24 text-center text-muted-foreground">
                     No API keys yet. Merchant calls to /api/v1 require one.
                   </TableCell>
                 </TableRow>
@@ -127,6 +131,9 @@ export function ApiKeysPage() {
                       <KeyRound className="size-3.5 text-muted-foreground" />
                       {key.name}
                     </div>
+                  </TableCell>
+                  <TableCell>
+                    <ProjectBadge projectId={key.project_id} merchantLabel="No project" />
                   </TableCell>
                   <TableCell>
                     <code className="text-xs">{key.prefix}_…</code>
@@ -231,10 +238,11 @@ function ApiKeyPrefixCard() {
   return (
     <Card>
       <CardHeader>
-        <CardTitle>API key prefix</CardTitle>
+        <CardTitle>Global API key prefix</CardTitle>
         <CardDescription>
           Optional tag prepended to newly generated API keys (max 5 alphanumeric
-          characters). Existing keys keep working unchanged.
+          characters) when their project has no tag of its own. Existing keys keep
+          working unchanged.
         </CardDescription>
       </CardHeader>
       <CardContent>
@@ -286,9 +294,16 @@ function CreateApiKeyDialog() {
   const [expiry, setExpiry] = useState<string>("never")
   const [created, setCreated] = useState<CreatedApiKey | null>(null)
   const createKey = useCreateApiKey()
+  // Required; pre-filled from the header selector. The tag preview follows it.
+  const { projects, scopeParam } = useProjectScope()
+  const [projectId, setProjectId] = useState(scopeParam ?? "")
+  const project = projects.find((p) => p.id === projectId)
+  const settings = useSettings()
+  const tag = project ? (project.key_tag ?? settings.data?.api_key_prefix ?? "") : ""
+  const preview = `${tag ? `${tag}_` : ""}xxxxxxxx_${"·".repeat(24)}`
 
   const choice = EXPIRY_CHOICES.find((c) => c.value === expiry)
-  const ready = name.trim() !== ""
+  const ready = name.trim() !== "" && projectId !== ""
 
   async function handleCreate() {
     if (!name.trim()) {
@@ -300,6 +315,7 @@ function CreateApiKeyDialog() {
       const key = await createKey.mutateAsync({
         name: name.trim(),
         expires_in_days: choice?.days ?? null,
+        project_id: projectId,
       })
       setCreated(key)
     } catch (error) {
@@ -309,6 +325,7 @@ function CreateApiKeyDialog() {
 
   function handleOpenChange(next: boolean) {
     setOpen(next)
+    if (next) setProjectId(scopeParam ?? "")
     if (!next) {
       setCreated(null)
       setName("")
@@ -361,6 +378,31 @@ function CreateApiKeyDialog() {
               </DialogDescription>
             </DialogHeader>
             <div className="space-y-4">
+              <div className="space-y-2">
+                <Label>Project</Label>
+                <Select value={projectId} onValueChange={setProjectId}>
+                  <SelectTrigger className="w-full">
+                    <SelectValue placeholder="Choose the project this key belongs to" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {projects.map((item) => (
+                      <SelectItem key={item.id} value={item.id}>
+                        <ProjectDot color={item.color} /> {item.name}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+                <p className="text-xs text-muted-foreground">
+                  A key belongs to one project for good.
+                  {project && (
+                    <>
+                      {" "}
+                      Its keys look like <code className="text-xs">{preview}</code>
+                      {project.key_tag ? "" : " (global tag)"}.
+                    </>
+                  )}
+                </p>
+              </div>
               <div className="space-y-2">
                 <Label htmlFor="key-name">Name</Label>
                 <Input

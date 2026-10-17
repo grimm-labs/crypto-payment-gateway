@@ -4,14 +4,14 @@
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
-use domain::{CancelReason, DestinationKind, Network, Token, WithdrawalStatus};
+use domain::{CancelReason, DestinationKind, Network, Owner, Token, WithdrawalStatus};
 use serde_json::Value;
 use sqlx::{FromRow, PgConnection, Postgres, Transaction};
 use uuid::Uuid;
 
-use crate::{Db, RawAmount};
+use crate::{owner_condition, Db, OwnerFilter, RawAmount};
 
-pub(crate) const WITHDRAWAL_COLUMNS: &str = r#"id, "idempotencyKey", "apiKeyId", "staffId", "paramsHash", network::text AS network, token::text AS token, "destinationKind"::text AS "destinationKind", destination, "addressBookEntryId", "solanaTokenAccount", "amountRaw"::text AS "amountRaw", "feeEstimateRaw"::text AS "feeEstimateRaw", "feeCapRaw"::text AS "feeCapRaw", "feeRaw"::text AS "feeRaw", "feeToken"::text AS "feeToken", status::text AS status, "approvalRequired", "approvedById", "approvedAt" AT TIME ZONE 'UTC' AS "approvedAt", "selfApprovalNotBefore" AT TIME ZONE 'UTC' AS "selfApprovalNotBefore", "approvalExpiresAt" AT TIME ZONE 'UTC' AS "approvalExpiresAt", "cancelledById", "cancelReason", "txHash", confirmations, "failureReason", reference, comment, metadata, "createdAt" AT TIME ZONE 'UTC' AS "createdAt", "updatedAt" AT TIME ZONE 'UTC' AS "updatedAt", "broadcastAt" AT TIME ZONE 'UTC' AS "broadcastAt", "confirmedAt" AT TIME ZONE 'UTC' AS "confirmedAt""#;
+pub(crate) const WITHDRAWAL_COLUMNS: &str = r#"id, "idempotencyKey", "apiKeyId", "staffId", "projectId", "paramsHash", network::text AS network, token::text AS token, "destinationKind"::text AS "destinationKind", destination, "addressBookEntryId", "solanaTokenAccount", "amountRaw"::text AS "amountRaw", "feeEstimateRaw"::text AS "feeEstimateRaw", "feeCapRaw"::text AS "feeCapRaw", "feeRaw"::text AS "feeRaw", "feeToken"::text AS "feeToken", status::text AS status, "approvalRequired", "approvedById", "approvedAt" AT TIME ZONE 'UTC' AS "approvedAt", "selfApprovalNotBefore" AT TIME ZONE 'UTC' AS "selfApprovalNotBefore", "approvalExpiresAt" AT TIME ZONE 'UTC' AS "approvalExpiresAt", "cancelledById", "cancelReason", "txHash", confirmations, "failureReason", reference, comment, metadata, "createdAt" AT TIME ZONE 'UTC' AS "createdAt", "updatedAt" AT TIME ZONE 'UTC' AS "updatedAt", "broadcastAt" AT TIME ZONE 'UTC' AS "broadcastAt", "confirmedAt" AT TIME ZONE 'UTC' AS "confirmedAt""#;
 
 #[derive(Debug, Clone, FromRow)]
 pub struct WithdrawalRow {
@@ -22,6 +22,10 @@ pub struct WithdrawalRow {
     pub api_key_id: Option<String>,
     #[sqlx(rename = "staffId")]
     pub staff_id: Option<String>,
+    /// Owning project (a key's project, or the admin's choice); NULL = the
+    /// merchant funds.
+    #[sqlx(rename = "projectId")]
+    pub project_id: Option<String>,
     #[sqlx(rename = "paramsHash")]
     pub params_hash: String,
     pub network: String,
@@ -97,6 +101,10 @@ impl WithdrawalRow {
     pub fn destination_kind(&self) -> Result<DestinationKind> {
         Ok(DestinationKind::from_db(&self.destination_kind)?)
     }
+
+    pub fn owner(&self) -> Owner {
+        Owner::from_project_id(self.project_id.as_deref())
+    }
 }
 
 /// A withdrawal being admitted. Exactly one of `api_key_id` / `staff_id`.
@@ -107,6 +115,8 @@ pub struct NewWithdrawal<'a> {
     pub idempotency_key: &'a str,
     pub api_key_id: Option<&'a str>,
     pub staff_id: Option<&'a str>,
+    /// The owner: a project, or the merchant funds.
+    pub owner: Owner,
     pub params_hash: &'a str,
     pub network: Network,
     pub token: Token,
@@ -144,8 +154,10 @@ pub struct WithdrawalFilter {
     pub status: Option<WithdrawalStatus>,
     pub network: Option<Network>,
     pub token: Option<Token>,
-    /// Merchant keys only ever see their own withdrawals.
+    /// Staff filter on the requesting key.
     pub api_key_id: Option<String>,
+    /// A project's withdrawals, the merchant's, or every one.
+    pub owner: OwnerFilter,
 }
 
 const RESERVING: &str = r#"('PENDING_APPROVAL', 'QUEUED', 'SIGNED', 'BROADCAST', 'STUCK')"#;
@@ -209,20 +221,27 @@ impl Db {
         let status = filter.status.map(|s| s.as_db());
         let network = filter.network.map(|n| n.as_db());
         let token = filter.token.map(|t| t.as_db());
-        let condition = r#"
+        let (project_id, merchant_only) = filter.owner.binds();
+        let condition = format!(
+            r#"
             ($1::text IS NULL OR status = $1::"WithdrawalStatus")
             AND ($2::text IS NULL OR network = $2::"Network")
             AND ($3::text IS NULL OR token = $3::"Token")
             AND ($4::text IS NULL OR "apiKeyId" = $4)
-        "#;
+            AND {}
+        "#,
+            owner_condition(r#""projectId""#, "$5", "$6")
+        );
         let rows = sqlx::query_as::<_, WithdrawalRow>(&format!(
             r#"SELECT {WITHDRAWAL_COLUMNS} FROM withdrawals WHERE {condition}
-               ORDER BY "createdAt" DESC, id DESC LIMIT $5 OFFSET $6"#
+               ORDER BY "createdAt" DESC, id DESC LIMIT $7 OFFSET $8"#
         ))
         .bind(status)
         .bind(network)
         .bind(token)
         .bind(filter.api_key_id.as_deref())
+        .bind(project_id)
+        .bind(merchant_only)
         .bind(limit)
         .bind(offset)
         .fetch_all(&self.pool)
@@ -233,6 +252,8 @@ impl Db {
                 .bind(network)
                 .bind(token)
                 .bind(filter.api_key_id.as_deref())
+                .bind(project_id)
+                .bind(merchant_only)
                 .fetch_one(&self.pool)
                 .await?;
         Ok((rows, total))
@@ -556,12 +577,12 @@ impl WithdrawalAdmission {
               (id, "idempotencyKey", "apiKeyId", "staffId", "paramsHash", network, token,
                "destinationKind", destination, "addressBookEntryId", "amountRaw", "feeEstimateRaw",
                "feeCapRaw", "feeToken", status, "approvalRequired", "selfApprovalNotBefore",
-               "approvalExpiresAt", reference, comment, metadata, "solanaTokenAccount", "createdAt", "updatedAt")
+               "approvalExpiresAt", reference, comment, metadata, "solanaTokenAccount", "projectId", "createdAt", "updatedAt")
             VALUES
               ($1, $2, $3, $4, $5, $6::"Network", $7::"Token",
                $8::"DestinationKind", $9, $10, $11::numeric, $12::numeric,
                $13::numeric, $14::"Token", $15::"WithdrawalStatus", $16, $17,
-               $18, $19, $20, $21, $22, NOW(), NOW())
+               $18, $19, $20, $21, $22, $23, NOW(), NOW())
             RETURNING {WITHDRAWAL_COLUMNS}
             "#
         ))
@@ -587,6 +608,7 @@ impl WithdrawalAdmission {
         .bind(new.comment)
         .bind(new.metadata)
         .bind(new.solana_token_account)
+        .bind(new.owner.project_id())
         .fetch_one(&mut *self.tx)
         .await
         .context("insert withdrawal")?;

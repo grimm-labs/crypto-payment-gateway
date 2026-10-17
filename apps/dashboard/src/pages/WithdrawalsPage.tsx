@@ -3,6 +3,7 @@ import { Plus, ShieldAlert, X } from "lucide-react"
 import { Link, useSearchParams } from "react-router-dom"
 
 import { Pagination } from "@/components/shared/Pagination"
+import { ProjectBadge } from "@/components/shared/ProjectBadge"
 import { QueryError } from "@/components/shared/QueryError"
 import { StatusBadge } from "@/components/shared/StatusBadge"
 import { TxHash } from "@/components/shared/TxHash"
@@ -30,6 +31,7 @@ import { usePendingApprovalCount, useWithdrawals } from "@/hooks/withdrawals"
 import { useIsAdmin } from "@/lib/auth"
 import { formatAmount, formatDate, humanize, networkLabel, shortHash } from "@/lib/format"
 import { NETWORKS } from "@/lib/networks"
+import { useProjectScope } from "@/lib/project-scope"
 import { WITHDRAWAL_STATUSES } from "@/lib/withdrawals"
 
 const PAGE_SIZE = 20
@@ -46,12 +48,15 @@ export function WithdrawalsPage() {
   const isAdmin = useIsAdmin()
   const [creating, setCreating] = useState(false)
   const pendingApprovals = usePendingApprovalCount()
+  // "All projects" includes the merchant-funds withdrawals.
+  const { scopeParam } = useProjectScope()
 
   const withdrawals = useWithdrawals({
     status: status === ALL ? undefined : status,
     network: network === ALL ? undefined : network,
     token: token === ALL ? undefined : token,
     api_key_id: apiKeyId,
+    project_id: scopeParam,
     limit: PAGE_SIZE,
     offset,
   })
@@ -175,6 +180,7 @@ export function WithdrawalsPage() {
               <TableHeader>
                 <TableRow>
                   <TableHead>Created</TableHead>
+                  <TableHead>Owner</TableHead>
                   <TableHead>Amount</TableHead>
                   <TableHead>Network</TableHead>
                   <TableHead>Destination</TableHead>
@@ -187,7 +193,7 @@ export function WithdrawalsPage() {
               <TableBody>
                 {withdrawals.data?.data.length === 0 && (
                   <TableRow>
-                    <TableCell colSpan={8} className="h-24 text-center text-muted-foreground">
+                    <TableCell colSpan={9} className="h-24 text-center text-muted-foreground">
                       No withdrawals found.
                     </TableCell>
                   </TableRow>
@@ -196,6 +202,9 @@ export function WithdrawalsPage() {
                   <TableRow key={withdrawal.id}>
                     <TableCell className="text-muted-foreground">
                       {formatDate(withdrawal.created_at)}
+                    </TableCell>
+                    <TableCell>
+                      <ProjectBadge projectId={withdrawal.project_id} merchantLabel="Merchant funds" />
                     </TableCell>
                     <TableCell className="tabular-nums">
                       <span className="font-medium">

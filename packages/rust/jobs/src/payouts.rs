@@ -22,6 +22,7 @@ pub fn legacy_payout_input(ln_address: &str, amount_sats: u64, comment: Option<S
         comment,
         metadata: json!({ "source": "lightning_payments_alias" }),
         id_is_idempotency_key: true,
+        owner: None,
     }
 }
 

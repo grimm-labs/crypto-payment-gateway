@@ -7,6 +7,7 @@ import { Toaster } from "@/components/ui/sonner"
 import { TooltipProvider } from "@/components/ui/tooltip"
 import { ApiError } from "@/lib/api"
 import { AuthProvider } from "@/lib/auth"
+import { ProjectScopeProvider } from "@/lib/project-scope"
 import App from "./App"
 import "./index.css"
 
@@ -27,9 +28,11 @@ createRoot(document.getElementById("root")!).render(
     <QueryClientProvider client={queryClient}>
       <BrowserRouter>
         <AuthProvider>
-          <TooltipProvider>
-            <App />
-          </TooltipProvider>
+          <ProjectScopeProvider>
+            <TooltipProvider>
+              <App />
+            </TooltipProvider>
+          </ProjectScopeProvider>
           <Toaster richColors position="top-right" />
         </AuthProvider>
       </BrowserRouter>

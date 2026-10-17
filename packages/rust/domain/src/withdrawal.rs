@@ -254,6 +254,9 @@ string_enum!(
         TreasuryCapExceeded => ("TREASURY_CAP_EXCEEDED", "treasury_cap_exceeded"),
         AddressBookEntryAdded => ("ADDRESS_BOOK_ENTRY_ADDED", "address_book_entry_added"),
         WithdrawalStuck => ("WITHDRAWAL_STUCK", "withdrawal_stuck"),
+        /// Project balances of an asset exceed the holdings (3 consecutive
+        /// checks).
+        LedgerShortfall => ("LEDGER_SHORTFALL", "ledger_shortfall"),
     }
 );
 

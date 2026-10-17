@@ -6,9 +6,10 @@ import { cn } from "@/lib/utils"
 const TABS = [
   { to: "/settings", label: "General", adminOnly: true },
   { to: "/settings/assets", label: "Assets", adminOnly: false },
+  { to: "/projects", label: "Projects", adminOnly: false },
 ]
 
-/** General (admin) | Assets (readable by every staff member). */
+/** General (admin) | Assets | Projects (readable by every staff member). */
 export function SettingsTabs() {
   const location = useLocation()
   const isAdmin = useIsAdmin()

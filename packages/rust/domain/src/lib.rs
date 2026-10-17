@@ -2,8 +2,10 @@ use rust_decimal::{Decimal, RoundingStrategy};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+mod project;
 mod withdrawal;
 
+pub use project::*;
 pub use withdrawal::*;
 
 pub const USDT_DECIMALS: u32 = 6;
@@ -329,6 +331,10 @@ pub enum WebhookEventType {
     TreasuryCapExceeded,
     AddressBookEntryAdded,
     WithdrawalStuck,
+    /// An internal transfer between two owners (both sides are notified).
+    TransferCompleted,
+    /// The project balances of an asset exceed what the gateway holds.
+    LedgerShortfall,
 }
 
 /// What a webhook delivery is about — decides which `webhook_deliveries`
@@ -345,10 +351,12 @@ pub enum WebhookSubject {
     Withdrawal,
     /// `alerts.id`.
     Alert,
+    /// `internal_transfers.id`.
+    Transfer,
 }
 
 impl WebhookEventType {
-    pub const ALL: [Self; 14] = [
+    pub const ALL: [Self; 16] = [
         Self::Pending,
         Self::Paid,
         Self::Expired,
@@ -363,6 +371,8 @@ impl WebhookEventType {
         Self::TreasuryCapExceeded,
         Self::AddressBookEntryAdded,
         Self::WithdrawalStuck,
+        Self::TransferCompleted,
+        Self::LedgerShortfall,
     ];
 
     pub fn as_db(&self) -> &'static str {
@@ -381,6 +391,8 @@ impl WebhookEventType {
             Self::TreasuryCapExceeded => "TREASURY_CAP_EXCEEDED",
             Self::AddressBookEntryAdded => "ADDRESS_BOOK_ENTRY_ADDED",
             Self::WithdrawalStuck => "WITHDRAWAL_STUCK",
+            Self::TransferCompleted => "TRANSFER_COMPLETED",
+            Self::LedgerShortfall => "LEDGER_SHORTFALL",
         }
     }
 
@@ -400,6 +412,8 @@ impl WebhookEventType {
             Self::TreasuryCapExceeded => "treasury_cap_exceeded",
             Self::AddressBookEntryAdded => "address_book_entry_added",
             Self::WithdrawalStuck => "withdrawal_stuck",
+            Self::TransferCompleted => "transfer_completed",
+            Self::LedgerShortfall => "ledger_shortfall",
         }
     }
 
@@ -427,7 +441,9 @@ impl WebhookEventType {
             Self::GasReserveLow
             | Self::TreasuryCapExceeded
             | Self::AddressBookEntryAdded
-            | Self::WithdrawalStuck => WebhookSubject::Alert,
+            | Self::WithdrawalStuck
+            | Self::LedgerShortfall => WebhookSubject::Alert,
+            Self::TransferCompleted => WebhookSubject::Transfer,
         }
     }
 
@@ -444,6 +460,7 @@ impl WebhookEventType {
             AlertType::TreasuryCapExceeded => Self::TreasuryCapExceeded,
             AlertType::AddressBookEntryAdded => Self::AddressBookEntryAdded,
             AlertType::WithdrawalStuck => Self::WithdrawalStuck,
+            AlertType::LedgerShortfall => Self::LedgerShortfall,
         }
     }
 
@@ -1324,7 +1341,7 @@ mod tests {
         );
         assert_eq!(WebhookEventType::PayoutFailed.payload_event_type(), "payout_failed");
         assert!(WebhookEventType::from_db("payout_failed").is_err());
-        assert_eq!(WebhookEventType::ALL.len(), 14);
+        assert_eq!(WebhookEventType::ALL.len(), 16);
     }
 
     #[test]
@@ -1343,6 +1360,8 @@ mod tests {
             (WebhookEventType::TreasuryCapExceeded, "TREASURY_CAP_EXCEEDED", "treasury_cap_exceeded"),
             (WebhookEventType::AddressBookEntryAdded, "ADDRESS_BOOK_ENTRY_ADDED", "address_book_entry_added"),
             (WebhookEventType::WithdrawalStuck, "WITHDRAWAL_STUCK", "withdrawal_stuck"),
+            (WebhookEventType::TransferCompleted, "TRANSFER_COMPLETED", "transfer_completed"),
+            (WebhookEventType::LedgerShortfall, "LEDGER_SHORTFALL", "ledger_shortfall"),
         ] {
             assert_eq!(event.as_db(), db);
             assert_eq!(event.as_api(), api);
@@ -1354,6 +1373,8 @@ mod tests {
         assert_eq!(WebhookEventType::PayoutFailed.subject(), WebhookSubject::LightningPayment);
         assert_eq!(WebhookEventType::WithdrawalBroadcast.subject(), WebhookSubject::Withdrawal);
         assert_eq!(WebhookEventType::WithdrawalStuck.subject(), WebhookSubject::Alert);
+        assert_eq!(WebhookEventType::LedgerShortfall.subject(), WebhookSubject::Alert);
+        assert_eq!(WebhookEventType::TransferCompleted.subject(), WebhookSubject::Transfer);
         for alert in AlertType::ALL {
             let event = WebhookEventType::for_alert(*alert);
             assert_eq!(event.subject(), WebhookSubject::Alert);

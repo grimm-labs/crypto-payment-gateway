@@ -26,6 +26,10 @@ pub struct CurrentStaff {
 #[derive(Debug, Clone)]
 pub struct CurrentApiKey {
     pub id: String,
+    /// The key's project: every merchant read and mutation is scoped to it.
+    /// `None` only for a legacy key before the first project exists, which
+    /// keeps the unscoped behaviour of before (spec §11, §13).
+    pub project_id: Option<String>,
     /// What the key may withdraw to (`None` = no withdrawals).
     pub withdrawal_policy: WithdrawalPolicy,
     pub withdrawal_tokens: Vec<Token>,
@@ -106,6 +110,7 @@ pub async fn require_api_key(
 
     let current = CurrentApiKey {
         id: row.id.clone(),
+        project_id: row.project_id.clone(),
         withdrawal_policy: row.withdrawal_policy(),
         withdrawal_tokens: row
             .withdrawal_tokens

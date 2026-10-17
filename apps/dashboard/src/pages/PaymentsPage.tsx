@@ -8,6 +8,7 @@ import { z } from "zod"
 
 import { CopyButton } from "@/components/shared/CopyButton"
 import { Pagination } from "@/components/shared/Pagination"
+import { ProjectBadge, ProjectDot } from "@/components/shared/ProjectBadge"
 import { QueryError } from "@/components/shared/QueryError"
 import { StatusBadge } from "@/components/shared/StatusBadge"
 import { Button } from "@/components/ui/button"
@@ -50,6 +51,7 @@ import {
   tokenDecimals,
 } from "@/lib/format"
 import { PAYMENT_TOKENS, isBtcNetwork } from "@/lib/networks"
+import { useProjectScope } from "@/lib/project-scope"
 import type { DepositAddress } from "@/lib/types"
 
 const PAGE_SIZE = 20
@@ -60,10 +62,12 @@ export function PaymentsPage() {
   const status = searchParams.get("status") ?? ALL
   const network = searchParams.get("network") ?? ALL
   const offset = Number(searchParams.get("offset") ?? 0)
+  const { scopeParam } = useProjectScope()
 
   const payments = usePayments({
     status: status === ALL ? undefined : status,
     network: network === ALL ? undefined : network,
+    project_id: scopeParam,
     limit: PAGE_SIZE,
     offset,
   })
@@ -127,6 +131,7 @@ export function PaymentsPage() {
               <TableHeader>
                 <TableRow>
                   <TableHead>Address</TableHead>
+                  <TableHead>Project</TableHead>
                   <TableHead>Network</TableHead>
                   <TableHead>Expected</TableHead>
                   <TableHead>Status</TableHead>
@@ -137,7 +142,7 @@ export function PaymentsPage() {
               <TableBody>
                 {payments.data?.data.length === 0 && (
                   <TableRow>
-                    <TableCell colSpan={6} className="h-24 text-center text-muted-foreground">
+                    <TableCell colSpan={7} className="h-24 text-center text-muted-foreground">
                       No payments found.
                     </TableCell>
                   </TableRow>
@@ -151,6 +156,9 @@ export function PaymentsPage() {
                       >
                         {shortHash(payment.address)}
                       </Link>
+                    </TableCell>
+                    <TableCell>
+                      <ProjectBadge projectId={payment.project_id} merchantLabel="No project" />
                     </TableCell>
                     <TableCell>
                       {networkLabel(payment.network)}
@@ -202,6 +210,7 @@ function isValidSats(value: string): boolean {
 
 const createSchema = z
   .object({
+    project_id: z.string().min(1, "Choose a project"),
     network: z.enum(["tron", "ethereum", "solana", "bitcoin", "lightning"]),
     // One of the network's payment tokens (USDT or ETH on ethereum).
     token: z.enum(["USDT", "BTC", "ETH"]),
@@ -276,10 +285,13 @@ function CreatePaymentDialog() {
   const [open, setOpen] = useState(() => searchParams.has("create"))
   const [created, setCreated] = useState<DepositAddress | null>(null)
   const createPayment = useCreatePayment()
+  // Pre-filled from the header selector; required.
+  const { projects, scopeParam } = useProjectScope()
   const form = useForm<CreateValues>({
     resolver: zodResolver(createSchema),
-    defaultValues: { network: "tron", token: "USDT", expected_amount: "" },
+    defaultValues: { project_id: scopeParam ?? "", network: "tron", token: "USDT", expected_amount: "" },
   })
+  const selectedProjectId = form.watch("project_id")
   const selectedNetwork = form.watch("network")
   const selectedToken = form.watch("token")
   const networkTokens = PAYMENT_TOKENS[selectedNetwork]
@@ -295,6 +307,7 @@ function CreatePaymentDialog() {
     try {
       const btc = isBtcNetwork(values.network)
       const payment = await createPayment.mutateAsync({
+        project_id: values.project_id,
         network: values.network,
         token: values.token,
         ...(btc
@@ -319,6 +332,7 @@ function CreatePaymentDialog() {
     if (!next) {
       setCreated(null)
       form.reset({
+        project_id: scopeParam ?? "",
         network: "tron",
         token: "USDT",
         expected_amount: "",
@@ -385,6 +399,27 @@ function CreatePaymentDialog() {
               </DialogDescription>
             </DialogHeader>
             <form onSubmit={form.handleSubmit(onSubmit)} className="space-y-4">
+              <div className="space-y-2">
+                <Label>Project</Label>
+                <Select
+                  value={selectedProjectId}
+                  onValueChange={(value) => form.setValue("project_id", value, { shouldValidate: true })}
+                >
+                  <SelectTrigger className="w-full">
+                    <SelectValue placeholder="Choose the project this payment belongs to" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {projects.map((project) => (
+                      <SelectItem key={project.id} value={project.id}>
+                        <ProjectDot color={project.color} /> {project.name}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+                {errors.project_id && (
+                  <p className="text-xs text-destructive">{errors.project_id.message}</p>
+                )}
+              </div>
               <div className="space-y-2">
                 <Label>Network</Label>
                 <Select

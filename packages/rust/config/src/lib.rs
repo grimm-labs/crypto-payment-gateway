@@ -122,6 +122,18 @@ pub const OUTBOUND_REBROADCAST_AFTER_SECS: i64 = 30;
 /// One alert per (type, network, token) per window while the condition
 /// holds.
 pub const ALERT_DEDUP_SECS: i64 = 24 * 60 * 60;
+
+// Projects (docs/projects-spec.md).
+/// How long a negative "does any project exist?" answer is trusted; a
+/// positive one is remembered for good (the last project is never deleted).
+pub const PROJECTS_EXIST_CACHE_SECS: u64 = 10;
+/// Consecutive shortfall checks of the treasury monitor before a
+/// `LEDGER_SHORTFALL` alert is raised.
+pub const LEDGER_SHORTFALL_CONSECUTIVE_CHECKS: i64 = 3;
+/// Dashboard cache of the project balances (`ledger:projects`), invalidated
+/// on every withdrawal status change and internal transfer. The admission
+/// check never reads it.
+pub const LEDGER_CACHE_SECS: u64 = 30;
 /// Largest native-ETH `expected_amount` accepted on a deposit address.
 pub const ETH_MAX_EXPECTED_AMOUNT: i64 = 100_000;
 /// Ethereum: unconfirmed transactions per sending address, and blocks a

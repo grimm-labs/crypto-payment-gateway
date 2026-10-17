@@ -19,6 +19,7 @@ mod asset_settings;
 mod audit;
 pub mod outbound;
 mod payouts;
+mod projects;
 mod settings;
 mod staff;
 mod sweeps;
@@ -40,6 +41,10 @@ pub use api_traffic::{
 };
 pub use audit::{AuditActor, AuditLogRow, NewAuditEntry};
 pub use payouts::PayoutRequestRow;
+pub use projects::{
+    CreatedProject, LegacyData, LegacyOutcome, NewProject, ProjectCounts, ProjectCreate,
+    ProjectDelete, ProjectListRow, ProjectRow, ProjectUpdate, UnassignedCounts,
+};
 pub use settings::{
     API_KEY_PREFIX_SETTING, API_TRAFFIC_RETENTION_FOREVER, API_TRAFFIC_RETENTION_SETTING,
     DEPOSIT_EXPIRY_SETTING, OUTFLOWS_FROZEN_SETTING, TOTP_ISSUER_SETTING,
@@ -61,9 +66,9 @@ pub struct Db {
 // TIMESTAMP(3) column into DateTime<Utc>, so every query that materializes a
 // row must cast enums to text and timestamps to timestamptz (stored values
 // are UTC instants) instead of using SELECT * / RETURNING *.
-const DEPOSIT_ADDRESS_COLUMNS: &str = r#"id, network::text AS network, token::text AS token, address, "derivationIndex", "expectedAmount", status::text AS status, "expiresAt" AT TIME ZONE 'UTC' AS "expiresAt", metadata, "apiKeyId", "createdAt" AT TIME ZONE 'UTC' AS "createdAt", "updatedAt" AT TIME ZONE 'UTC' AS "updatedAt""#;
+const DEPOSIT_ADDRESS_COLUMNS: &str = r#"id, network::text AS network, token::text AS token, address, "derivationIndex", "expectedAmount", status::text AS status, "expiresAt" AT TIME ZONE 'UTC' AS "expiresAt", metadata, "apiKeyId", "projectId", "btcReceivedRaw"::text AS "btcReceivedRaw", "createdAt" AT TIME ZONE 'UTC' AS "createdAt", "updatedAt" AT TIME ZONE 'UTC' AS "updatedAt""#;
 const DEPOSIT_COLUMNS: &str = r#"id, "depositAddressId", "txHash", amount, "amountRaw", confirmations, status::text AS status, "detectedAt" AT TIME ZONE 'UTC' AS "detectedAt", "confirmedAt" AT TIME ZONE 'UTC' AS "confirmedAt""#;
-const WEBHOOK_DELIVERY_COLUMNS: &str = r#"id, "depositId", "depositAddressId", "lightningPaymentId", "withdrawalId", "alertId", "eventType", "webhookEndpointId", status::text AS status, attempts, "lastResponse", "lastError", "createdAt" AT TIME ZONE 'UTC' AS "createdAt", "updatedAt" AT TIME ZONE 'UTC' AS "updatedAt""#;
+const WEBHOOK_DELIVERY_COLUMNS: &str = r#"id, "depositId", "depositAddressId", "lightningPaymentId", "withdrawalId", "alertId", "transferId", "eventType", "webhookEndpointId", status::text AS status, attempts, "lastResponse", "lastError", "createdAt" AT TIME ZONE 'UTC' AS "createdAt", "updatedAt" AT TIME ZONE 'UTC' AS "updatedAt""#;
 
 #[derive(Debug, Clone, FromRow)]
 pub struct DepositAddressRow {
@@ -83,10 +88,45 @@ pub struct DepositAddressRow {
     /// dashboard (or before this column existed).
     #[sqlx(rename = "apiKeyId")]
     pub api_key_id: Option<String>,
+    /// Owning project; NULL only on payments from before the first project.
+    #[sqlx(rename = "projectId")]
+    pub project_id: Option<String>,
+    /// Bitcoin: the total confirmed amount ever received, as last scanned
+    /// (only ever raised). NULL elsewhere.
+    #[sqlx(rename = "btcReceivedRaw")]
+    pub btc_received_raw: Option<RawAmount>,
     #[sqlx(rename = "createdAt")]
     pub created_at: DateTime<Utc>,
     #[sqlx(rename = "updatedAt")]
     pub updated_at: DateTime<Utc>,
+}
+
+/// Which owned rows a listing shows: every row, one project's, or the
+/// merchant's (`"projectId" IS NULL`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum OwnerFilter {
+    #[default]
+    Any,
+    Project(String),
+    Merchant,
+}
+
+impl OwnerFilter {
+    /// The two binds of [`OWNER_CONDITION`]: the project id to match, and
+    /// whether only merchant rows are wanted.
+    pub fn binds(&self) -> (Option<&str>, bool) {
+        match self {
+            Self::Any => (None, false),
+            Self::Project(id) => (Some(id.as_str()), false),
+            Self::Merchant => (None, true),
+        }
+    }
+}
+
+/// SQL of an [`OwnerFilter`] over a `"projectId"` column, with the binds of
+/// `OwnerFilter::binds` at `$project` / `$merchant` (callers format them).
+pub(crate) fn owner_condition(column: &str, project: &str, merchant: &str) -> String {
+    format!(r#"({project}::text IS NULL OR {column} = {project}) AND (NOT {merchant} OR {column} IS NULL)"#)
 }
 
 #[derive(Debug, Clone, FromRow)]
@@ -125,6 +165,9 @@ pub struct WebhookDeliveryRow {
     /// Set on alert deliveries only.
     #[sqlx(rename = "alertId")]
     pub alert_id: Option<String>,
+    /// Set on internal-transfer deliveries only.
+    #[sqlx(rename = "transferId")]
+    pub transfer_id: Option<String>,
     /// DB value of the `WebhookEventType` this delivery notifies.
     #[sqlx(rename = "eventType")]
     pub event_type: String,
@@ -215,15 +258,16 @@ impl Db {
         expires_at: DateTime<Utc>,
         metadata: Value,
         api_key_id: Option<&str>,
+        project_id: Option<&str>,
     ) -> Result<DepositAddressRow> {
         let id = Uuid::new_v4().to_string();
         let now = Utc::now();
         let row = sqlx::query_as::<_, DepositAddressRow>(&format!(
             r#"
             INSERT INTO deposit_addresses
-              (id, network, token, address, "derivationIndex", "expectedAmount", status, "expiresAt", metadata, "createdAt", "updatedAt", "apiKeyId")
+              (id, network, token, address, "derivationIndex", "expectedAmount", status, "expiresAt", metadata, "createdAt", "updatedAt", "apiKeyId", "projectId")
             VALUES
-              ($1, $2::"Network", $3::"Token", $4, $5, $6, 'PENDING'::"DepositAddressStatus", $7, $8, $9, $9, $10)
+              ($1, $2::"Network", $3::"Token", $4, $5, $6, 'PENDING'::"DepositAddressStatus", $7, $8, $9, $9, $10, $11)
             RETURNING {DEPOSIT_ADDRESS_COLUMNS}
             "#
         ))
@@ -237,6 +281,7 @@ impl Db {
         .bind(metadata)
         .bind(now)
         .bind(api_key_id)
+        .bind(project_id)
         .fetch_one(&self.pool)
         .await?;
         Ok(row)
@@ -253,41 +298,49 @@ impl Db {
         Ok(count)
     }
 
+    /// `owner`: the project's payments, the merchant's (legacy rows), or all.
     pub async fn list_deposit_addresses(
         &self,
         status: Option<DepositAddressStatus>,
         network: Option<Network>,
+        owner: &OwnerFilter,
         limit: i64,
         offset: i64,
     ) -> Result<(Vec<DepositAddressRow>, i64)> {
         let status_db = status.map(|s| s.as_db().to_string());
         let network_db = network.map(|n| n.as_db().to_string());
+        let (project_id, merchant_only) = owner.binds();
+        let condition = format!(
+            r#"($1::text IS NULL OR status = $1::"DepositAddressStatus")
+               AND ($2::text IS NULL OR network = $2::"Network")
+               AND {}"#,
+            owner_condition(r#""projectId""#, "$3", "$4")
+        );
 
         let rows = sqlx::query_as::<_, DepositAddressRow>(&format!(
             r#"
             SELECT {DEPOSIT_ADDRESS_COLUMNS} FROM deposit_addresses
-            WHERE ($1::text IS NULL OR status = $1::"DepositAddressStatus")
-              AND ($2::text IS NULL OR network = $2::"Network")
+            WHERE {condition}
             ORDER BY "createdAt" DESC
-            LIMIT $3 OFFSET $4
+            LIMIT $5 OFFSET $6
             "#
         ))
         .bind(status_db.as_deref())
         .bind(network_db.as_deref())
+        .bind(project_id)
+        .bind(merchant_only)
         .bind(limit)
         .bind(offset)
         .fetch_all(&self.pool)
         .await?;
 
-        let (total,): (i64,) = sqlx::query_as(
-            r#"
-            SELECT COUNT(*) FROM deposit_addresses
-            WHERE ($1::text IS NULL OR status = $1::"DepositAddressStatus")
-              AND ($2::text IS NULL OR network = $2::"Network")
-            "#,
-        )
+        let (total,): (i64,) = sqlx::query_as(&format!(
+            "SELECT COUNT(*) FROM deposit_addresses WHERE {condition}"
+        ))
         .bind(status_db.as_deref())
         .bind(network_db.as_deref())
+        .bind(project_id)
+        .bind(merchant_only)
         .fetch_one(&self.pool)
         .await?;
 
@@ -984,6 +1037,7 @@ fn subject_column(event: WebhookEventType) -> Result<&'static str> {
         WebhookSubject::LightningPayment => "lightningPaymentId",
         WebhookSubject::Withdrawal => "withdrawalId",
         WebhookSubject::Alert => "alertId",
+        WebhookSubject::Transfer => "transferId",
         WebhookSubject::Deposit => anyhow::bail!("PAID deliveries are keyed on their deposit"),
     })
 }

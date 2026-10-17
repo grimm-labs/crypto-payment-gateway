@@ -16,6 +16,9 @@ pub enum Requester {
     },
     ApiKey {
         id: String,
+        /// The key's project — `None` only for a legacy key before the
+        /// first project exists.
+        project_id: Option<String>,
         policy: WithdrawalPolicy,
         tokens: Vec<Token>,
         /// `None` = every network of the allowed tokens.
@@ -329,6 +332,7 @@ mod tests {
     fn key(policy: WithdrawalPolicy, tokens: &[Token], networks: Option<&[Network]>) -> Requester {
         Requester::ApiKey {
             id: "k1".into(),
+            project_id: Some("p1".into()),
             policy,
             tokens: tokens.to_vec(),
             networks: networks.map(<[Network]>::to_vec),

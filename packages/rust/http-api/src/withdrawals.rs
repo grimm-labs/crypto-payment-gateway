@@ -15,11 +15,11 @@ use config::{
 };
 use db::{
     AddressBookEntryRow, AssetSettingsRow, AssetSettingsUpdate, NewAddressBookEntry, OutboundTxRow,
-    SweepRow, WithdrawalFilter, WithdrawalRow,
+    OwnerFilter, SweepRow, WithdrawalFilter, WithdrawalRow,
 };
 use domain::{
     is_withdrawable, parse_amount_raw, parse_sats, raw_u128_to_string, AlertType, DestinationKind,
-    Network, StaffRole, SweepStatus, Token, WithdrawalStatus,
+    Network, Owner, StaffRole, SweepStatus, Token, WithdrawalStatus,
 };
 use jobs::freeze::FreezeError;
 use jobs::withdrawals::{
@@ -31,6 +31,7 @@ use serde_json::{json, Value};
 
 use crate::admin::{require_step_up, staff_actor};
 use crate::middleware::{ClientIp, CurrentApiKey, CurrentStaff};
+use crate::projects::{owner_filter_param, parse_owner_field, require_any_project};
 use crate::{actor, rate_limit, ApiError};
 
 impl From<WithdrawalError> for ApiError {
@@ -73,10 +74,24 @@ pub(crate) struct WithdrawalRequest {
     metadata: Option<Value>,
     /// Staff only: fresh TOTP code (create).
     totp_code: Option<String>,
+    /// Staff only: the owner debited — a project UUID or `"merchant"`
+    /// (spec §8.1). A merchant key's withdrawals belong to its project.
+    project_id: Option<String>,
 }
 
 /// Shape checks of a withdrawal request (everything that needs no I/O).
-pub(crate) fn validate_withdrawal_request(body: &WithdrawalRequest) -> Result<WithdrawalInput, ApiError> {
+/// `merchant`: the caller is a merchant key, whose body may not name an
+/// owner.
+pub(crate) fn validate_withdrawal_request(body: &WithdrawalRequest, merchant: bool) -> Result<WithdrawalInput, ApiError> {
+    let owner = match body.project_id.as_deref() {
+        Some(_) if merchant => {
+            return Err(ApiError::unprocessable(
+                "project_id is not accepted from a merchant key: its withdrawals belong to its project".into(),
+            ))
+        }
+        Some(value) => Some(parse_owner_field(value)?),
+        None => None,
+    };
     let network = Network::parse_api(&body.network).map_err(|_| ApiError::bad_request("Invalid network"))?;
     let token = Token::parse_api(&body.token).map_err(|_| ApiError::bad_request("Invalid token"))?;
     if !is_withdrawable(network, token) {
@@ -141,6 +156,7 @@ pub(crate) fn validate_withdrawal_request(body: &WithdrawalRequest) -> Result<Wi
         comment: comment.map(str::to_string),
         metadata,
         id_is_idempotency_key: false,
+        owner,
     })
 }
 
@@ -158,6 +174,7 @@ pub(crate) fn idempotency_key(headers: &HeaderMap) -> Result<String, ApiError> {
 pub(crate) fn key_requester(key: &CurrentApiKey) -> Requester {
     Requester::ApiKey {
         id: key.id.clone(),
+        project_id: key.project_id.clone(),
         policy: key.withdrawal_policy,
         tokens: key.withdrawal_tokens.clone(),
         networks: key.withdrawal_networks.clone(),
@@ -178,6 +195,8 @@ pub(crate) fn withdrawal_json(row: &WithdrawalRow) -> Result<Value, ApiError> {
     let fee_token = row.fee_token()?;
     Ok(json!({
         "id": row.id,
+        // The owner: a project, or null for the merchant funds.
+        "project_id": row.project_id,
         "status": row.status()?.as_api(),
         "network": row.network()?.as_api(),
         "token": token.as_api(),
@@ -270,7 +289,7 @@ pub(crate) async fn create_withdrawal(
     Json(body): Json<WithdrawalRequest>,
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
     let key = idempotency_key(&headers)?;
-    let input = validate_withdrawal_request(&body)?;
+    let input = validate_withdrawal_request(&body, api_key.is_some())?;
     rate_limit::hit(&state, rate_limit::WITHDRAWALS, &caller_id(api_key.as_deref(), staff.as_deref())).await?;
     let requester = match (api_key.as_deref(), staff.as_deref()) {
         (Some(key), _) => key_requester(key),
@@ -278,6 +297,7 @@ pub(crate) async fn create_withdrawal(
             if staff.role != StaffRole::Admin {
                 return Err(ApiError::forbidden("Admin role required"));
             }
+            require_any_project(&state).await?;
             require_step_up(&state, &staff.id, body.totp_code.as_deref()).await?;
             staff_requester(staff)
         }
@@ -296,7 +316,7 @@ pub(crate) async fn quote_withdrawal(
     staff: Option<Extension<CurrentStaff>>,
     Json(body): Json<WithdrawalRequest>,
 ) -> Result<Json<Value>, ApiError> {
-    let input = validate_withdrawal_request(&body)?;
+    let input = validate_withdrawal_request(&body, api_key.is_some())?;
     rate_limit::hit(&state, rate_limit::WITHDRAWALS, &caller_id(api_key.as_deref(), staff.as_deref())).await?;
     let requester = match (api_key.as_deref(), staff.as_deref()) {
         (Some(key), _) => key_requester(key),
@@ -313,6 +333,8 @@ pub(crate) struct WithdrawalListQuery {
     network: Option<String>,
     token: Option<String>,
     api_key_id: Option<String>,
+    /// Staff: `<uuid>` or `merchant`.
+    project_id: Option<String>,
     limit: Option<i64>,
     offset: Option<i64>,
 }
@@ -345,6 +367,10 @@ pub(crate) async fn list_withdrawals(
         api_key_id: match api_key.as_deref() {
             Some(key) => Some(key.id.clone()),
             None => query.api_key_id.clone().filter(|id| !id.is_empty()),
+        },
+        owner: match api_key.as_deref() {
+            Some(_) => OwnerFilter::Any,
+            None => owner_filter_param(query.project_id.as_deref())?,
         },
     };
     let limit = query.limit.unwrap_or(50).clamp(1, 100);
@@ -487,6 +513,8 @@ fn entry_json(entry: &AddressBookEntryRow) -> Value {
     let now = Utc::now();
     json!({
         "id": entry.id,
+        // The owner: a project, or null for a merchant entry.
+        "project_id": entry.project_id,
         "network": Network::from_db(&entry.network).map(|n| n.as_api()).unwrap_or("unknown"),
         "destination_kind": DestinationKind::from_db(&entry.destination_kind).map(|k| k.as_api()).unwrap_or("address"),
         "destination": entry.destination,
@@ -507,7 +535,13 @@ pub(crate) async fn merchant_address_book(
     if key.withdrawal_policy == domain::WithdrawalPolicy::None {
         return Err(ApiError::forbidden("This API key is not allowed to withdraw"));
     }
-    let entries = state.db.list_address_book_entries(None, true).await?;
+    // The key's project's entries (a legacy key without a project sees none
+    // of the project entries: only the merchant's, as before projects).
+    let owner = match &key.project_id {
+        Some(id) => OwnerFilter::Project(id.clone()),
+        None => OwnerFilter::Merchant,
+    };
+    let entries = state.db.list_address_book_entries(None, true, &owner).await?;
     Ok(Json(json!({
         "data": entries.iter().map(|e| json!({
             "id": e.id,
@@ -521,6 +555,8 @@ pub(crate) async fn merchant_address_book(
 #[derive(Debug, Deserialize)]
 pub(crate) struct AddressBookQuery {
     network: Option<String>,
+    /// `<uuid>` or `merchant`.
+    project_id: Option<String>,
 }
 
 pub(crate) async fn list_address_book(
@@ -533,7 +569,8 @@ pub(crate) async fn list_address_book(
         .map(Network::parse_api)
         .transpose()
         .map_err(|_| ApiError::bad_request("Invalid network"))?;
-    let entries = state.db.list_address_book_entries(network, false).await?;
+    let owner = owner_filter_param(query.project_id.as_deref())?;
+    let entries = state.db.list_address_book_entries(network, false, &owner).await?;
     Ok(Json(json!({ "data": entries.iter().map(entry_json).collect::<Vec<_>>() })))
 }
 
@@ -545,6 +582,8 @@ pub(crate) struct CreateEntryRequest {
     #[serde(default)]
     is_cold_storage: bool,
     totp_code: Option<String>,
+    /// The owner: a project UUID or `"merchant"` (required).
+    project_id: Option<String>,
 }
 
 /// New entries are usable after a 24 h cooling-off; adding one raises an
@@ -555,6 +594,17 @@ pub(crate) async fn create_address_book_entry(
     client_ip: ClientIp,
     Json(body): Json<CreateEntryRequest>,
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
+    require_any_project(&state).await?;
+    let owner = parse_owner_field(
+        body.project_id
+            .as_deref()
+            .ok_or_else(|| ApiError::unprocessable("project_id is required: a project UUID or \"merchant\"".into()))?,
+    )?;
+    if let Owner::Project(id) = &owner {
+        if state.db.find_project(id).await?.is_none() {
+            return Err(ApiError::unprocessable("Unknown project".into()));
+        }
+    }
     require_step_up(&state, &staff.id, body.totp_code.as_deref()).await?;
     let network = Network::parse_api(&body.network).map_err(|_| ApiError::bad_request("Invalid network"))?;
     let label = body.label.trim();
@@ -593,15 +643,16 @@ pub(crate) async fn create_address_book_entry(
             is_cold_storage: body.is_cold_storage,
             created_by_id: &staff.id,
             active_at: Utc::now() + chrono::Duration::seconds(ADDRESS_BOOK_COOLING_OFF_SECS),
+            owner: owner.clone(),
         })
         .await?
-        .ok_or_else(|| ApiError::conflict("This destination is already in the address book"))?;
+        .ok_or_else(|| ApiError::conflict("This destination is already in the address book of this owner"))?;
     jobs::audit::record(
         &state,
         &staff_actor(&staff, &client_ip),
         "address_book.created",
         Some(("address_book_entry", &entry.id)),
-        json!({ "network": network.as_api(), "destination": destination, "label": label, "is_cold_storage": body.is_cold_storage }),
+        json!({ "network": network.as_api(), "destination": destination, "label": label, "is_cold_storage": body.is_cold_storage, "project_id": entry.project_id }),
     )
     .await;
     if let Err(err) = jobs::alerts::raise(
@@ -1178,6 +1229,33 @@ mod tests {
 
     fn request(body: Value) -> WithdrawalRequest {
         serde_json::from_value(body).expect("valid shape")
+    }
+
+    /// Staff caller (a merchant key may not name an owner, see below).
+    fn validate_withdrawal_request(body: &WithdrawalRequest) -> Result<WithdrawalInput, ApiError> {
+        super::validate_withdrawal_request(body, false)
+    }
+
+    #[test]
+    fn owners_come_from_staff_bodies_only() {
+        let body = request(json!({
+            "network": "tron", "token": "USDT", "amount": "1", "destination": "T",
+            "project_id": "6f1c7a8e-2f43-4d55-9a8b-1c2d3e4f5a6b"
+        }));
+        assert_eq!(
+            validate_withdrawal_request(&body).unwrap().owner,
+            Some(Owner::Project("6f1c7a8e-2f43-4d55-9a8b-1c2d3e4f5a6b".into()))
+        );
+        let merchant = request(json!({
+            "network": "tron", "token": "USDT", "amount": "1", "destination": "T", "project_id": "merchant"
+        }));
+        assert_eq!(validate_withdrawal_request(&merchant).unwrap().owner, Some(Owner::Merchant));
+        // A merchant key's withdrawals belong to its project: no choice.
+        assert_eq!(super::validate_withdrawal_request(&body, true).unwrap_err().status, StatusCode::UNPROCESSABLE_ENTITY);
+        let none = request(json!({ "network": "tron", "token": "USDT", "amount": "1", "destination": "T" }));
+        assert_eq!(super::validate_withdrawal_request(&none, true).unwrap().owner, None);
+        let bad = request(json!({ "network": "tron", "token": "USDT", "amount": "1", "destination": "T", "project_id": "shop" }));
+        assert_eq!(validate_withdrawal_request(&bad).unwrap_err().status, StatusCode::UNPROCESSABLE_ENTITY);
     }
 
     #[test]

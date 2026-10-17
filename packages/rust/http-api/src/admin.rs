@@ -7,7 +7,8 @@ use axum::{Extension, Json, Router};
 use config::{PASSWORD_MAX_LEN, PASSWORD_MIN_LEN};
 use db::{ApiRequestFilter, ApiRequestRow, AuditActor, StaffUpdate, StaffUserRow};
 use domain::{
-    ApiSurface, StaffRole, StatusClass, TrafficWindow, WebhookDeliveryStatus, WebhookEventType,
+    allowed_events, is_event_allowed, ApiSurface, Owner, OwnerKind, StaffRole, StatusClass,
+    TrafficWindow, WebhookDeliveryStatus, WebhookEventType,
 };
 use jobs::{retrigger_delivery, retrigger_failed_webhooks, Actor, AppState, RetriggerError};
 use redis::AsyncCommands;
@@ -15,6 +16,10 @@ use serde::{Deserialize, Deserializer};
 use serde_json::{json, Value};
 
 use crate::middleware::{require_admin, require_jwt, ClientIp, CurrentStaff};
+use crate::projects::{
+    self as p, owner_filter_param, parse_owner_field, parse_project_id_field, require_any_project,
+    OwnerListQuery,
+};
 use crate::session::{self, set_cookie_header};
 use crate::withdrawals as w;
 use crate::{
@@ -42,6 +47,9 @@ pub fn admin_router(state: &AppState) -> Router<AppState> {
         .route("/staff/{id}/totp/reset", post(reset_staff_totp))
         .route("/api-keys", get(list_api_keys).post(create_api_key))
         .route("/api-keys/{id}", delete(revoke_api_key).patch(update_api_key))
+        // Projects: ADMIN manages them (no TOTP, audited — spec Q19).
+        .route("/projects", post(p::create_project))
+        .route("/projects/{id}", patch(p::update_project).delete(p::delete_project))
         .route("/settings", get(get_settings).patch(update_settings))
         .route(
             "/webhook-endpoints",
@@ -91,6 +99,7 @@ pub fn admin_router(state: &AppState) -> Router<AppState> {
         .route("/auth/totp/enable", post(totp_enable))
         .route("/auth/totp/disable", post(totp_disable))
         .route("/webhooks", get(list_webhooks))
+        .route("/projects", get(p::list_projects))
         .route("/stats", get(stats))
         .route("/stats/deposits-timeseries", get(deposits_timeseries))
         .route("/traffic/overview", get(traffic_overview))
@@ -874,13 +883,19 @@ fn api_key_display_status(status: &str, expires_at: Option<chrono::DateTime<chro
     }
 }
 
-async fn list_api_keys(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
-    let rows = state.db.list_api_keys().await?;
+async fn list_api_keys(
+    State(state): State<AppState>,
+    Query(query): Query<OwnerListQuery>,
+) -> Result<Json<Value>, ApiError> {
+    let owner = owner_filter_param(query.project_id.as_deref())?;
+    let rows = state.db.list_api_keys(&owner).await?;
     let data = rows
         .iter()
         .map(|k| {
             json!({
                 "id": k.id,
+                // The owning project; null only on a legacy key.
+                "project_id": k.project_id,
                 "name": k.name,
                 "prefix": k.prefix,
                 "status": api_key_display_status(&k.status, k.expires_at),
@@ -934,6 +949,9 @@ struct CreateApiKeyRequest {
     /// (a key that may withdraw must expire). New keys cannot withdraw: the
     /// grant is set afterwards (`PATCH /api-keys/{id}`, TOTP).
     expires_in_days: Option<i64>,
+    /// The owning project (required). The key is generated with the
+    /// project's tag, or the global one.
+    project_id: Option<String>,
 }
 
 /// Longest API key name.
@@ -961,7 +979,16 @@ async fn create_api_key(
         }
     };
 
-    let tag = state.db.api_key_prefix().await?;
+    require_any_project(&state).await?;
+    let project_id = parse_project_id_field(body.project_id.as_deref())?;
+    let Some(project) = state.db.find_project(&project_id).await? else {
+        return Err(ApiError::unprocessable("Unknown project".into()));
+    };
+    // The project's tag, falling back to the global one (spec §6.1).
+    let tag = match project.key_tag {
+        Some(tag) => Some(tag),
+        None => state.db.api_key_prefix().await?,
+    };
     let material = auth::generate_api_key(tag.as_deref());
     let row = state
         .db
@@ -971,6 +998,7 @@ async fn create_api_key(
             &material.sha256_hex,
             &current.id,
             expires_at,
+            &project.id,
         )
         .await?;
 
@@ -982,6 +1010,7 @@ async fn create_api_key(
         json!({
             "name": row.name,
             "prefix": row.prefix,
+            "project_id": row.project_id,
             "expires_at": row.expires_at.map(|t| t.to_rfc3339()),
         }),
     )
@@ -992,6 +1021,7 @@ async fn create_api_key(
         StatusCode::CREATED,
         Json(json!({
             "id": row.id,
+            "project_id": row.project_id,
             "name": row.name,
             "prefix": row.prefix,
             "key": material.full_key,
@@ -1540,13 +1570,19 @@ async fn validate_webhook_url(state: &AppState, url: &str) -> Result<String, Api
     Ok(url.to_string())
 }
 
-async fn list_webhook_endpoints(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
-    let rows = state.db.list_webhook_endpoints().await?;
+async fn list_webhook_endpoints(
+    State(state): State<AppState>,
+    Query(query): Query<OwnerListQuery>,
+) -> Result<Json<Value>, ApiError> {
+    let owner = owner_filter_param(query.project_id.as_deref())?;
+    let rows = state.db.list_webhook_endpoints(&owner).await?;
     let data = rows
         .iter()
         .map(|e| {
             json!({
                 "id": e.id,
+                // The owner: a project, or null for a merchant endpoint.
+                "project_id": e.project_id,
                 "url": e.url,
                 "is_active": e.is_active,
                 "events": events_to_api(&e.events),
@@ -1567,6 +1603,23 @@ struct CreateWebhookEndpointRequest {
     events: Option<Vec<String>>,
     /// Signing secret for X-Webhook-Signature(-V2) — required, write-only.
     secret: Option<String>,
+    /// The owner, fixed for good: a project UUID or `"merchant"` (the
+    /// instance events). Required.
+    project_id: Option<String>,
+}
+
+/// The events an endpoint of `owner` may subscribe to (spec §10.2): `422`
+/// naming the allowed ones otherwise.
+fn check_events_for_owner(owner: OwnerKind, events: &[WebhookEventType]) -> Result<(), ApiError> {
+    if let Some(refused) = events.iter().find(|e| !is_event_allowed(owner, **e)) {
+        return Err(ApiError::unprocessable(format!(
+            "A {} endpoint cannot subscribe to {}: allowed events are {}",
+            owner.as_api(),
+            refused.as_api(),
+            allowed_events(owner).iter().map(|e| e.as_api()).collect::<Vec<_>>().join(", ")
+        )));
+    }
+    Ok(())
 }
 
 async fn create_webhook_endpoint(
@@ -1575,36 +1628,56 @@ async fn create_webhook_endpoint(
     client_ip: ClientIp,
     Json(body): Json<CreateWebhookEndpointRequest>,
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
+    require_any_project(&state).await?;
+    let owner = parse_owner_field(
+        body.project_id
+            .as_deref()
+            .ok_or_else(|| ApiError::unprocessable("project_id is required: a project UUID or \"merchant\"".into()))?,
+    )?;
+    if let Owner::Project(id) = &owner {
+        if state.db.find_project(id).await?.is_none() {
+            return Err(ApiError::unprocessable("Unknown project".into()));
+        }
+    }
     let events = match body.events.as_deref() {
         Some(events) => parse_events(events)?,
         None => vec![WebhookEventType::Paid],
     };
+    check_events_for_owner(owner.kind(), &events)?;
     let secret = validate_webhook_secret(body.secret.as_deref().unwrap_or_default())?;
     let url = validate_webhook_url(&state, &body.url).await?;
     let secret = Some(secret);
 
-    if state.db.find_webhook_endpoint_by_url(&url).await?.is_some() {
+    // URLs are unique per owner (the same receiver may serve a project and
+    // the merchant).
+    if state.db.find_webhook_endpoint_by_url(&owner, &url).await?.is_some() {
         return Err(ApiError::conflict(
-            "A webhook endpoint with this URL already exists",
+            "This owner already has a webhook endpoint with this URL",
         ));
     }
 
-    let row = state
+    let Some(row) = state
         .db
-        .create_webhook_endpoint(&url, &events, secret.as_deref(), &current.id)
-        .await?;
+        .create_webhook_endpoint(&url, &events, secret.as_deref(), &current.id, &owner)
+        .await?
+    else {
+        return Err(ApiError::conflict(
+            "This owner already has a webhook endpoint with this URL",
+        ));
+    };
     jobs::audit::record(
         &state,
         &staff_actor(&current, &client_ip),
         "webhook_endpoint.created",
         Some(("webhook_endpoint", &row.id)),
-        json!({ "url": row.url, "events": events_to_api(&row.events) }),
+        json!({ "url": row.url, "events": events_to_api(&row.events), "project_id": row.project_id }),
     )
     .await;
     Ok((
         StatusCode::CREATED,
         Json(json!({
             "id": row.id,
+            "project_id": row.project_id,
             "url": row.url,
             "is_active": row.is_active,
             "events": events_to_api(&row.events),
@@ -1621,6 +1694,9 @@ struct UpdateWebhookEndpointRequest {
     events: Option<Vec<String>>,
     /// Present = rotate (signing can no longer be removed).
     secret: Option<String>,
+    /// Refused: the owner is fixed at creation (any value, even null).
+    #[serde(default, deserialize_with = "deserialize_some")]
+    project_id: Option<Option<Value>>,
 }
 
 async fn update_webhook_endpoint(
@@ -1630,11 +1706,22 @@ async fn update_webhook_endpoint(
     Path(id): Path<String>,
     Json(body): Json<UpdateWebhookEndpointRequest>,
 ) -> Result<Json<Value>, ApiError> {
+    if body.project_id.is_some() {
+        return Err(ApiError::unprocessable(
+            "The owner of a webhook endpoint cannot be changed — create another endpoint".into(),
+        ));
+    }
     if body.is_active.is_none() && body.events.is_none() && body.secret.is_none() {
         return Err(ApiError::bad_request("Nothing to update"));
     }
+    let Some(existing) = state.db.find_webhook_endpoint(&id).await? else {
+        return Err(ApiError::not_found(format!("Webhook endpoint not found: {id}")));
+    };
     // Validate everything before writing anything.
     let events = body.events.as_deref().map(parse_events).transpose()?;
+    if let Some(events) = events.as_deref() {
+        check_events_for_owner(existing.owner().kind(), events)?;
+    }
     let secret = body.secret.as_deref().map(validate_webhook_secret).transpose()?;
 
     let mut row = None;
@@ -1679,6 +1766,7 @@ async fn update_webhook_endpoint(
     .await;
     Ok(Json(json!({
         "id": row.id,
+        "project_id": row.project_id,
         "url": row.url,
         "is_active": row.is_active,
         "events": events_to_api(&row.events),
@@ -1752,6 +1840,10 @@ async fn list_webhooks(
                 // NULL on deliveries from before per-endpoint tracking.
                 "webhook_endpoint_id": w.webhook_endpoint_id,
                 "endpoint_url": w.endpoint_url,
+                // The target endpoint's owner (null = merchant, or legacy).
+                "project_id": w.project_id,
+                // Internal-transfer deliveries only.
+                "transfer_id": w.transfer_id,
                 "tx_hash": w.tx_hash,
                 "address": w.address,
                 "network": match (&w.network, &w.lightning_payment_id) {

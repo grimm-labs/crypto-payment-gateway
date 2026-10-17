@@ -10,8 +10,8 @@ use chrono::Utc;
 use config::{WITHDRAWAL_APPROVAL_EXPIRY_SECS, WITHDRAWAL_SELF_APPROVAL_DELAY_SECS};
 use db::{NewWithdrawal, WithdrawalRow, WithdrawalUpdate};
 use domain::{
-    format_amount, raw_u128_to_string, CancelReason, DestinationKind, Network, Token, WebhookEventType,
-    WithdrawalPolicy, WithdrawalStatus,
+    format_amount, raw_u128_to_string, CancelReason, DestinationKind, Network, Owner, Token,
+    WebhookEventType, WithdrawalPolicy, WithdrawalStatus,
 };
 use serde_json::{json, Value};
 use tracing::{error, info, warn};
@@ -42,6 +42,19 @@ pub struct WithdrawalInput {
     /// a request racing between an old and a new container during a deploy
     /// reaches the wallet with one key, never two.
     pub id_is_idempotency_key: bool,
+    /// Staff only: the owner the withdrawal is debited from (a project, or
+    /// the merchant funds). A key's withdrawals always belong to its
+    /// project; `None` for a staff member means the merchant funds.
+    pub owner: Option<Owner>,
+}
+
+/// The owner of a withdrawal `requester` makes (spec §8.1): a key's project,
+/// or the admin's explicit choice.
+pub fn withdrawal_owner(requester: &Requester, input: &WithdrawalInput) -> Owner {
+    match requester {
+        Requester::ApiKey { project_id, .. } => Owner::from_project_id(project_id.as_deref()),
+        Requester::Staff { .. } => input.owner.clone().unwrap_or(Owner::Merchant),
+    }
 }
 
 #[derive(Debug)]
@@ -252,6 +265,7 @@ fn ensure_network_enabled(state: &AppState, network: Network) -> Result<(), With
 
 /// Everything admission checks before taking the locks.
 struct Prepared {
+    owner: Owner,
     resolved: ResolvedDestination,
     approval_required: bool,
     fee_estimate: u128,
@@ -263,9 +277,24 @@ async fn prepare(
     requester: &Requester,
     input: &WithdrawalInput,
 ) -> Result<(Prepared, Option<RuleError>), WithdrawalError> {
+    // The owner first (pure checks): gas assets are always merchant funds
+    // (projects never hold TRX/SOL), and a named project must exist.
+    let owner = withdrawal_owner(requester, input);
+    if input.token.is_gas_only() && owner != Owner::Merchant {
+        return Err(RuleError::Refused {
+            code: "gas_asset_merchant_only",
+            message: format!("{} withdrawals always draw on the merchant funds", input.token.as_api()),
+        }
+        .into());
+    }
+    if let Owner::Project(id) = &owner {
+        if state.db.find_project(id).await?.is_none() {
+            return Err(WithdrawalError::BadRequest("Unknown project".into()));
+        }
+    }
     ensure_network_enabled(state, input.network)?;
     rules::authorize(requester, input.network, input.token)?;
-    let resolved = resolve::resolve_destination(state, input.network, input.token, input.amount_raw, &input.destination).await?;
+    let resolved = resolve::resolve_destination(state, &owner, input.network, input.token, input.amount_raw, &input.destination).await?;
     let settings = state.db.asset_settings(input.token).await?;
     let approval_required = rules::approval_required(input.amount_raw, settings.approval_threshold_raw.0);
     let refusal = rules::check_destination_rule(requester, approval_required, resolved.uses_book_entry(), resolved.kind).err();
@@ -280,6 +309,7 @@ async fn prepare(
     .await?;
     Ok((
         Prepared {
+            owner,
             resolved,
             approval_required,
             fee_estimate,
@@ -441,6 +471,7 @@ pub async fn create_withdrawal(
             idempotency_key,
             api_key_id: requester.api_key_id(),
             staff_id: requester.staff_id(),
+            owner: prepared.owner.clone(),
             params_hash: &params_hash,
             network: input.network,
             token: input.token,
@@ -486,6 +517,7 @@ pub async fn create_withdrawal(
             "network": input.network.as_api(),
             "token": input.token.as_api(),
             "amount_raw": input.amount_raw.to_string(),
+            "project_id": row.project_id,
             "destination": row.destination,
             "address_book_entry_id": row.address_book_entry_id,
             "status": status.as_api(),
@@ -769,6 +801,7 @@ pub async fn recheck_before_signing(state: &AppState, row: &WithdrawalRow) -> an
             }
             Requester::ApiKey {
                 id: key.id.clone(),
+                project_id: key.project_id.clone(),
                 policy: key.withdrawal_policy(),
                 tokens: key.withdrawal_tokens.iter().filter_map(|t| Token::from_db(t).ok()).collect(),
                 networks: key
@@ -822,6 +855,7 @@ pub fn withdrawal_payload(event: WebhookEventType, row: &WithdrawalRow) -> anyho
         "event_type": event.payload_event_type(),
         "data": {
             "withdrawal_id": row.id,
+            "project_id": row.project_id,
             "status": row.status()?.as_api(),
             "network": row.network()?.as_api(),
             "token": token.as_api(),

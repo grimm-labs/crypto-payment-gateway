@@ -4,13 +4,13 @@
 
 use anyhow::Result;
 use chrono::{DateTime, Utc};
-use domain::{DestinationKind, Network};
+use domain::{DestinationKind, Network, Owner};
 use sqlx::FromRow;
 use uuid::Uuid;
 
-use crate::Db;
+use crate::{owner_condition, Db, OwnerFilter};
 
-const ENTRY_COLUMNS: &str = r#"e.id, e.network::text AS network, e."destinationKind"::text AS "destinationKind", e.destination, e.label, e."isColdStorage", e."createdById", s."firstName" || ' ' || s."lastName" AS "createdByName", e."createdAt" AT TIME ZONE 'UTC' AS "createdAt", e."activeAt" AT TIME ZONE 'UTC' AS "activeAt", e."deletedAt" AT TIME ZONE 'UTC' AS "deletedAt", e."deletedById""#;
+const ENTRY_COLUMNS: &str = r#"e.id, e.network::text AS network, e."destinationKind"::text AS "destinationKind", e.destination, e.label, e."isColdStorage", e."createdById", s."firstName" || ' ' || s."lastName" AS "createdByName", e."projectId", e."createdAt" AT TIME ZONE 'UTC' AS "createdAt", e."activeAt" AT TIME ZONE 'UTC' AS "activeAt", e."deletedAt" AT TIME ZONE 'UTC' AS "deletedAt", e."deletedById""#;
 
 #[derive(Debug, Clone, FromRow)]
 pub struct AddressBookEntryRow {
@@ -26,6 +26,9 @@ pub struct AddressBookEntryRow {
     pub created_by_id: String,
     #[sqlx(rename = "createdByName")]
     pub created_by_name: Option<String>,
+    /// Owning project; NULL = a merchant entry.
+    #[sqlx(rename = "projectId")]
+    pub project_id: Option<String>,
     #[sqlx(rename = "createdAt")]
     pub created_at: DateTime<Utc>,
     #[sqlx(rename = "activeAt")]
@@ -49,6 +52,10 @@ impl AddressBookEntryRow {
     pub fn is_active(&self, now: DateTime<Utc>) -> bool {
         self.deleted_at.is_none() && self.active_at <= now
     }
+
+    pub fn owner(&self) -> Owner {
+        Owner::from_project_id(self.project_id.as_deref())
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -60,10 +67,13 @@ pub struct NewAddressBookEntry<'a> {
     pub is_cold_storage: bool,
     pub created_by_id: &'a str,
     pub active_at: DateTime<Utc>,
+    /// The owner (a project, or the merchant).
+    pub owner: Owner,
 }
 
 impl Db {
-    /// `None` when the destination already has a live entry on that network.
+    /// `None` when the owner already has a live entry for the destination
+    /// on that network.
     pub async fn create_address_book_entry(
         &self,
         new: &NewAddressBookEntry<'_>,
@@ -72,8 +82,8 @@ impl Db {
         let inserted: Option<(String,)> = sqlx::query_as(
             r#"
             INSERT INTO address_book_entries
-              (id, network, "destinationKind", destination, label, "isColdStorage", "createdById", "createdAt", "activeAt")
-            VALUES ($1, $2::"Network", $3::"DestinationKind", $4, $5, $6, $7, NOW(), $8)
+              (id, network, "destinationKind", destination, label, "isColdStorage", "createdById", "createdAt", "activeAt", "projectId")
+            VALUES ($1, $2::"Network", $3::"DestinationKind", $4, $5, $6, $7, NOW(), $8, $9)
             ON CONFLICT DO NOTHING
             RETURNING id
             "#,
@@ -86,6 +96,7 @@ impl Db {
         .bind(new.is_cold_storage)
         .bind(new.created_by_id)
         .bind(new.active_at)
+        .bind(new.owner.project_id())
         .fetch_optional(&self.pool)
         .await?;
         match inserted {
@@ -105,41 +116,50 @@ impl Db {
         Ok(row)
     }
 
-    /// Live entries (not deleted), newest first; `active_only` also hides
-    /// the ones still in their cooling-off delay.
+    /// Live entries (not deleted) of `owner`, newest first; `active_only`
+    /// also hides the ones still in their cooling-off delay.
     pub async fn list_address_book_entries(
         &self,
         network: Option<Network>,
         active_only: bool,
+        owner: &OwnerFilter,
     ) -> Result<Vec<AddressBookEntryRow>> {
+        let (project_id, merchant_only) = owner.binds();
         let rows = sqlx::query_as::<_, AddressBookEntryRow>(&format!(
             r#"SELECT {ENTRY_COLUMNS} FROM address_book_entries e
                LEFT JOIN staff_users s ON s.id = e."createdById"
                WHERE e."deletedAt" IS NULL
                  AND ($1::text IS NULL OR e.network = $1::"Network")
                  AND (NOT $2 OR e."activeAt" <= (NOW() AT TIME ZONE 'UTC'))
-               ORDER BY e."createdAt" DESC"#
+                 AND {}
+               ORDER BY e."createdAt" DESC"#,
+            owner_condition(r#"e."projectId""#, "$3", "$4")
         ))
         .bind(network.map(|n| n.as_db()))
         .bind(active_only)
+        .bind(project_id)
+        .bind(merchant_only)
         .fetch_all(&self.pool)
         .await?;
         Ok(rows)
     }
 
-    /// The live entry for a normalized destination, if any.
+    /// The owner's live entry for a normalized destination, if any.
     pub async fn find_address_book_entry_by_destination(
         &self,
+        owner: &Owner,
         network: Network,
         destination: &str,
     ) -> Result<Option<AddressBookEntryRow>> {
         let row = sqlx::query_as::<_, AddressBookEntryRow>(&format!(
             r#"SELECT {ENTRY_COLUMNS} FROM address_book_entries e
                LEFT JOIN staff_users s ON s.id = e."createdById"
-               WHERE e."deletedAt" IS NULL AND e.network = $1::"Network" AND e.destination = $2"#
+               WHERE e."deletedAt" IS NULL AND e.network = $1::"Network" AND e.destination = $2
+                 AND e."projectId" IS NOT DISTINCT FROM $3"#
         ))
         .bind(network.as_db())
         .bind(destination)
+        .bind(owner.project_id())
         .fetch_optional(&self.pool)
         .await?;
         Ok(row)
