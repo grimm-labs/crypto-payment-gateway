@@ -7,6 +7,7 @@ import { AlertsCard } from "@/components/treasury/AlertsCard"
 import { BalancesTable } from "@/components/treasury/BalancesTable"
 import { GasReserves } from "@/components/treasury/GasReserves"
 import { HotWalletCaps } from "@/components/treasury/HotWalletCaps"
+import { LedgerCard } from "@/components/treasury/LedgerCard"
 import { SweepsCard } from "@/components/treasury/SweepsCard"
 import { Button } from "@/components/ui/button"
 import { Card, CardContent } from "@/components/ui/card"
@@ -65,6 +66,8 @@ export function TreasuryPage() {
           </div>
         </>
       )}
+
+      <LedgerCard />
 
       <SweepsCard frozen={frozen} />
       <AlertsCard />

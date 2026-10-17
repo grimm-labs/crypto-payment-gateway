@@ -13,12 +13,14 @@ import {
 } from "@/components/ui/card"
 import { useAddressBook } from "@/hooks/withdrawals"
 import { useIsAdmin } from "@/lib/auth"
+import { MERCHANT_OWNER } from "@/lib/types"
 import { formatRaw, networkLabel } from "@/lib/format"
 import type { TreasuryRow } from "@/lib/types"
 import { capExcessRaw } from "@/lib/withdrawals"
 
-/** Hot-wallet cap per asset, with a guided withdrawal of the excess to the
- *  first active cold-storage address-book entry of the network. */
+/** Hot-wallet cap per asset, with a guided withdrawal of the excess to a
+ *  cold-storage address-book entry (spec §8.6): the admin picks the owner
+ *  debited in the dialog, which lists that owner's cold-storage entries. */
 export function HotWalletCaps({ rows }: { rows: TreasuryRow[] }) {
   const isAdmin = useIsAdmin()
   const book = useAddressBook()
@@ -26,10 +28,15 @@ export function HotWalletCaps({ rows }: { rows: TreasuryRow[] }) {
   const [open, setOpen] = useState(false)
   const capped = rows.filter((row) => row.hot_wallet_cap_raw !== null)
 
-  function coldStorageEntry(network: string) {
-    return book.data?.data.find(
-      (entry) => entry.network === network && entry.is_cold_storage && entry.active,
-    )
+  /** Owners with an active cold-storage entry on the network. */
+  function coldStorageOwners(network: string): string[] {
+    const owners = new Set<string>()
+    for (const entry of book.data?.data ?? []) {
+      if (entry.network === network && entry.is_cold_storage && entry.active) {
+        owners.add(entry.project_id ?? MERCHANT_OWNER)
+      }
+    }
+    return [...owners]
   }
 
   return (
@@ -38,8 +45,10 @@ export function HotWalletCaps({ rows }: { rows: TreasuryRow[] }) {
         <CardTitle>Hot-wallet caps</CardTitle>
         <CardDescription>
           Above its cap, a treasury raises an alert. “Send excess to cold storage”
-          prepares a normal withdrawal of the excess (TOTP, approval above the
-          threshold) — nothing moves automatically.
+          prepares a normal withdrawal of the excess, debited from the owner you
+          choose, to one of that owner&apos;s cold-storage entries (TOTP, approval
+          above the threshold) — nothing moves automatically. When no single project
+          covers the excess, send several withdrawals.
         </CardDescription>
       </CardHeader>
       <CardContent>
@@ -51,7 +60,7 @@ export function HotWalletCaps({ rows }: { rows: TreasuryRow[] }) {
           <div className="divide-y rounded-lg border">
             {capped.map((row) => {
               const excess = capExcessRaw(row)
-              const entry = coldStorageEntry(row.network)
+              const owners = coldStorageOwners(row.network)
               return (
                 <div
                   key={`${row.network}-${row.token}`}
@@ -79,10 +88,11 @@ export function HotWalletCaps({ rows }: { rows: TreasuryRow[] }) {
                         </>
                       )}
                     </p>
-                    {excess !== null && !entry && (
+                    {excess !== null && owners.length === 0 && (
                       <p className="text-xs text-amber-700 dark:text-amber-400">
-                        No active cold-storage entry on {networkLabel(row.network)} — add one
-                        in the Address book.
+                        No active cold-storage entry on {networkLabel(row.network)} — each
+                        project (and the merchant) that uses cold storage needs its own, in
+                        the Address book.
                       </p>
                     )}
                   </div>
@@ -90,13 +100,15 @@ export function HotWalletCaps({ rows }: { rows: TreasuryRow[] }) {
                     <Button
                       size="sm"
                       variant="outline"
-                      disabled={!entry}
+                      disabled={owners.length === 0}
                       onClick={() => {
                         setPreset({
                           network: row.network,
                           token: row.token,
                           amountRaw: excess.toString(),
-                          addressBookEntryId: entry?.id,
+                          coldStorageOnly: true,
+                          // One owner with an entry: pre-selected; otherwise the admin chooses.
+                          owner: owners.length === 1 ? owners[0] : undefined,
                         })
                         setOpen(true)
                       }}

@@ -5,9 +5,9 @@
 //! withdrawal status change and every internal transfer.
 
 use anyhow::Result;
-use config::LEDGER_CACHE_SECS;
+use config::{LEDGER_CACHE_SECS, LEDGER_SHORTFALL_CONSECUTIVE_CHECKS};
 use db::LedgerFilter;
-use domain::{BalanceComponents, Network, ProjectBalance, Token};
+use domain::{AlertType, BalanceComponents, Network, ProjectBalance, Token};
 use redis::AsyncCommands;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -120,6 +120,139 @@ pub fn reconcile(holdings: Holdings, project_total: i128) -> MerchantFunds {
             .amount
             .map(|held| i128::try_from(held).unwrap_or(i128::MAX).saturating_sub(project_total)),
     }
+}
+
+/// One project's figures in the ledger view.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LedgerProjectRow {
+    pub project_id: String,
+    pub balance: i128,
+    pub available: i128,
+}
+
+/// The reconciliation of one payment pair (spec §10.4, `GET /ledger`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LedgerPairRow {
+    pub network: Network,
+    pub token: Token,
+    pub projects: Vec<LedgerProjectRow>,
+    pub funds: MerchantFunds,
+}
+
+/// Every payment pair reconciled, from the 30 s cache and the treasury's
+/// balance cache (dashboard reads).
+pub async fn ledger_view(state: &AppState) -> Result<Vec<LedgerPairRow>> {
+    let rows = cached_components(state).await?;
+    let mut view = Vec::new();
+    for (network, token) in payment_pairs() {
+        let projects: Vec<LedgerProjectRow> = rows
+            .iter()
+            .filter(|row| row.network == network && row.token == token)
+            .map(|row| {
+                let balance = ProjectBalance::from_components(row.components);
+                LedgerProjectRow {
+                    project_id: row.project_id.clone(),
+                    balance: balance.balance,
+                    available: balance.available,
+                }
+            })
+            .collect();
+        let project_total = projects.iter().map(|p| p.balance).fold(0i128, i128::saturating_add);
+        let funds = reconcile(holdings(state, network, token).await, project_total);
+        view.push(LedgerPairRow {
+            network,
+            token,
+            projects,
+            funds,
+        });
+    }
+    Ok(view)
+}
+
+/// The API shape of one ledger row: every amount in pairs, `null` holdings
+/// and merchant funds when unknown.
+pub fn ledger_row_json(row: &LedgerPairRow) -> Value {
+    let token = row.token;
+    let signed = |raw: i128| json!(domain::signed_raw_to_string(raw, token));
+    json!({
+        "network": row.network.as_api(),
+        "token": token.as_api(),
+        "holdings": row.funds.holdings.map(|h| domain::raw_u128_to_string(h, token)),
+        "holdings_raw": row.funds.holdings.map(|h| h.to_string()),
+        "projects": row.projects.iter().map(|p| json!({
+            "project_id": p.project_id,
+            "balance": signed(p.balance), "balance_raw": p.balance.to_string(),
+            "available": signed(p.available), "available_raw": p.available.to_string(),
+        })).collect::<Vec<_>>(),
+        "project_total": signed(row.funds.project_total), "project_total_raw": row.funds.project_total.to_string(),
+        "merchant_funds": row.funds.merchant_funds.map(|f| domain::signed_raw_to_string(f, token)),
+        "merchant_funds_raw": row.funds.merchant_funds.map(|f| f.to_string()),
+        "status": row.funds.status(),
+    })
+}
+
+/// The consecutive-shortfall counter after one check (spec §10.4): a
+/// shortfall adds one, `ok` and `unknown` reset it. The alert fires once
+/// the counter reaches the threshold.
+pub fn shortfall_count_after(previous: i64, status: &str) -> i64 {
+    if status == "shortfall" {
+        previous.saturating_add(1)
+    } else {
+        0
+    }
+}
+
+pub fn shortfall_alert_due(count: i64) -> bool {
+    count >= LEDGER_SHORTFALL_CONSECUTIVE_CHECKS
+}
+
+fn shortfall_counter_key(state: &AppState, network: Network, token: Token) -> String {
+    state
+        .config
+        .redis_key(&format!("ledger-shortfall:{}:{}", network.as_db(), token.as_db()))
+}
+
+/// The treasury monitor's ledger pass (every 5 min): reconcile each pair
+/// and raise `LEDGER_SHORTFALL` after three consecutive shortfalls.
+pub async fn check_shortfalls(state: &AppState) -> Result<()> {
+    let mut conn = state.db.pool().acquire().await?;
+    let mut redis = state.redis.clone();
+    for (network, token) in payment_pairs() {
+        let funds = merchant_funds(state, &mut conn, network, token).await?;
+        let key = shortfall_counter_key(state, network, token);
+        let previous: i64 = redis.get(&key).await.unwrap_or(None::<i64>).unwrap_or(0);
+        let count = shortfall_count_after(previous, funds.status());
+        if count == 0 {
+            let _: Result<(), redis::RedisError> = redis.del(&key).await;
+            continue;
+        }
+        let _: Result<(), redis::RedisError> = redis.set(&key, count).await;
+        if !shortfall_alert_due(count) {
+            continue;
+        }
+        let Some(merchant) = funds.merchant_funds else { continue };
+        warn!(
+            "Ledger shortfall on {} {}: the project balances exceed the holdings by {} base units ({count} consecutive checks)",
+            network.as_api(),
+            token.as_api(),
+            -merchant
+        );
+        crate::alerts::raise(
+            state,
+            AlertType::LedgerShortfall,
+            Some(network),
+            Some(token),
+            None,
+            json!({
+                "holdings_raw": funds.holdings.map(|h| h.to_string()),
+                "project_balances_raw": funds.project_total.to_string(),
+                "shortfall_raw": (-merchant).to_string(),
+                "consecutive_checks": count,
+            }),
+        )
+        .await?;
+    }
+    Ok(())
 }
 
 /// One project's balance of one asset.
@@ -404,6 +537,42 @@ mod tests {
         let unknown = reconcile(Holdings { amount: None }, 5);
         assert_eq!(unknown.merchant_funds, None);
         assert_eq!(unknown.status(), "unknown");
+    }
+
+    #[test]
+    fn three_consecutive_shortfalls_raise_the_alert_and_anything_else_resets() {
+        let mut count = 0;
+        for _ in 0..2 {
+            count = shortfall_count_after(count, "shortfall");
+            assert!(!shortfall_alert_due(count));
+        }
+        count = shortfall_count_after(count, "shortfall");
+        assert_eq!(count, 3);
+        assert!(shortfall_alert_due(count));
+        // Stays due while it holds (the alert itself is deduplicated).
+        assert!(shortfall_alert_due(shortfall_count_after(count, "shortfall")));
+        assert_eq!(shortfall_count_after(2, "ok"), 0);
+        assert_eq!(shortfall_count_after(2, "unknown"), 0);
+        assert_eq!(shortfall_count_after(5, "ok"), 0);
+    }
+
+    #[test]
+    fn ledger_rows_render_unknown_holdings_as_null() {
+        let row = LedgerPairRow {
+            network: Network::Tron,
+            token: Token::Usdt,
+            projects: vec![LedgerProjectRow { project_id: "p1".into(), balance: 2_500_000, available: -1 }],
+            funds: reconcile(Holdings { amount: None }, 2_500_000),
+        };
+        let json = ledger_row_json(&row);
+        assert_eq!(json["status"], "unknown");
+        assert!(json["holdings"].is_null() && json["merchant_funds_raw"].is_null());
+        assert_eq!(json["project_total"], "2.5");
+        assert_eq!(json["projects"][0]["available"], "-0.000001");
+        let known = LedgerPairRow { funds: reconcile(Holdings { amount: Some(1_000_000) }, 2_500_000), ..row };
+        let json = ledger_row_json(&known);
+        assert_eq!(json["status"], "shortfall");
+        assert_eq!(json["merchant_funds"], "-1.5");
     }
 
     #[test]

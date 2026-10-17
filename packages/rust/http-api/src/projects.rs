@@ -282,6 +282,15 @@ pub(crate) async fn project_balance(
     })))
 }
 
+/// `GET /ledger` (any staff): every payment pair reconciled — holdings,
+/// the project balances, the merchant funds and the status (spec §12).
+pub(crate) async fn ledger(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
+    let rows = jobs::ledger::ledger_view(&state).await?;
+    Ok(Json(json!({
+        "data": rows.iter().map(jobs::ledger::ledger_row_json).collect::<Vec<_>>(),
+    })))
+}
+
 /// `GET /api/v1/project`: the key's project and its balances (spec §11,
 /// Q21). Nothing about custody is in here (invariant 7).
 pub(crate) async fn merchant_project(

@@ -2,7 +2,7 @@ import { useMutation, useQueries, useQuery, useQueryClient } from "@tanstack/rea
 
 import { api } from "@/lib/api"
 import { useAuth } from "@/lib/auth"
-import type { Project, ProjectBalances, ProjectColor, ProjectsResponse } from "@/lib/types"
+import type { LedgerPair, Project, ProjectBalances, ProjectColor, ProjectsResponse } from "@/lib/types"
 
 export const PROJECTS_QUERY_KEY = ["projects"] as const
 
@@ -86,5 +86,14 @@ export function useProjectBalancesOf(projectIds: string[]) {
       queryFn: () => api<ProjectBalances>(`/projects/${id}/balance`),
       refetchInterval: 30_000,
     })),
+  })
+}
+
+/** The reconciliation of every payment pair (any staff member). */
+export function useLedger() {
+  return useQuery({
+    queryKey: ["ledger"],
+    queryFn: () => api<{ data: LedgerPair[] }>("/ledger"),
+    refetchInterval: 60_000,
   })
 }

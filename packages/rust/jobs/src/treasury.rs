@@ -330,6 +330,11 @@ pub async fn treasury_monitor_loop(state: AppState) {
 }
 
 async fn monitor_once(state: &AppState) -> Result<()> {
+    // The project ledger against the holdings (spec §10.4): three
+    // consecutive shortfalls raise an alert.
+    if let Err(err) = crate::ledger::check_shortfalls(state).await {
+        error!("ledger shortfall check error: {err:#}");
+    }
     // Per asset: the treasuries of every network together (for BTC every
     // spendable UTXO plus the Lightning balance) against the cap.
     let mut holdings: HashMap<Token, u128> = HashMap::new();

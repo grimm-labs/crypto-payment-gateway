@@ -11,6 +11,7 @@ import {
   CardTitle,
 } from "@/components/ui/card"
 import { Skeleton } from "@/components/ui/skeleton"
+import { useLedger } from "@/hooks/projects"
 import { useWalletBalances } from "@/hooks/queries"
 import { formatAmount, networkLabel } from "@/lib/format"
 import { assetKey } from "@/lib/networks"
@@ -19,6 +20,17 @@ import { useProjectScope } from "@/lib/project-scope"
 export function OverviewPage() {
   const balances = useWalletBalances()
   const { projects, selectedProject } = useProjectScope()
+  const ledger = useLedger()
+  // Merchant-funds rows per token for the "All projects" tables.
+  const merchantRows: Record<string, { network: string; amount: string; status: string }[]> = {}
+  for (const pair of ledger.data?.data ?? []) {
+    if (pair.merchant_funds === null && pair.projects.length === 0) continue
+    ;(merchantRows[pair.token] ??= []).push({
+      network: pair.network,
+      amount: pair.merchant_funds ?? "",
+      status: pair.status,
+    })
+  }
 
   return (
     <div className="flex flex-col gap-4 py-4 md:gap-6 md:py-6">
@@ -30,7 +42,7 @@ export function OverviewPage() {
         {selectedProject ? (
           <ProjectBalanceCards project={selectedProject} />
         ) : (
-          <ProjectBalanceTables projects={projects} />
+          <ProjectBalanceTables projects={projects} merchantRows={merchantRows} />
         )}
       </div>
       <div className="px-4 lg:px-6">

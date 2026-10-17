@@ -3,7 +3,7 @@ import { ArrowLeft } from "lucide-react"
 import { useNavigate } from "react-router-dom"
 import { toast } from "sonner"
 
-import { ProjectDot } from "@/components/shared/ProjectBadge"
+import { ProjectBadge, ProjectDot } from "@/components/shared/ProjectBadge"
 import { StepUpCodeField } from "@/components/shared/StepUpCodeField"
 import { QuoteSummary } from "@/components/withdrawals/QuoteSummary"
 import { Button } from "@/components/ui/button"
@@ -25,7 +25,7 @@ import {
   SelectValue,
 } from "@/components/ui/select"
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group"
-import { useProjectBalance } from "@/hooks/projects"
+import { useLedger, useProjectBalance } from "@/hooks/projects"
 import { useAddressBook, useCreateWithdrawal, useWithdrawalQuote } from "@/hooks/withdrawals"
 import { useNow } from "@/hooks/use-now"
 import { toastError } from "@/lib/errors"
@@ -37,6 +37,7 @@ import {
   rawToDecimal,
   satsToBtc,
   shortHash,
+  toBigInt,
   tokenDecimals,
 } from "@/lib/format"
 import { NETWORKS, WITHDRAWABLE_TOKENS, isBtcNetwork, isGasOnlyToken } from "@/lib/networks"
@@ -86,6 +87,8 @@ export interface WithdrawalPreset {
   addressBookEntryId?: string
   /** The owner debited: a project id or "merchant". No default otherwise. */
   owner?: string
+  /** Cold-storage flow (spec §8.6): only the owner's cold-storage entries. */
+  coldStorageOnly?: boolean
 }
 
 interface WithdrawalDialogProps {
@@ -144,8 +147,9 @@ function WithdrawalForm({
   const [owner, setOwner] = useState(preset?.owner ?? "")
   const [network, setNetwork] = useState<Network>(initialNetwork)
   const [token, setToken] = useState<Token>(initialToken)
+  const coldStorageOnly = preset?.coldStorageOnly ?? false
   const [mode, setMode] = useState<"book" | "destination">(
-    preset?.addressBookEntryId ? "book" : "destination",
+    preset?.addressBookEntryId || coldStorageOnly ? "book" : "destination",
   )
   const [entryId, setEntryId] = useState(preset?.addressBookEntryId ?? "")
   const [destination, setDestination] = useState("")
@@ -167,8 +171,17 @@ function WithdrawalForm({
 
   const isBtc = isBtcNetwork(network)
   const isLightning = network === "lightning"
-  const entries = book.data?.data ?? []
+  const entries = (book.data?.data ?? []).filter((e) => !coldStorageOnly || e.is_cold_storage)
   const entry = entries.find((e) => e.id === entryId)
+  // Cold storage: when no single project covers the excess, show what each
+  // one has, so the admin sends several withdrawals (spec §8.6).
+  const ledger = useLedger()
+  const ledgerPair = ledger.data?.data.find((p) => p.network === network && p.token === token)
+  const excess = coldStorageOnly ? toBigInt(preset?.amountRaw ?? null) : null
+  const noProjectCovers =
+    excess !== null &&
+    ledgerPair !== undefined &&
+    !ledgerPair.projects.some((p) => (toBigInt(p.available_raw) ?? 0n) >= excess)
 
   const trimmedAmount = amount.trim()
   const amountValid = isBtc
@@ -306,6 +319,28 @@ function WithdrawalForm({
         </DialogDescription>
       </DialogHeader>
 
+      {coldStorageOnly && noProjectCovers && ledgerPair && (
+        <div className="space-y-1 rounded-lg border border-amber-300 bg-amber-50 p-3 text-sm dark:border-amber-800 dark:bg-amber-950/40">
+          <p className="font-medium">No single project covers the excess</p>
+          <p className="text-xs text-muted-foreground">
+            Send several withdrawals, one per owner, within what each one has available:
+          </p>
+          <ul className="text-xs">
+            {ledgerPair.projects.map((p) => (
+              <li key={p.project_id} className="flex items-center justify-between gap-3">
+                <ProjectBadge projectId={p.project_id} />
+                <span className="tabular-nums">{formatAmount(p.available, token)}</span>
+              </li>
+            ))}
+            <li className="flex items-center justify-between gap-3">
+              <span className="text-muted-foreground">Merchant funds</span>
+              <span className="tabular-nums">
+                {ledgerPair.merchant_funds !== null ? formatAmount(ledgerPair.merchant_funds, token) : "unknown"}
+              </span>
+            </li>
+          </ul>
+        </div>
+      )}
       <div className="space-y-2">
         <Label>Owner</Label>
         <Select value={effectiveOwner} onValueChange={changeOwner} disabled={gasAsset}>
@@ -384,9 +419,10 @@ function WithdrawalForm({
           size="sm"
           value={mode}
           onValueChange={(value) => value && setMode(value as "book" | "destination")}
+          disabled={coldStorageOnly}
         >
           <ToggleGroupItem value="destination">Destination</ToggleGroupItem>
-          <ToggleGroupItem value="book">Address book</ToggleGroupItem>
+          <ToggleGroupItem value="book">{coldStorageOnly ? "Cold storage" : "Address book"}</ToggleGroupItem>
         </ToggleGroup>
         {mode === "book" ? (
           <>
@@ -411,7 +447,8 @@ function WithdrawalForm({
             </Select>
             {!book.isLoading && entries.length === 0 && (
               <p className="text-xs text-muted-foreground">
-                No {networkLabel(network)} entry in the address book for this owner yet.
+                No {networkLabel(network)} {coldStorageOnly ? "cold-storage " : ""}entry in the address
+                book for this owner yet.
               </p>
             )}
           </>

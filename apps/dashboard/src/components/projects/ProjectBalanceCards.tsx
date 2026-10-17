@@ -23,6 +23,12 @@ import { formatAmount, networkLabel, toBigInt } from "@/lib/format"
 import type { Project, ProjectAssetBalance } from "@/lib/types"
 import { cn } from "@/lib/utils"
 
+const STATUS_LABEL: Record<string, string> = {
+  ok: "reconciled",
+  shortfall: "shortfall",
+  unknown: "holdings unknown",
+}
+
 /** Signed decimal amount, red when negative. */
 function SignedAmount({ value, token, className }: { value: string; token: string; className?: string }) {
   const negative = value.startsWith("-")
@@ -107,8 +113,8 @@ export function ProjectBalanceTables({
   merchantRows,
 }: {
   projects: Project[]
-  /** Per token: merchant funds amount (signed decimal string), or undefined while unknown. */
-  merchantRows?: Record<string, { amount: string; status: string }[]>
+  /** Per token, per network: the merchant funds (signed decimal string, "" while unknown) and the status. */
+  merchantRows?: Record<string, { network: string; amount: string; status: string }[]>
 }) {
   const results = useProjectBalancesOf(projects.map((p) => p.id))
   const loading = results.some((r) => r.isLoading)
@@ -170,12 +176,22 @@ export function ProjectBalanceTables({
                       </TableCell>
                     </TableRow>
                   ))}
-                  {merchantRows?.[token]?.map((row, index) => (
-                    <TableRow key={`merchant-${index}`} className="bg-muted/40">
+                  {merchantRows?.[token]?.map((row) => (
+                    <TableRow key={`merchant-${row.network}`} className="bg-muted/40">
                       <TableCell className="font-medium">Merchant funds</TableCell>
-                      <TableCell className="text-muted-foreground">{row.status}</TableCell>
-                      <TableCell className="text-right" colSpan={2}>
-                        <SignedAmount value={row.amount} token={token} />
+                      <TableCell>
+                        {networkLabel(row.network)}{" "}
+                        <span
+                          className={cn(
+                            "text-xs",
+                            row.status === "shortfall" ? "text-red-600 dark:text-red-400" : "text-muted-foreground",
+                          )}
+                        >
+                          · {STATUS_LABEL[row.status] ?? row.status}
+                        </span>
+                      </TableCell>
+                      <TableCell className="text-right text-muted-foreground" colSpan={2}>
+                        {row.amount ? <SignedAmount value={row.amount} token={token} /> : "—"}
                       </TableCell>
                     </TableRow>
                   ))}

@@ -123,6 +123,29 @@ export interface ProjectBalances {
   balances: ProjectAssetBalance[]
 }
 
+/** One payment pair reconciled (spec §10.4): what the gateway holds against
+ *  the project balances. Holdings and merchant funds are null when unknown. */
+export interface LedgerProjectRow {
+  project_id: string
+  balance: string
+  balance_raw: string
+  available: string
+  available_raw: string
+}
+
+export interface LedgerPair {
+  network: Network
+  token: Token
+  holdings: string | null
+  holdings_raw: string | null
+  projects: LedgerProjectRow[]
+  project_total: string
+  project_total_raw: string
+  merchant_funds: string | null
+  merchant_funds_raw: string | null
+  status: "ok" | "shortfall" | "unknown"
+}
+
 /** One side of an internal transfer. */
 export interface TransferSide {
   type: "project" | "merchant"

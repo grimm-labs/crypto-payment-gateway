@@ -104,6 +104,7 @@ pub fn admin_router(state: &AppState) -> Router<AppState> {
         .route("/webhooks", get(list_webhooks))
         .route("/projects", get(p::list_projects))
         .route("/projects/{id}/balance", get(p::project_balance))
+        .route("/ledger", get(p::ledger))
         .route("/transfers", get(t::list_transfers))
         .route("/transfers/{id}", get(t::get_transfer))
         .route("/stats", get(stats))
