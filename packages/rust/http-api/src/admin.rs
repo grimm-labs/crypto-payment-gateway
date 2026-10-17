@@ -1334,6 +1334,8 @@ struct TrafficOverviewQuery {
     surface: Option<String>,
     window: Option<String>,
     top_limit: Option<i64>,
+    /// The merchant surface of one project's keys.
+    project_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1343,8 +1345,20 @@ struct TrafficRequestsQuery {
     route: Option<String>,
     method: Option<String>,
     api_key_id: Option<String>,
+    /// The merchant surface of one project's keys.
+    project_id: Option<String>,
     limit: Option<i64>,
     offset: Option<i64>,
+}
+
+/// `?project_id` of the traffic routes: a project only (staff requests
+/// carry no key, so the merchant owns no traffic).
+fn traffic_project_param(value: Option<&str>) -> Result<Option<String>, ApiError> {
+    match owner_filter_param(value)? {
+        db::OwnerFilter::Any => Ok(None),
+        db::OwnerFilter::Project(id) => Ok(Some(id)),
+        db::OwnerFilter::Merchant => Err(ApiError::bad_request("project_id must be a project UUID")),
+    }
 }
 
 /// `merchant` (default) / `admin` / `all` (= no filter).
@@ -1378,12 +1392,13 @@ async fn traffic_overview(
     let window = parse_window(query.window.as_deref())?;
     let top_limit = query.top_limit.unwrap_or(10).clamp(1, 25);
     let secs = window.secs();
+    let project = traffic_project_param(query.project_id.as_deref())?;
 
     let (summary, timeseries, top_routes, top_keys) = tokio::join!(
-        state.db.traffic_summary(surface, secs),
-        state.db.traffic_timeseries(surface, secs, window.bucket_secs()),
-        state.db.traffic_top_routes(surface, secs, top_limit),
-        state.db.traffic_top_api_keys(secs, top_limit),
+        state.db.traffic_summary(surface, secs, project.as_deref()),
+        state.db.traffic_timeseries(surface, secs, window.bucket_secs(), project.as_deref()),
+        state.db.traffic_top_routes(surface, secs, top_limit, project.as_deref()),
+        state.db.traffic_top_api_keys(secs, top_limit, project.as_deref()),
     );
     let summary = summary?;
     let timeseries = timeseries?;
@@ -1469,6 +1484,7 @@ async fn traffic_requests(
         route: non_empty(query.route),
         method: non_empty(query.method).map(|m| m.to_ascii_uppercase()),
         api_key_id: non_empty(query.api_key_id),
+        project_id: traffic_project_param(query.project_id.as_deref())?,
     };
     let limit = query.limit.unwrap_or(50).clamp(1, 100);
     let offset = query.offset.unwrap_or(0).max(0);
@@ -1814,10 +1830,12 @@ async fn list_webhooks(
         .map_err(ApiError::from)?;
     let limit = query.limit.unwrap_or(50).clamp(1, 100);
     let offset = query.offset.unwrap_or(0).max(0);
+    // Through the target endpoint's owner.
+    let owner = owner_filter_param(query.project_id.as_deref())?;
 
     let (rows, total) = state
         .db
-        .list_webhook_deliveries_detailed(status, limit, offset)
+        .list_webhook_deliveries_detailed(status, &owner, limit, offset)
         .await?;
 
     let data = rows
@@ -1952,8 +1970,12 @@ async fn retry_failed(
     }
 }
 
-async fn stats(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
-    let s = state.db.admin_stats().await?;
+async fn stats(
+    State(state): State<AppState>,
+    Query(query): Query<OwnerListQuery>,
+) -> Result<Json<Value>, ApiError> {
+    let owner = owner_filter_param(query.project_id.as_deref())?;
+    let s = state.db.admin_stats(&owner).await?;
     Ok(Json(json!({
         "addresses": {
             "pending": s.addresses_pending,
@@ -1976,6 +1998,7 @@ async fn stats(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
 #[derive(Debug, Deserialize)]
 struct TimeseriesQuery {
     days: Option<i32>,
+    project_id: Option<String>,
 }
 
 async fn deposits_timeseries(
@@ -1983,7 +2006,8 @@ async fn deposits_timeseries(
     Query(query): Query<TimeseriesQuery>,
 ) -> Result<Json<Value>, ApiError> {
     let days = query.days.unwrap_or(90).clamp(1, 365);
-    let rows = state.db.deposits_timeseries(days).await?;
+    let owner = owner_filter_param(query.project_id.as_deref())?;
+    let rows = state.db.deposits_timeseries(days, &owner).await?;
     let data = rows
         .iter()
         .map(|r| {

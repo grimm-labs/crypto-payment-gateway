@@ -35,6 +35,7 @@ import {
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group"
 import { useSettings, useTrafficOverview, useTrafficRequests } from "@/hooks/queries"
 import { useAuth } from "@/lib/auth"
+import { useProjectScope } from "@/lib/project-scope"
 import { formatDate } from "@/lib/format"
 import type {
   StatusClass,
@@ -106,12 +107,15 @@ export function TrafficPage() {
   const apiKeyId = searchParams.get("key") ?? undefined
   const offset = Number(searchParams.get("offset") ?? 0)
 
-  const overview = useTrafficOverview({ surface, window })
+  // A selected project shows the merchant surface of its keys.
+  const { scopeParam } = useProjectScope()
+  const overview = useTrafficOverview({ surface, window, project_id: scopeParam })
   const requests = useTrafficRequests({
     surface,
     status: status === ALL ? undefined : status,
     route,
     api_key_id: apiKeyId,
+    project_id: scopeParam,
     limit: PAGE_SIZE,
     offset,
   })

@@ -37,6 +37,8 @@ mod middleware;
 mod projects;
 mod rate_limit;
 mod session;
+#[cfg(test)]
+mod test_support;
 mod traffic;
 mod withdrawals;
 
@@ -48,8 +50,11 @@ const BODY_LIMIT_BYTES: usize = 64 * 1024;
 /// BOLT11 memo cap for `description` (characters).
 const INVOICE_DESCRIPTION_MAX_CHARS: usize = 128;
 
-pub fn router(state: AppState) -> Router {
-    let api_v1 = Router::new()
+/// The merchant surface (`/api/v1`): scoped to the calling key's project.
+/// Custody figures (`/balances`, `/wallet-balances`) and the Lightning
+/// wallet history are staff-only (spec §11): they are not mounted here.
+fn merchant_router(state: &AppState) -> Router<AppState> {
+    Router::new()
         .route(
             "/deposit-addresses",
             post(create_deposit_address).get(list_deposit_addresses),
@@ -59,8 +64,6 @@ pub fn router(state: AppState) -> Router {
             "/deposits/{deposit_id}/webhooks/retry",
             post(retry_deposit_webhook),
         )
-        .route("/balances", get(get_balances))
-        .route("/wallet-balances", get(get_wallet_balances))
         .route(
             "/withdrawals",
             post(withdrawals::create_withdrawal).get(withdrawals::list_withdrawals),
@@ -70,16 +73,35 @@ pub fn router(state: AppState) -> Router {
         .route("/withdrawals/{id}/cancel", post(withdrawals::cancel_withdrawal))
         .route("/address-book", get(withdrawals::merchant_address_book))
         // Deprecated alias of POST /withdrawals (Lightning addresses).
-        .route(
-            "/lightning/payments",
-            get(list_lightning_payments).post(withdrawals::create_lightning_payout),
-        )
+        .route("/lightning/payments", post(withdrawals::create_lightning_payout))
         .route("/lightning/payments/quote", post(withdrawals::quote_lightning_payout))
-        .route("/lightning/payments/{id}", get(get_lightning_payment))
         .route_layer(axum::middleware::from_fn_with_state(
             state.clone(),
             middleware::require_api_key,
-        ));
+        ))
+        // Added after the guard, so it answers everyone: the wallet history
+        // (GET) moved to the staff surface — 404 like a path that never
+        // existed, not 405.
+        .route("/lightning/payments", get(merchant_route_removed))
+}
+
+/// A route taken out of the merchant surface answers like a missing one.
+async fn merchant_route_removed() -> ApiError {
+    ApiError::not_found("Not found".into())
+}
+
+/// How a merchant read is scoped (invariant 2): the key's project; a legacy
+/// key without a project keeps the unscoped behaviour of before projects.
+/// Staff reads are never scoped by this (they filter explicitly).
+pub(crate) fn merchant_scope(api_key: Option<&CurrentApiKey>) -> OwnerFilter {
+    match api_key.and_then(|key| key.project_id.as_deref()) {
+        Some(project_id) => OwnerFilter::Project(project_id.to_string()),
+        None => OwnerFilter::Any,
+    }
+}
+
+pub fn router(state: AppState) -> Router {
+    let api_v1 = merchant_router(&state);
 
     let mut app = Router::new()
         .route("/healthz", get(healthz))
@@ -542,10 +564,7 @@ async fn list_deposit_addresses(
     let offset = query.offset.unwrap_or(0).max(0);
     // Staff filter on the owner; a merchant key is scoped by its project.
     let owner = match api_key.as_deref() {
-        Some(key) => match &key.project_id {
-            Some(id) => OwnerFilter::Project(id.clone()),
-            None => OwnerFilter::Any,
-        },
+        Some(key) => merchant_scope(Some(key)),
         None => projects::owner_filter_param(query.project_id.as_deref())?,
     };
 
@@ -572,9 +591,14 @@ async fn get_deposit_address(
     Path(id): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
     // Endpoint URLs (and errors quoting them) are admin data: a merchant
-    // key never sees them (#51).
+    // key never sees them (#51). A key reads through a query scoped on its
+    // project (invariant 2): another project's payment is a 404.
     let merchant = api_key.is_some();
-    let Some(row) = state.db.find_deposit_address(&id).await? else {
+    let row = match api_key.as_deref() {
+        Some(key) => state.db.find_deposit_address_owned(&id, &merchant_scope(Some(key))).await?,
+        None => state.db.find_deposit_address(&id).await?,
+    };
+    let Some(row) = row else {
         return Err(ApiError::not_found(format!(
             "Deposit address not found: {id}"
         )));
@@ -692,7 +716,12 @@ async fn retry_deposit_webhook(
     Path(deposit_id): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
     let result = match api_key.as_deref() {
-        Some(_) => {
+        Some(key) => {
+            // Another project's deposit does not exist for this key
+            // (invariant 2), checked in the query before anything else.
+            if state.db.find_deposit_owned(&deposit_id, &merchant_scope(Some(key))).await?.is_none() {
+                return Err(ApiError::not_found(format!("Deposit not found: {deposit_id}")));
+            }
             rate_limit::hit(&state, rate_limit::WEBHOOK_REPLAY_PER_DEPOSIT, &deposit_id).await?;
             retrigger_failed_deposit_webhooks(&state, &deposit_id).await
         }
@@ -1278,6 +1307,23 @@ mod tests {
             assert_eq!(err.status, StatusCode::BAD_REQUEST, "{network}/{token}");
         }
         assert!(rejected(json!({ "network": "ethereum", "token": "ETH", "expected_amount_sats": "1" })).message.contains("expected_amount_sats"));
+    }
+
+    #[test]
+    fn merchant_reads_are_scoped_by_the_key_project() {
+        use domain::WithdrawalPolicy;
+        let key = |project_id: Option<&str>| CurrentApiKey {
+            id: "k".into(),
+            project_id: project_id.map(str::to_string),
+            withdrawal_policy: WithdrawalPolicy::None,
+            withdrawal_tokens: vec![],
+            withdrawal_networks: None,
+        };
+        assert_eq!(merchant_scope(Some(&key(Some("p1")))), OwnerFilter::Project("p1".into()));
+        // A legacy key before the first project: unscoped, as before.
+        assert_eq!(merchant_scope(Some(&key(None))), OwnerFilter::Any);
+        // Staff requests carry no key: never scoped here.
+        assert_eq!(merchant_scope(None), OwnerFilter::Any);
     }
 
     #[test]

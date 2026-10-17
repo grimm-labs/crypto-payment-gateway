@@ -4,7 +4,7 @@ use domain::WebhookDeliveryStatus;
 use rust_decimal::Decimal;
 use sqlx::FromRow;
 
-use crate::Db;
+use crate::{owner_condition, Db, OwnerFilter};
 
 /// Authoritative delivery row (newest per logical key — (deposit, endpoint)
 /// for PAID, (address, event, endpoint) for PENDING/EXPIRED, (Lightning
@@ -162,23 +162,33 @@ pub struct AdminStats {
 }
 
 impl Db {
+    /// `owner`: the deliveries of one project's endpoints, of the merchant
+    /// endpoints (legacy rows without an endpoint included), or every one.
     pub async fn list_webhook_deliveries_detailed(
         &self,
         status: Option<WebhookDeliveryStatus>,
+        owner: &OwnerFilter,
         limit: i64,
         offset: i64,
     ) -> Result<(Vec<WebhookDeliveryDetailRow>, i64)> {
         let status_db = status.map(|s| s.as_db().to_string());
+        let (project_id, merchant_only) = owner.binds();
+        let condition = format!(
+            r#"($1::text IS NULL OR t.status = $1) AND {}"#,
+            owner_condition(r#"t."projectId""#, "$2", "$3")
+        );
 
         let rows = sqlx::query_as::<_, WebhookDeliveryDetailRow>(&format!(
             r#"
             SELECT * FROM ({WEBHOOK_DETAIL_INNER}) t
-            WHERE ($1::text IS NULL OR t.status = $1)
+            WHERE {condition}
             ORDER BY t."updatedAt" DESC
-            LIMIT $2 OFFSET $3
+            LIMIT $4 OFFSET $5
             "#
         ))
         .bind(status_db.as_deref())
+        .bind(project_id)
+        .bind(merchant_only)
         .bind(limit)
         .bind(offset)
         .fetch_all(&self.pool)
@@ -187,10 +197,12 @@ impl Db {
         let (total,): (i64,) = sqlx::query_as(&format!(
             r#"
             SELECT COUNT(*) FROM ({WEBHOOK_DETAIL_INNER}) t
-            WHERE ($1::text IS NULL OR t.status = $1)
+            WHERE {condition}
             "#
         ))
         .bind(status_db.as_deref())
+        .bind(project_id)
+        .bind(merchant_only)
         .fetch_one(&self.pool)
         .await?;
 
@@ -224,10 +236,12 @@ impl Db {
     }
 
     /// Confirmed deposits per day over the trailing window (days with no
-    /// deposits are absent — callers fill the gaps). `count` covers every
-    /// token; `volume` is USDT only (never mix sats into a USDT figure).
-    pub async fn deposits_timeseries(&self, days: i32) -> Result<Vec<DailyDepositStat>> {
-        let rows: Vec<(String, i64, Decimal)> = sqlx::query_as(
+    /// deposits are absent — callers fill the gaps), for one owner's
+    /// payments or every one. `count` covers every token; `volume` is USDT
+    /// only (never mix sats into a USDT figure).
+    pub async fn deposits_timeseries(&self, days: i32, owner: &OwnerFilter) -> Result<Vec<DailyDepositStat>> {
+        let (project_id, merchant_only) = owner.binds();
+        let rows: Vec<(String, i64, Decimal)> = sqlx::query_as(&format!(
             r#"
             SELECT to_char(date_trunc('day', d."confirmedAt"), 'YYYY-MM-DD') AS date,
                    COUNT(*),
@@ -236,11 +250,15 @@ impl Db {
             JOIN deposit_addresses a ON a.id = d."depositAddressId"
             WHERE d.status = 'CONFIRMED'::"DepositStatus"
               AND d."confirmedAt" >= (NOW() AT TIME ZONE 'UTC') - make_interval(days => $1)
+              AND {}
             GROUP BY 1
             ORDER BY 1
             "#,
-        )
+            owner_condition(r#"a."projectId""#, "$2", "$3")
+        ))
         .bind(days)
+        .bind(project_id)
+        .bind(merchant_only)
         .fetch_all(&self.pool)
         .await?;
         Ok(rows
@@ -249,12 +267,18 @@ impl Db {
             .collect())
     }
 
-    pub async fn admin_stats(&self) -> Result<AdminStats> {
+    /// The dashboard counters, for one owner's payments and endpoints or
+    /// every one.
+    pub async fn admin_stats(&self, owner: &OwnerFilter) -> Result<AdminStats> {
         let mut stats = AdminStats::default();
+        let (project_id, merchant_only) = owner.binds();
+        let address_owner = owner_condition(r#"a."projectId""#, "$1", "$2");
 
-        let address_counts: Vec<(String, i64)> = sqlx::query_as(
-            "SELECT status::text, COUNT(*) FROM deposit_addresses GROUP BY status",
-        )
+        let address_counts: Vec<(String, i64)> = sqlx::query_as(&format!(
+            "SELECT a.status::text, COUNT(*) FROM deposit_addresses a WHERE {address_owner} GROUP BY a.status",
+        ))
+        .bind(project_id)
+        .bind(merchant_only)
         .fetch_all(&self.pool)
         .await?;
         for (status, count) in address_counts {
@@ -266,10 +290,15 @@ impl Db {
             }
         }
 
-        let deposit_counts: Vec<(String, i64)> =
-            sqlx::query_as("SELECT status::text, COUNT(*) FROM deposits GROUP BY status")
-                .fetch_all(&self.pool)
-                .await?;
+        let deposit_counts: Vec<(String, i64)> = sqlx::query_as(&format!(
+            r#"SELECT d.status::text, COUNT(*) FROM deposits d
+               JOIN deposit_addresses a ON a.id = d."depositAddressId"
+               WHERE {address_owner} GROUP BY d.status"#
+        ))
+        .bind(project_id)
+        .bind(merchant_only)
+        .fetch_all(&self.pool)
+        .await?;
         for (status, count) in deposit_counts {
             match status.as_str() {
                 "DETECTED" => stats.deposits_detected = count,
@@ -278,28 +307,37 @@ impl Db {
             }
         }
 
-        let (volume,): (Decimal,) = sqlx::query_as(
+        let (volume,): (Decimal,) = sqlx::query_as(&format!(
             r#"
             SELECT COALESCE(SUM(d.amount), 0) FROM deposits d
             JOIN deposit_addresses a ON a.id = d."depositAddressId"
-            WHERE d.status = 'CONFIRMED'::"DepositStatus" AND a.token = 'USDT'::"Token"
-            "#,
-        )
+            WHERE d.status = 'CONFIRMED'::"DepositStatus" AND a.token = 'USDT'::"Token" AND {address_owner}
+            "#
+        ))
+        .bind(project_id)
+        .bind(merchant_only)
         .fetch_one(&self.pool)
         .await?;
         stats.confirmed_volume = volume;
 
         // Count webhook statuses on authoritative rows only (newest per
-        // logical delivery key).
-        let webhook_counts: Vec<(String, i64)> = sqlx::query_as(
+        // logical delivery key), by the target endpoint's owner.
+        let webhook_counts: Vec<(String, i64)> = sqlx::query_as(&format!(
             r#"
             SELECT t.status, COUNT(*) FROM (
-                SELECT DISTINCT ON ("depositAddressId", "lightningPaymentId", "withdrawalId", "alertId", "transferId", "eventType", "depositId", "webhookEndpointId") status::text AS status
-                FROM webhook_deliveries
-                ORDER BY "depositAddressId", "lightningPaymentId", "withdrawalId", "alertId", "transferId", "eventType", "depositId", "webhookEndpointId", "createdAt" DESC
-            ) t GROUP BY t.status
+                SELECT DISTINCT ON (w."depositAddressId", w."lightningPaymentId", w."withdrawalId", w."alertId", w."transferId", w."eventType", w."depositId", w."webhookEndpointId")
+                    w.status::text AS status, e."projectId"
+                FROM webhook_deliveries w
+                LEFT JOIN webhook_endpoints e ON e.id = w."webhookEndpointId"
+                ORDER BY w."depositAddressId", w."lightningPaymentId", w."withdrawalId", w."alertId", w."transferId", w."eventType", w."depositId", w."webhookEndpointId", w."createdAt" DESC
+            ) t
+            WHERE {}
+            GROUP BY t.status
             "#,
-        )
+            owner_condition(r#"t."projectId""#, "$1", "$2")
+        ))
+        .bind(project_id)
+        .bind(merchant_only)
         .fetch_all(&self.pool)
         .await?;
         for (status, count) in webhook_counts {

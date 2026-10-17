@@ -25,6 +25,7 @@ import {
 import { Skeleton } from "@/components/ui/skeleton"
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group"
 import { useDepositsTimeseries } from "@/hooks/queries"
+import { useProjectScope } from "@/lib/project-scope"
 import { useIsMobile } from "@/hooks/use-mobile"
 
 const chartConfig = {
@@ -73,7 +74,8 @@ export function ChartAreaInteractive() {
   }, [isMobile])
 
   const days = RANGES[timeRange] ?? 90
-  const timeseries = useDepositsTimeseries(days)
+  const { scopeParam } = useProjectScope()
+  const timeseries = useDepositsTimeseries(days, scopeParam)
   const chartData = React.useMemo(
     () => fillDays(days, timeseries.data?.data ?? []),
     [days, timeseries.data],

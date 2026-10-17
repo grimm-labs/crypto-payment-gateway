@@ -54,6 +54,7 @@ import { useIsAdmin } from "@/lib/auth"
 import { toastError } from "@/lib/errors"
 import { formatAmount, formatDate, humanize, networkLabel, shortHash } from "@/lib/format"
 import { PAYMENT_TOKENS, isNetwork } from "@/lib/networks"
+import { useProjectScope } from "@/lib/project-scope"
 import type { WebhookDelivery } from "@/lib/types"
 
 const PAGE_SIZE = 20
@@ -136,8 +137,11 @@ export function DeliveriesPage() {
   const status = searchParams.get("status") ?? ALL
   const offset = Number(searchParams.get("offset") ?? 0)
 
+  // "All projects" includes the merchant endpoints' deliveries.
+  const { scopeParam } = useProjectScope()
   const webhooks = useWebhooks({
     status: status === ALL ? undefined : status,
+    project_id: scopeParam,
     limit: PAGE_SIZE,
     offset,
   })

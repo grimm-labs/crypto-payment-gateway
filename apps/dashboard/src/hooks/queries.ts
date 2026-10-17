@@ -41,10 +41,11 @@ export function listParams(params: Record<string, string | number | undefined>):
   return encoded ? `?${encoded}` : ""
 }
 
-export function useStats() {
+/** `projectId`: the counters of one project (undefined = the whole instance). */
+export function useStats(projectId?: string) {
   return useQuery({
-    queryKey: ["stats"],
-    queryFn: () => api<AdminStats>("/stats"),
+    queryKey: ["stats", projectId ?? "all"],
+    queryFn: () => api<AdminStats>(`/stats${listParams({ project_id: projectId })}`),
     refetchInterval: 30_000,
   })
 }
@@ -55,11 +56,11 @@ export interface DepositPoint {
   volume: string
 }
 
-export function useDepositsTimeseries(days: number) {
+export function useDepositsTimeseries(days: number, projectId?: string) {
   return useQuery({
-    queryKey: ["deposits-timeseries", days],
+    queryKey: ["deposits-timeseries", projectId ?? "all", days],
     queryFn: () => api<{ days: number; data: DepositPoint[] }>(
-      `/stats/deposits-timeseries?days=${days}`,
+      `/stats/deposits-timeseries${listParams({ days, project_id: projectId })}`,
     ),
     refetchInterval: 60_000,
   })
@@ -68,7 +69,12 @@ export function useDepositsTimeseries(days: number) {
 /** Near-real-time: 5 s polling (30 s on the 24 h window, whose percentile
  * queries scan far more rows). Previous data is kept so refetches never
  * flash a skeleton. */
-export function useTrafficOverview(params: { surface: TrafficSurface; window: TrafficWindow }) {
+export function useTrafficOverview(params: {
+  surface: TrafficSurface
+  window: TrafficWindow
+  /** The merchant surface of one project's keys. */
+  project_id?: string
+}) {
   return useQuery({
     queryKey: ["traffic", "overview", params],
     queryFn: () => api<TrafficOverview>(`/traffic/overview${listParams(params)}`),
@@ -82,6 +88,8 @@ export interface TrafficRequestFilters {
   status?: string
   route?: string
   api_key_id?: string
+  /** The merchant surface of one project's keys. */
+  project_id?: string
   limit: number
   offset: number
 }
@@ -177,6 +185,8 @@ export function useCreatePayment() {
 
 export interface WebhookFilters {
   status?: string
+  /** Through the target endpoint's owner: a project id or "merchant". */
+  project_id?: string
   limit: number
   offset: number
 }

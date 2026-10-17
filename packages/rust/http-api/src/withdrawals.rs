@@ -339,7 +339,8 @@ pub(crate) struct WithdrawalListQuery {
     offset: Option<i64>,
 }
 
-/// `GET /withdrawals`: a merchant key sees its own only.
+/// `GET /withdrawals`: a merchant key sees its project's (spec §8.5) — a
+/// legacy key without a project, its own.
 pub(crate) async fn list_withdrawals(
     State(state): State<AppState>,
     api_key: Option<Extension<CurrentApiKey>>,
@@ -365,11 +366,12 @@ pub(crate) async fn list_withdrawals(
             .transpose()
             .map_err(|_| ApiError::bad_request("Invalid token"))?,
         api_key_id: match api_key.as_deref() {
-            Some(key) => Some(key.id.clone()),
+            Some(key) if key.project_id.is_none() => Some(key.id.clone()),
+            Some(_) => None,
             None => query.api_key_id.clone().filter(|id| !id.is_empty()),
         },
         owner: match api_key.as_deref() {
-            Some(_) => OwnerFilter::Any,
+            Some(key) => crate::merchant_scope(Some(key)),
             None => owner_filter_param(query.project_id.as_deref())?,
         },
     };
@@ -380,19 +382,22 @@ pub(crate) async fn list_withdrawals(
     Ok(Json(json!({ "data": data, "total": total, "limit": limit, "offset": offset })))
 }
 
+/// Invariant 2: a merchant key reads its project's withdrawals through a
+/// query scoped on the project; another project's withdrawal is as absent
+/// as a missing one. A legacy key (no project) keeps seeing its own.
 async fn find_visible(state: &AppState, api_key: Option<&CurrentApiKey>, id: &str) -> Result<WithdrawalRow, ApiError> {
-    let row = state
-        .db
-        .find_withdrawal(id)
-        .await?
-        .ok_or_else(|| ApiError::not_found(format!("Withdrawal not found: {id}")))?;
-    // Another key's withdrawal does not exist for this one.
-    if let Some(key) = api_key {
-        if row.api_key_id.as_deref() != Some(key.id.as_str()) {
-            return Err(ApiError::not_found(format!("Withdrawal not found: {id}")));
+    let not_found = || ApiError::not_found(format!("Withdrawal not found: {id}"));
+    match api_key {
+        Some(key) => {
+            let filter = WithdrawalFilter {
+                api_key_id: key.project_id.is_none().then(|| key.id.clone()),
+                owner: crate::merchant_scope(Some(key)),
+                ..Default::default()
+            };
+            state.db.find_withdrawal_visible(id, &filter).await?.ok_or_else(not_found)
         }
+        None => state.db.find_withdrawal(id).await?.ok_or_else(not_found),
     }
-    Ok(row)
 }
 
 /// `GET /withdrawals/{id}`; staff also get the transaction timeline.
@@ -426,7 +431,10 @@ pub(crate) async fn cancel_withdrawal(
     body: Bytes,
 ) -> Result<Json<Value>, ApiError> {
     let canceller = match (api_key.as_deref(), staff.as_deref()) {
-        (Some(key), _) => Canceller::ApiKey(key.id.clone()),
+        (Some(key), _) => Canceller::ApiKey {
+            id: key.id.clone(),
+            project_id: key.project_id.clone(),
+        },
         (None, Some(staff)) => {
             let body: StepUpBody = if body.is_empty() {
                 StepUpBody::default()

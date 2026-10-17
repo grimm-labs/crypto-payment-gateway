@@ -684,14 +684,18 @@ pub async fn reject_withdrawal(
 /// Who cancels.
 #[derive(Debug, Clone)]
 pub enum Canceller {
-    /// The merchant key that requested it.
-    ApiKey(String),
+    /// A merchant key: any key of the withdrawal's project (spec §8.5) —
+    /// or, for a legacy key without a project, the requesting key itself.
+    ApiKey {
+        id: String,
+        project_id: Option<String>,
+    },
     /// An ADMIN (TOTP checked by the HTTP layer), any withdrawal.
     Admin(String),
 }
 
 /// Cancel a withdrawal before anything is signed (PENDING_APPROVAL or
-/// QUEUED), releasing its reservation.
+/// QUEUED), releasing its reservation. `cancelledById` keeps who did it.
 pub async fn cancel_withdrawal(
     state: &AppState,
     actor: &Actor,
@@ -700,8 +704,12 @@ pub async fn cancel_withdrawal(
 ) -> Result<WithdrawalRow, WithdrawalError> {
     let row = state.db.find_withdrawal(id).await?.ok_or(WithdrawalError::NotFound)?;
     let by = match canceller {
-        Canceller::ApiKey(key) => {
-            if row.api_key_id.as_deref() != Some(key) {
+        Canceller::ApiKey { id: key, project_id } => {
+            let visible = match project_id {
+                Some(project) => row.project_id.as_deref() == Some(project.as_str()),
+                None => row.api_key_id.as_deref() == Some(key.as_str()),
+            };
+            if !visible {
                 return Err(WithdrawalError::NotFound);
             }
             key

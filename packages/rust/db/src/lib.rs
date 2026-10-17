@@ -196,6 +196,16 @@ impl Db {
         Ok(Self { pool })
     }
 
+    /// A pool that connects on first use — for tests that build an
+    /// `AppState` without a database (nothing is ever queried).
+    pub fn connect_lazy(database_url: &str) -> Result<Self> {
+        let pool = PgPoolOptions::new()
+            .max_connections(1)
+            .connect_lazy(database_url)
+            .context("Invalid DATABASE_URL")?;
+        Ok(Self { pool })
+    }
+
     pub async fn migrate(&self) -> Result<()> {
         sqlx::migrate!("./migrations")
             .run(&self.pool)
@@ -352,6 +362,46 @@ impl Db {
             "SELECT {DEPOSIT_ADDRESS_COLUMNS} FROM deposit_addresses WHERE id = $1"
         ))
         .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row)
+    }
+
+    /// The merchant surface's lookup (invariant 2): the payment only when
+    /// `owner` matches, in the query itself — another owner's payment is
+    /// as absent as a missing one.
+    pub async fn find_deposit_address_owned(
+        &self,
+        id: &str,
+        owner: &OwnerFilter,
+    ) -> Result<Option<DepositAddressRow>> {
+        let (project_id, merchant_only) = owner.binds();
+        let row = sqlx::query_as::<_, DepositAddressRow>(&format!(
+            "SELECT {DEPOSIT_ADDRESS_COLUMNS} FROM deposit_addresses WHERE id = $1 AND {}",
+            owner_condition(r#""projectId""#, "$2", "$3")
+        ))
+        .bind(id)
+        .bind(project_id)
+        .bind(merchant_only)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row)
+    }
+
+    /// The merchant surface's deposit lookup (invariant 2): the deposit
+    /// only when its address has `owner`, in the query itself.
+    pub async fn find_deposit_owned(&self, id: &str, owner: &OwnerFilter) -> Result<Option<DepositRow>> {
+        let (project_id, merchant_only) = owner.binds();
+        let row = sqlx::query_as::<_, DepositRow>(&format!(
+            r#"SELECT {DEPOSIT_COLUMNS} FROM deposits d
+               WHERE d.id = $1 AND EXISTS (
+                 SELECT 1 FROM deposit_addresses a WHERE a.id = d."depositAddressId" AND {}
+               )"#,
+            owner_condition(r#"a."projectId""#, "$2", "$3")
+        ))
+        .bind(id)
+        .bind(project_id)
+        .bind(merchant_only)
         .fetch_optional(&self.pool)
         .await?;
         Ok(row)

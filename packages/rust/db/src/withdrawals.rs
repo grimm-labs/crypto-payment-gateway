@@ -202,6 +202,25 @@ impl Db {
         Ok(row)
     }
 
+    /// The merchant surface's lookup (invariant 2): the withdrawal only when
+    /// it matches `filter`'s owner (and key, for a legacy key), in the query
+    /// itself.
+    pub async fn find_withdrawal_visible(&self, id: &str, filter: &WithdrawalFilter) -> Result<Option<WithdrawalRow>> {
+        let (project_id, merchant_only) = filter.owner.binds();
+        let row = sqlx::query_as::<_, WithdrawalRow>(&format!(
+            r#"SELECT {WITHDRAWAL_COLUMNS} FROM withdrawals
+               WHERE id = $1 AND ($2::text IS NULL OR "apiKeyId" = $2) AND {}"#,
+            owner_condition(r#""projectId""#, "$3", "$4")
+        ))
+        .bind(id)
+        .bind(filter.api_key_id.as_deref())
+        .bind(project_id)
+        .bind(merchant_only)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row)
+    }
+
     pub async fn find_withdrawal_by_idempotency_key(&self, key: &str) -> Result<Option<WithdrawalRow>> {
         let row = sqlx::query_as::<_, WithdrawalRow>(&format!(
             r#"SELECT {WITHDRAWAL_COLUMNS} FROM withdrawals WHERE "idempotencyKey" = $1"#

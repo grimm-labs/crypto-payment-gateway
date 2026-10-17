@@ -18,9 +18,12 @@ import {
 import { Skeleton } from "@/components/ui/skeleton"
 import { useStats, useWalletBalances } from "@/hooks/queries"
 import { formatAmount, formatDate } from "@/lib/format"
+import { useProjectScope } from "@/lib/project-scope"
 
 export function SectionCards() {
-  const stats = useStats()
+  // Counters follow the header selector; the wallet balances are the instance's.
+  const { scopeParam } = useProjectScope()
+  const stats = useStats(scopeParam)
   const balances = useWalletBalances()
 
   const networks = balances.data?.networks ?? []

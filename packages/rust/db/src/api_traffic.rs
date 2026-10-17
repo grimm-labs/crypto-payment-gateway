@@ -102,6 +102,16 @@ pub struct ApiRequestFilter {
     pub route: Option<String>,
     pub method: Option<String>,
     pub api_key_id: Option<String>,
+    /// Requests made with one project's keys (staff requests carry none).
+    pub project_id: Option<String>,
+}
+
+/// SQL of a project filter on the key a request carried (`$n` = project id,
+/// NULL = no filter): staff requests and rejected attempts never match.
+fn project_condition(param: &str) -> String {
+    format!(
+        r#"({param}::text IS NULL OR EXISTS (SELECT 1 FROM api_keys pk WHERE pk.id = r."apiKeyId" AND pk."projectId" = {param}))"#
+    )
 }
 
 /// (bucket, ok, 4xx, 5xx, p95)
@@ -133,6 +143,7 @@ const REQUEST_LIST_WHERE: &str = r#"
     AND ($4::text IS NULL OR r.route = $4)
     AND ($5::text IS NULL OR r.method = $5)
     AND ($6::text IS NULL OR r."apiKeyId" = $6)
+    AND ($7::text IS NULL OR EXISTS (SELECT 1 FROM api_keys pk WHERE pk.id = r."apiKeyId" AND pk."projectId" = $7))
 "#;
 
 impl Db {
@@ -182,6 +193,7 @@ impl Db {
         &self,
         surface: Option<ApiSurface>,
         window_secs: i64,
+        project_id: Option<&str>,
     ) -> Result<TrafficSummary> {
         let surface_db = surface.map(|s| s.as_db().to_string());
         let (total, last_minute, client_errors, server_errors, p50_ms, p95_ms, active_keys): (
@@ -192,7 +204,7 @@ impl Db {
             Option<f64>,
             Option<f64>,
             i64,
-        ) = sqlx::query_as(
+        ) = sqlx::query_as(&format!(
             r#"
             SELECT COUNT(*),
                    COUNT(*) FILTER (WHERE "createdAt" >= (NOW() AT TIME ZONE 'UTC') - interval '60 seconds'),
@@ -201,13 +213,16 @@ impl Db {
                    percentile_cont(0.5)  WITHIN GROUP (ORDER BY "durationMs"),
                    percentile_cont(0.95) WITHIN GROUP (ORDER BY "durationMs"),
                    COUNT(DISTINCT "apiKeyId")
-            FROM api_requests
+            FROM api_requests r
             WHERE "createdAt" >= (NOW() AT TIME ZONE 'UTC') - make_interval(secs => $2::double precision)
               AND ($1::text IS NULL OR surface = $1::"ApiSurface")
+              AND {}
             "#,
-        )
+            project_condition("$3")
+        ))
         .bind(surface_db.as_deref())
         .bind(window_secs)
+        .bind(project_id)
         .fetch_one(&self.pool)
         .await?;
         Ok(TrafficSummary {
@@ -229,9 +244,10 @@ impl Db {
         surface: Option<ApiSurface>,
         window_secs: i64,
         bucket_secs: i64,
+        project_id: Option<&str>,
     ) -> Result<Vec<TrafficBucket>> {
         let surface_db = surface.map(|s| s.as_db().to_string());
-        let rows: Vec<BucketRow> = sqlx::query_as(
+        let rows: Vec<BucketRow> = sqlx::query_as(&format!(
             r#"
             WITH bounds AS (
                 SELECT to_timestamp(floor(extract(epoch FROM NOW()) / $3) * $3) AS end_bucket
@@ -241,9 +257,10 @@ impl Db {
                        COUNT(*) FILTER (WHERE status BETWEEN 400 AND 499) AS client_error,
                        COUNT(*) FILTER (WHERE status >= 500)               AS server_error,
                        percentile_cont(0.95) WITHIN GROUP (ORDER BY "durationMs") AS p95
-                FROM api_requests
+                FROM api_requests r
                 WHERE "createdAt" >= (NOW() AT TIME ZONE 'UTC') - make_interval(secs => $2::double precision)
                   AND ($1::text IS NULL OR surface = $1::"ApiSurface")
+                  AND {}
                 GROUP BY 1
             ), series AS (
                 SELECT generate_series(
@@ -260,10 +277,12 @@ impl Db {
             LEFT JOIN agg a ON a.bucket = s.bucket
             ORDER BY s.bucket
             "#,
-        )
+            project_condition("$4")
+        ))
         .bind(surface_db.as_deref())
         .bind(window_secs)
         .bind(bucket_secs)
+        .bind(project_id)
         .fetch_all(&self.pool)
         .await?;
         Ok(rows
@@ -283,25 +302,29 @@ impl Db {
         surface: Option<ApiSurface>,
         window_secs: i64,
         limit: i64,
+        project_id: Option<&str>,
     ) -> Result<Vec<TrafficRouteStat>> {
         let surface_db = surface.map(|s| s.as_db().to_string());
-        let rows: Vec<(String, String, i64, i64, i64, Option<f64>)> = sqlx::query_as(
+        let rows: Vec<(String, String, i64, i64, i64, Option<f64>)> = sqlx::query_as(&format!(
             r#"
             SELECT method, route, COUNT(*),
                    COUNT(*) FILTER (WHERE status BETWEEN 400 AND 499),
                    COUNT(*) FILTER (WHERE status >= 500),
                    percentile_cont(0.95) WITHIN GROUP (ORDER BY "durationMs")
-            FROM api_requests
+            FROM api_requests r
             WHERE "createdAt" >= (NOW() AT TIME ZONE 'UTC') - make_interval(secs => $2::double precision)
               AND ($1::text IS NULL OR surface = $1::"ApiSurface")
+              AND {}
             GROUP BY method, route
             ORDER BY 3 DESC, route ASC
             LIMIT $3
             "#,
-        )
+            project_condition("$4")
+        ))
         .bind(surface_db.as_deref())
         .bind(window_secs)
         .bind(limit)
+        .bind(project_id)
         .fetch_all(&self.pool)
         .await?;
         Ok(rows
@@ -325,8 +348,9 @@ impl Db {
         &self,
         window_secs: i64,
         limit: i64,
+        project_id: Option<&str>,
     ) -> Result<Vec<TrafficApiKeyStat>> {
-        let rows: Vec<TopApiKeyRow> = sqlx::query_as(
+        let rows: Vec<TopApiKeyRow> = sqlx::query_as(&format!(
             r#"
             SELECT r."apiKeyId", k.name, k.prefix, k.status::text,
                    COUNT(*),
@@ -338,13 +362,16 @@ impl Db {
             LEFT JOIN api_keys k ON k.id = r."apiKeyId"
             WHERE r.surface = 'MERCHANT'::"ApiSurface"
               AND r."createdAt" >= (NOW() AT TIME ZONE 'UTC') - make_interval(secs => $1::double precision)
+              AND {}
             GROUP BY 1, 2, 3, 4
             ORDER BY 5 DESC
             LIMIT $2
             "#,
-        )
+            project_condition("$3")
+        ))
         .bind(window_secs)
         .bind(limit)
+        .bind(project_id)
         .fetch_all(&self.pool)
         .await?;
         Ok(rows
@@ -396,7 +423,7 @@ impl Db {
             LEFT JOIN staff_users s ON s.id = r."staffId"
             WHERE {REQUEST_LIST_WHERE}
             ORDER BY r."createdAt" DESC, r.id DESC
-            LIMIT $7 OFFSET $8
+            LIMIT $8 OFFSET $9
             "#
         ))
         .bind(surface_db.as_deref())
@@ -405,6 +432,7 @@ impl Db {
         .bind(filter.route.as_deref())
         .bind(filter.method.as_deref())
         .bind(filter.api_key_id.as_deref())
+        .bind(filter.project_id.as_deref())
         .bind(limit)
         .bind(offset)
         .fetch_all(&self.pool)
@@ -422,6 +450,7 @@ impl Db {
         .bind(filter.route.as_deref())
         .bind(filter.method.as_deref())
         .bind(filter.api_key_id.as_deref())
+        .bind(filter.project_id.as_deref())
         .fetch_one(&self.pool)
         .await?;
 
