@@ -17,7 +17,7 @@ use serde_json::{json, Value};
 use tracing::{error, info, warn};
 
 use crate::audit::{self, Actor};
-use crate::{enqueue_webhook, fees, treasury, AppState};
+use crate::{enqueue_webhook, fees, treasury, webhooks, AppState};
 
 pub mod resolve;
 pub mod rules;
@@ -891,12 +891,14 @@ pub fn requested_by(row: &WithdrawalRow) -> Value {
     }
 }
 
-/// Queue `event` of a withdrawal for every subscribed endpoint, once per
-/// (withdrawal, event, endpoint). A queueing failure is logged: the
-/// withdrawal itself already moved.
+/// Queue `event` of a withdrawal for the subscribed endpoints of its owner
+/// (its project, or the merchant — spec §10.1), once per (withdrawal,
+/// event, endpoint). A queueing failure is logged: the withdrawal itself
+/// already moved.
 pub async fn notify_withdrawal(state: &AppState, row: &WithdrawalRow, event: WebhookEventType) {
     let result: anyhow::Result<()> = async {
-        for endpoint in state.db.active_webhook_endpoints_for_event(event).await? {
+        let owners = webhooks::SubjectOwners::One(row.owner());
+        for endpoint in webhooks::endpoints_for(state, event, &owners).await? {
             if state
                 .db
                 .find_subject_webhook_delivery(event, &row.id, &endpoint.id)

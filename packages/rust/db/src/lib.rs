@@ -23,6 +23,7 @@ mod projects;
 mod settings;
 mod staff;
 mod sweeps;
+mod transfers;
 mod webhook_endpoints;
 mod withdrawals;
 
@@ -51,6 +52,7 @@ pub use settings::{
 };
 pub use staff::{StaffUpdate, StaffUserRow};
 pub use sweeps::{NewSweep, SweepCandidate, SweepClaim, SweepRow};
+pub use transfers::InternalTransferRow;
 pub use webhook_endpoints::{WebhookEndpointListRow, WebhookEndpointRow};
 pub use withdrawals::{
     NewWithdrawal, Reservations, WithdrawalAdmission, WithdrawalClaim, WithdrawalFilter,

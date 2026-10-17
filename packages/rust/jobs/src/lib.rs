@@ -15,8 +15,8 @@ use db::Db;
 use db::DepositAddressRow;
 use domain::{
     format_amount, raw_to_decimal, raw_to_decimal_string, required_confirmations,
-    DetectedTransfer, DepositAddressStatus, DepositStatus, Network, Token, WebhookDeliveryStatus,
-    WebhookEventType, WebhookSubject, is_amount_within_tolerance,
+    DetectedTransfer, DepositAddressStatus, DepositStatus, Network, Owner, Token,
+    WebhookDeliveryStatus, WebhookEventType, WebhookSubject, is_amount_within_tolerance,
 };
 use lightning_client::{
     LightningClient, LightningEvent, PaymentDirection, ReceivedPayment, WalletPayment,
@@ -39,6 +39,7 @@ pub mod sweeper;
 pub mod traffic;
 pub mod treasury;
 pub mod webhook_client;
+pub mod webhooks;
 pub mod withdrawals;
 pub use audit::Actor;
 pub use payouts::{legacy_payout_input, PAYOUT_ALIAS_SUNSET};
@@ -171,14 +172,11 @@ pub async fn process_detected_transfer(state: &AppState, transfer: DetectedTrans
         )
         .await?;
 
-    // Fan out to every active endpoint subscribed to the PAID event; no
-    // endpoints configured is a no-op.
+    // Fan out to the address owner's endpoints subscribed to PAID (spec
+    // §10.1); none configured is a no-op.
     if is_confirmed {
-        for endpoint in state
-            .db
-            .active_webhook_endpoints_for_event(WebhookEventType::Paid)
-            .await?
-        {
+        let owners = webhooks::SubjectOwners::One(Owner::from_project_id(address.project_id.as_deref()));
+        for endpoint in webhooks::endpoints_for(state, WebhookEventType::Paid, &owners).await? {
             if !state.db.has_delivered_webhook(&deposit.id, &endpoint.id).await? {
                 enqueue_webhook(state, WebhookEventType::Paid, &deposit.id, &endpoint.id).await?;
             }
@@ -411,7 +409,7 @@ pub async fn notify_payout(state: &AppState, payment: &WalletPayment) -> Result<
         return Ok(0);
     }
     let mut queued = 0;
-    for endpoint in state.db.active_webhook_endpoints_for_event(event).await? {
+    for endpoint in webhooks::endpoints_for(state, event, &webhooks::SubjectOwners::merchant()).await? {
         if state
             .db
             .find_payout_webhook_delivery(&payment.id, event, &endpoint.id)
@@ -476,14 +474,17 @@ async fn catch_up_payouts(state: &AppState, lightning: &LightningClient) -> Resu
 }
 
 /// Fan an address lifecycle event (PENDING at creation, EXPIRED at expiry)
-/// out to every active endpoint subscribed to it. Returns the number of
-/// deliveries queued; none subscribed is a no-op.
+/// out to the address owner's endpoints subscribed to it. Returns the
+/// number of deliveries queued; none subscribed (or no such address) is a
+/// no-op.
 pub async fn notify_address_event(
     state: &AppState,
     address_id: &str,
     event: WebhookEventType,
 ) -> Result<usize> {
-    let endpoints = state.db.active_webhook_endpoints_for_event(event).await?;
+    let Some(endpoints) = webhooks::endpoints_for_subject(state, event, address_id).await? else {
+        return Ok(0);
+    };
     for endpoint in &endpoints {
         enqueue_webhook(state, event, address_id, &endpoint.id).await?;
     }
@@ -645,18 +646,18 @@ impl From<anyhow::Error> for RetriggerError {
 }
 
 /// Manual replay for the dashboard: for every active PAID-subscribed
-/// endpoint, reset the delivery row to PENDING / 0 attempts, then schedule an
-/// immediate attempt. Never touches `deposits` or `deposit_addresses`.
+/// endpoint of the deposit's owner, reset the delivery row to PENDING / 0
+/// attempts, then schedule an immediate attempt. Never touches `deposits`
+/// or `deposit_addresses`.
 pub async fn retrigger_webhook(state: &AppState, deposit_id: &str) -> Result<(), RetriggerError> {
     let deposit = state
         .db
         .find_deposit(deposit_id)
         .await?
         .ok_or(RetriggerError::DepositNotFound)?;
-    let endpoints = state
-        .db
-        .active_webhook_endpoints_for_event(WebhookEventType::Paid)
-        .await?;
+    let endpoints = webhooks::endpoints_for_subject(state, WebhookEventType::Paid, &deposit.id)
+        .await?
+        .ok_or(RetriggerError::DepositNotFound)?;
     if endpoints.is_empty() {
         return Err(RetriggerError::NoActiveEndpoints);
     }
@@ -691,10 +692,10 @@ pub async fn retrigger_failed_deposit_webhooks(
     if deposit.status != DepositStatus::Confirmed.as_db() {
         return Err(RetriggerError::DepositNotConfirmed);
     }
-    let eligible: Vec<String> = state
-        .db
-        .active_webhook_endpoints_for_event(WebhookEventType::Paid)
+    // The deposit owner's endpoints only (spec §10.1).
+    let eligible: Vec<String> = webhooks::endpoints_for_subject(state, WebhookEventType::Paid, &deposit.id)
         .await?
+        .ok_or(RetriggerError::DepositNotFound)?
         .into_iter()
         .map(|endpoint| endpoint.id)
         .collect();
@@ -734,15 +735,6 @@ pub async fn retrigger_delivery(state: &AppState, delivery_id: &str) -> Result<(
         return retrigger_webhook(state, &deposit_id).await;
     };
 
-    let endpoint = state
-        .db
-        .find_webhook_endpoint(&endpoint_id)
-        .await?
-        .ok_or(RetriggerError::EndpointNotEligible)?;
-    if !endpoint.is_active || !endpoint.accepts_event(event) {
-        return Err(RetriggerError::EndpointNotEligible);
-    }
-
     let subject_id = match event.subject() {
         WebhookSubject::Deposit => {
             let deposit_id = delivery.deposit_id.ok_or(RetriggerError::DeliveryNotFound)?;
@@ -763,6 +755,12 @@ pub async fn retrigger_delivery(state: &AppState, delivery_id: &str) -> Result<(
         WebhookSubject::DepositAddress => delivery.deposit_address_id.clone(),
     }
     .ok_or(RetriggerError::DeliveryNotFound)?;
+    // Active, subscribed and owned by the subject's owner (spec §10.1).
+    match webhooks::check_endpoint(state, &endpoint_id, event, &subject_id).await? {
+        Ok(_) => {}
+        Err(webhooks::Ineligible::SubjectGone) => return Err(RetriggerError::DeliveryNotFound),
+        Err(_) => return Err(RetriggerError::EndpointNotEligible),
+    }
 
     state.db.reset_webhook_delivery_by_id(&delivery.id).await?;
     enqueue_webhook(state, event, &subject_id, &endpoint_id).await?;
@@ -771,19 +769,14 @@ pub async fn retrigger_delivery(state: &AppState, delivery_id: &str) -> Result<(
 }
 
 /// Bulk manual replay: re-queue every delivery key whose authoritative
-/// delivery is FAILED; legacy rows (no endpoint) fan out to all active
-/// PAID-subscribed endpoints. Individual failures are logged and skipped;
-/// returns the number of keys successfully re-queued.
+/// delivery is FAILED, towards endpoints still active, subscribed and owned
+/// by the subject's owner (spec §10.1); legacy rows (no endpoint) fan out
+/// to the owner's PAID endpoints. Individual failures are logged and
+/// skipped; returns the number of keys successfully re-queued.
 pub async fn retrigger_failed_webhooks(state: &AppState) -> Result<usize, RetriggerError> {
-    let endpoints = state.db.active_webhook_endpoints().await?;
-    if endpoints.is_empty() {
+    if state.db.active_webhook_endpoints().await?.is_empty() {
         return Err(RetriggerError::NoActiveEndpoints);
     }
-    let paid_endpoints: Vec<&str> = endpoints
-        .iter()
-        .filter(|e| e.accepts_event(WebhookEventType::Paid))
-        .map(|e| e.id.as_str())
-        .collect();
 
     let targets = state.db.failed_webhook_targets().await?;
     let mut retried = 0usize;
@@ -795,12 +788,23 @@ pub async fn retrigger_failed_webhooks(state: &AppState) -> Result<usize, Retrig
         let Some(subject_id) = target.subject_id(event) else {
             continue;
         };
-        let target_endpoints: Vec<&str> = match &target.webhook_endpoint_id {
-            Some(id) => vec![id.as_str()],
-            // Legacy failure — replay towards every active PAID endpoint.
-            None => paid_endpoints.clone(),
+        let target_endpoints: Vec<String> = match &target.webhook_endpoint_id {
+            Some(id) => match webhooks::check_endpoint(state, id, event, subject_id).await? {
+                Ok(_) => vec![id.clone()],
+                Err(reason) => {
+                    debug!("Bulk webhook retry skipped {} {subject_id} endpoint {id}: {reason:?}", event.as_api());
+                    continue;
+                }
+            },
+            // Legacy failure — replay towards the owner's active PAID endpoints.
+            None => webhooks::endpoints_for_subject(state, event, subject_id)
+                .await?
+                .unwrap_or_default()
+                .into_iter()
+                .map(|e| e.id)
+                .collect(),
         };
-        for endpoint_id in target_endpoints {
+        for endpoint_id in target_endpoints.iter().map(String::as_str) {
             let result: Result<()> = async {
                 if event == WebhookEventType::Paid {
                     state.db.reset_webhook_delivery(subject_id, endpoint_id).await?;
@@ -836,24 +840,24 @@ pub async fn deliver_webhook(
     subject_id: &str,
     endpoint_id: &str,
 ) -> Result<DeliveryOutcome> {
-    // Reload the endpoint on every attempt so a deactivation or an event
-    // unsubscription takes effect immediately: the queued member is consumed
-    // without being rescheduled, and its PENDING row is closed.
-    let endpoint = match state.db.find_webhook_endpoint(endpoint_id).await? {
-        Some(endpoint) if endpoint.is_active && endpoint.accepts_event(event) => endpoint,
-        _ => {
+    // Re-check the endpoint on every attempt — active, subscribed and owned
+    // by the subject's owner (spec §10.1) — so a deactivation, an
+    // unsubscription or a mismatch takes effect immediately: the queued
+    // member is consumed without being rescheduled, and its PENDING row is
+    // closed.
+    let endpoint = match webhooks::check_endpoint(state, endpoint_id, event, subject_id).await? {
+        Ok(endpoint) => endpoint,
+        Err(reason) => {
+            let message = match reason {
+                webhooks::Ineligible::EndpointUnavailable => "Endpoint inactive, unsubscribed or deleted",
+                webhooks::Ineligible::OwnerMismatch => "Endpoint belongs to another owner",
+                webhooks::Ineligible::SubjectGone => "Subject not found",
+            };
             warn!(
-                "Webhook delivery skipped for {} {subject_id} — endpoint {endpoint_id} is inactive, gone or unsubscribed",
+                "Webhook delivery skipped for {} {subject_id} — endpoint {endpoint_id}: {message}",
                 event.as_api()
             );
-            close_undeliverable(
-                state,
-                event,
-                subject_id,
-                endpoint_id,
-                "Endpoint inactive, unsubscribed or deleted",
-            )
-            .await?;
+            close_undeliverable(state, event, subject_id, endpoint_id, message).await?;
             return Ok(DeliveryOutcome::Skipped);
         }
     };
@@ -980,6 +984,7 @@ async fn prepare_delivery(
                 "event_type": event.payload_event_type(),
                 "data": {
                     "deposit_id": deposit.deposit_address_id,
+                    "project_id": address.project_id,
                     "address": address.address,
                     "network": network.as_api(),
                     "token": token.as_api(),
@@ -1132,6 +1137,7 @@ fn address_event_payload(
         "event_type": event.payload_event_type(),
         "data": {
             "deposit_id": address.id,
+            "project_id": address.project_id,
             "address": address.address,
             "network": network.as_api(),
             "token": token.as_api(),
@@ -1503,16 +1509,13 @@ async fn process_queue_member(state: &AppState, member: &str) -> Option<i64> {
             None
         }
         QueueMember::Legacy(deposit_id) => {
-            // Pre-multi-endpoint member: fan it out to the current active
-            // PAID-subscribed endpoints (as decodable members).
-            match state
-                .db
-                .active_webhook_endpoints_for_event(WebhookEventType::Paid)
-                .await
-            {
+            // Pre-multi-endpoint member: fan it out to the deposit owner's
+            // active PAID-subscribed endpoints (as decodable members).
+            match webhooks::endpoints_for_subject(state, WebhookEventType::Paid, deposit_id).await {
                 Ok(endpoints) => {
+                    let endpoints = endpoints.unwrap_or_default();
                     if endpoints.is_empty() {
-                        warn!("Dropping legacy webhook queue member {deposit_id} — no active endpoints");
+                        warn!("Dropping legacy webhook queue member {deposit_id} — no endpoint to notify");
                     }
                     for endpoint in endpoints {
                         if let Err(err) =

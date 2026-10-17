@@ -183,20 +183,25 @@ impl Db {
         Ok(rows)
     }
 
-    /// Active endpoints subscribed to `event` — the fan-out set when that
-    /// event fires.
+    /// Active endpoints subscribed to `event` that belong to `owner` — the
+    /// fan-out set when that event fires (spec §10.1). `None` = every owner
+    /// (only before the first project exists).
     pub async fn active_webhook_endpoints_for_event(
         &self,
         event: WebhookEventType,
+        owner: Option<&Owner>,
     ) -> Result<Vec<WebhookEndpointRow>> {
         let rows = sqlx::query_as::<_, WebhookEndpointRow>(&format!(
             r#"
             SELECT {WEBHOOK_ENDPOINT_COLUMNS} FROM webhook_endpoints
             WHERE "isActive" = true AND $1 = ANY(events)
+              AND (NOT $2 OR "projectId" IS NOT DISTINCT FROM $3)
             ORDER BY "createdAt" ASC
             "#
         ))
         .bind(event.as_db())
+        .bind(owner.is_some())
+        .bind(owner.and_then(|o| o.project_id()))
         .fetch_all(&self.pool)
         .await?;
         Ok(rows)

@@ -9,7 +9,7 @@ use domain::{AlertType, Network, Token, WebhookEventType};
 use serde_json::Value;
 use tracing::warn;
 
-use crate::{enqueue_webhook, AppState};
+use crate::{enqueue_webhook, webhooks, AppState};
 
 /// The deduplication key: conditions (gas reserve low, cap exceeded) per
 /// type/network/token — one alert a day while it holds; events per subject
@@ -60,8 +60,9 @@ pub async fn raise(
         details = %row.details,
         "ALERT"
     );
+    // Alerts are the merchant's (spec §10.1): merchant endpoints only.
     let event = WebhookEventType::for_alert(alert);
-    for endpoint in state.db.active_webhook_endpoints_for_event(event).await? {
+    for endpoint in webhooks::endpoints_for(state, event, &webhooks::SubjectOwners::merchant()).await? {
         enqueue_webhook(state, event, &row.id, &endpoint.id).await?;
     }
     Ok(Some(row))
