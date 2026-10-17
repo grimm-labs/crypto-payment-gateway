@@ -300,15 +300,23 @@ pub(crate) async fn create_withdrawal(
     Json(body): Json<WithdrawalRequest>,
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
     let key = idempotency_key(&headers)?;
+    if api_key.is_none() {
+        // Staff: admin only, and never before the first project exists (spec
+        // §12: `409 "Create a project first"` comes before any body check —
+        // a withdrawal is an owned object).
+        let Some(staff) = staff.as_deref() else {
+            return Err(ApiError::unauthorized("Not authenticated"));
+        };
+        if staff.role != StaffRole::Admin {
+            return Err(ApiError::forbidden("Admin role required"));
+        }
+        require_any_project(&state).await?;
+    }
     let input = validate_withdrawal_request(&body, api_key.is_some())?;
     rate_limit::hit(&state, rate_limit::WITHDRAWALS, &caller_id(api_key.as_deref(), staff.as_deref())).await?;
     let requester = match (api_key.as_deref(), staff.as_deref()) {
         (Some(key), _) => key_requester(key),
         (None, Some(staff)) => {
-            if staff.role != StaffRole::Admin {
-                return Err(ApiError::forbidden("Admin role required"));
-            }
-            require_any_project(&state).await?;
             require_step_up(&state, &staff.id, body.totp_code.as_deref()).await?;
             staff_requester(staff)
         }
