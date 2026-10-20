@@ -216,42 +216,51 @@ fn shortfall_counter_key(state: &AppState, network: Network, token: Token) -> St
 /// and raise `LEDGER_SHORTFALL` after three consecutive shortfalls.
 pub async fn check_shortfalls(state: &AppState) -> Result<()> {
     let mut conn = state.db.pool().acquire().await?;
-    let mut redis = state.redis.clone();
     for (network, token) in payment_pairs() {
-        let funds = merchant_funds(state, &mut conn, network, token).await?;
-        let key = shortfall_counter_key(state, network, token);
-        let previous: i64 = redis.get(&key).await.unwrap_or(None::<i64>).unwrap_or(0);
-        let count = shortfall_count_after(previous, funds.status());
-        if count == 0 {
-            let _: Result<(), redis::RedisError> = redis.del(&key).await;
-            continue;
+        // One pair's failure (a provider, the database) leaves the others
+        // checked and counted this tick.
+        if let Err(err) = check_shortfall(state, &mut conn, network, token).await {
+            warn!("ledger shortfall check of {} {} failed: {err:#}", network.as_api(), token.as_api());
         }
-        let _: Result<(), redis::RedisError> = redis.set(&key, count).await;
-        if !shortfall_alert_due(count) {
-            continue;
-        }
-        let Some(merchant) = funds.merchant_funds else { continue };
-        warn!(
-            "Ledger shortfall on {} {}: the project balances exceed the holdings by {} base units ({count} consecutive checks)",
-            network.as_api(),
-            token.as_api(),
-            -merchant
-        );
-        crate::alerts::raise(
-            state,
-            AlertType::LedgerShortfall,
-            Some(network),
-            Some(token),
-            None,
-            json!({
-                "holdings_raw": funds.holdings.map(|h| h.to_string()),
-                "project_balances_raw": funds.project_total.to_string(),
-                "shortfall_raw": (-merchant).to_string(),
-                "consecutive_checks": count,
-            }),
-        )
-        .await?;
     }
+    Ok(())
+}
+
+async fn check_shortfall(state: &AppState, conn: &mut sqlx::PgConnection, network: Network, token: Token) -> Result<()> {
+    let mut redis = state.redis.clone();
+    let funds = merchant_funds(state, conn, network, token).await?;
+    let key = shortfall_counter_key(state, network, token);
+    let previous: i64 = redis.get(&key).await.unwrap_or(None::<i64>).unwrap_or(0);
+    let count = shortfall_count_after(previous, funds.status());
+    if count == 0 {
+        let _: Result<(), redis::RedisError> = redis.del(&key).await;
+        return Ok(());
+    }
+    let _: Result<(), redis::RedisError> = redis.set(&key, count).await;
+    if !shortfall_alert_due(count) {
+        return Ok(());
+    }
+    let Some(merchant) = funds.merchant_funds else { return Ok(()) };
+    warn!(
+        "Ledger shortfall on {} {}: the project balances exceed the holdings by {} base units ({count} consecutive checks)",
+        network.as_api(),
+        token.as_api(),
+        -merchant
+    );
+    crate::alerts::raise(
+        state,
+        AlertType::LedgerShortfall,
+        Some(network),
+        Some(token),
+        None,
+        json!({
+            "holdings_raw": funds.holdings.map(|h| h.to_string()),
+            "project_balances_raw": funds.project_total.to_string(),
+            "shortfall_raw": (-merchant).to_string(),
+            "consecutive_checks": count,
+        }),
+    )
+    .await?;
     Ok(())
 }
 

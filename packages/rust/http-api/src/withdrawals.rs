@@ -19,7 +19,7 @@ use db::{
 };
 use domain::{
     is_withdrawable, parse_amount_raw, parse_sats, raw_u128_to_string, AlertType, DestinationKind,
-    Network, Owner, StaffRole, SweepStatus, Token, WithdrawalStatus,
+    Network, Owner, StaffRole, SweepStatus, Token, WithdrawalPolicy, WithdrawalStatus,
 };
 use jobs::freeze::FreezeError;
 use jobs::withdrawals::{
@@ -175,6 +175,15 @@ pub(crate) fn idempotency_key(headers: &HeaderMap) -> Result<String, ApiError> {
     uuid::Uuid::parse_str(raw.trim())
         .map(|uuid| uuid.hyphenated().to_string())
         .map_err(|_| ApiError::bad_request("Idempotency-Key must be a UUID"))
+}
+
+/// Spec §7.13: the merchant withdrawal surface (reads included) is for keys
+/// holding a withdrawal policy; a `NONE` key is refused with 403.
+pub(crate) fn require_withdrawal_access(key: &CurrentApiKey) -> Result<(), ApiError> {
+    if key.withdrawal_policy == WithdrawalPolicy::None {
+        return Err(ApiError::forbidden("This API key has no withdrawal permission"));
+    }
+    Ok(())
 }
 
 pub(crate) fn key_requester(key: &CurrentApiKey) -> Requester {
@@ -365,6 +374,9 @@ pub(crate) async fn list_withdrawals(
     api_key: Option<Extension<CurrentApiKey>>,
     Query(query): Query<WithdrawalListQuery>,
 ) -> Result<Json<Value>, ApiError> {
+    if let Some(key) = api_key.as_deref() {
+        require_withdrawal_access(key)?;
+    }
     let filter = WithdrawalFilter {
         status: query
             .status
@@ -408,6 +420,7 @@ async fn find_visible(state: &AppState, api_key: Option<&CurrentApiKey>, id: &st
     let not_found = || ApiError::not_found(format!("Withdrawal not found: {id}"));
     match api_key {
         Some(key) => {
+            require_withdrawal_access(key)?;
             let filter = WithdrawalFilter {
                 api_key_id: key.project_id.is_none().then(|| key.id.clone()),
                 owner: crate::merchant_scope(Some(key)),
@@ -450,10 +463,13 @@ pub(crate) async fn cancel_withdrawal(
     body: Bytes,
 ) -> Result<Json<Value>, ApiError> {
     let canceller = match (api_key.as_deref(), staff.as_deref()) {
-        (Some(key), _) => Canceller::ApiKey {
-            id: key.id.clone(),
-            project_id: key.project_id.clone(),
-        },
+        (Some(key), _) => {
+            require_withdrawal_access(key)?;
+            Canceller::ApiKey {
+                id: key.id.clone(),
+                project_id: key.project_id.clone(),
+            }
+        }
         (None, Some(staff)) => {
             let body: StepUpBody = if body.is_empty() {
                 StepUpBody::default()
@@ -738,6 +754,7 @@ pub(crate) async fn get_treasury(State(state): State<AppState>) -> Result<Json<V
                 object.insert("unswept".into(), json!(fmt(&Some(row.unswept_raw.clone()))));
                 object.insert("unattributed".into(), json!(fmt(&Some(row.unattributed_raw.clone()))));
                 object.insert("hot_wallet_cap".into(), json!(fmt(&row.hot_wallet_cap_raw)));
+                object.insert("asset_holdings".into(), json!(fmt(&row.asset_holdings_raw)));
                 object.insert("gas_floor".into(), json!(fmt(&row.gas_floor_raw)));
                 object.insert("gas_alert_below".into(), json!(fmt(&row.gas_alert_below_raw)));
             }
@@ -853,6 +870,8 @@ pub(crate) async fn get_outflows(State(state): State<AppState>) -> Result<Json<V
     Ok(Json(json!({
         "frozen": jobs::freeze::outflows_frozen(&state).await,
         "forced_by_environment": state.config.outflows_frozen,
+        // Polled app-wide: the dashboard picks its block explorers from it.
+        "chain_mode": state.config.chain.mode.as_str(),
     })))
 }
 
@@ -1164,6 +1183,9 @@ pub(crate) async fn create_lightning_payout(
             if staff.role != StaffRole::Admin {
                 return Err(ApiError::forbidden("Admin role required"));
             }
+            // A withdrawal is an owned object: never before the first project
+            // exists (spec §12), on the alias like on `POST /withdrawals`.
+            require_any_project(&state).await?;
             require_step_up(&state, &staff.id, body.totp_code.as_deref()).await?;
             staff_requester(staff)
         }
@@ -1356,6 +1378,22 @@ mod tests {
         })))
         .unwrap_err();
         assert_eq!(err.status, StatusCode::BAD_REQUEST);
+    }
+
+    /// Spec §7.13: the merchant withdrawal surface is for keys with a
+    /// withdrawal policy; a `NONE` key gets 403 on reads too.
+    #[test]
+    fn keys_without_a_withdrawal_policy_have_no_withdrawal_surface() {
+        let key = |policy| CurrentApiKey {
+            id: "k1".into(),
+            project_id: Some("p1".into()),
+            withdrawal_policy: policy,
+            withdrawal_tokens: vec![],
+            withdrawal_networks: None,
+        };
+        assert_eq!(require_withdrawal_access(&key(WithdrawalPolicy::None)).unwrap_err().status, StatusCode::FORBIDDEN);
+        assert!(require_withdrawal_access(&key(WithdrawalPolicy::Book)).is_ok());
+        assert!(require_withdrawal_access(&key(WithdrawalPolicy::Open)).is_ok());
     }
 
     #[test]

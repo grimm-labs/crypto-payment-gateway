@@ -437,7 +437,7 @@ All mutating calls require `Idempotency-Key` where noted, return `ApiError` JSON
 
 | Method | Path | Notes |
 |---|---|---|
-| POST | `/withdrawals` | `Idempotency-Key` required. Body: `network`, `token`, `amount` (decimal string) or `amount_sats` (bitcoin/lightning), exactly one of `destination` / `address_book_entry_id`, optional `reference`, `comment` (lightning), `metadata`. `202` new, `200` replay, `409` in progress, `422` key reused/limits/funds/destination rule, `503` frozen or network disabled. |
+| POST | `/withdrawals` | `Idempotency-Key` required. Body: `network`, `token`, `amount` (decimal string) or `amount_sats` (bitcoin/lightning), exactly one of `destination` / `address_book_entry_id`, optional `reference`, `comment` (lightning), `metadata`. `202` new, `200` replay (a concurrent request with the same key waits for the admission under the asset lock and gets the stored withdrawal, never a `409`), `422` key reused/limits/funds/destination rule, `503` frozen or network disabled. |
 | POST | `/withdrawals/quote` | Same body without the key; no reservation. |
 | GET | `/withdrawals` | Only this key's withdrawals; filters `status`, `network`, `token`; paging as elsewhere. |
 | GET | `/withdrawals/{id}` | 404 for another key's withdrawal. |

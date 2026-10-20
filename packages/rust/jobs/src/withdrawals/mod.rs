@@ -10,8 +10,8 @@ use chrono::Utc;
 use config::{WITHDRAWAL_APPROVAL_EXPIRY_SECS, WITHDRAWAL_SELF_APPROVAL_DELAY_SECS};
 use db::{NewWithdrawal, WithdrawalRow, WithdrawalUpdate};
 use domain::{
-    format_amount, raw_u128_to_string, reserved_amount, CancelReason, DestinationKind, Network,
-    Owner, ProjectBalance, Token, WebhookEventType, WithdrawalPolicy, WithdrawalStatus,
+    format_amount, next_withdrawal_status, raw_u128_to_string, reserved_amount, CancelReason, DestinationKind,
+    Network, Owner, ProjectBalance, Token, WebhookEventType, WithdrawalEvent, WithdrawalPolicy, WithdrawalStatus,
 };
 use serde_json::{json, Value};
 use tracing::{error, info, warn};
@@ -113,9 +113,11 @@ pub struct WithdrawalQuote {
     pub address_book_entry_id: Option<String>,
     /// `None` when the destination is acceptable for this caller.
     pub destination_refusal: Option<RuleError>,
-    /// Of the withdrawn token on its network; `None` when unreadable.
+    /// Of the withdrawn token on its network; `None` when unreadable, and
+    /// always for a merchant key (a custody figure, staff only).
     pub available_raw: Option<u128>,
-    /// Gas still available for the fee (when paid in another asset).
+    /// Gas still available for the fee (when paid in another asset); staff
+    /// only, like `available_raw`.
     pub fee_available_raw: Option<u128>,
     /// Merchant keys: the project's available balance of the asset (spec
     /// §8.3), signed, and whether the project check would pass. `None` for
@@ -353,12 +355,17 @@ pub async fn quote_withdrawal(
     input: &WithdrawalInput,
 ) -> Result<WithdrawalQuote, WithdrawalError> {
     let (prepared, refusal) = prepare(state, requester, input).await?;
-    let (token_balance, fee_balance) = match balances(state, None, input.network, input.token, None, false).await {
-        Ok((token, fee)) => (Some(token), fee),
-        Err(err) => {
-            warn!("Quote without available balance: {err:?}");
-            (None, None)
+    // Custody figures are for staff (projects spec invariant 7).
+    let (token_balance, fee_balance) = if rules::custody_figures_visible(requester) {
+        match balances(state, None, input.network, input.token, None, false).await {
+            Ok((token, fee)) => (Some(token), fee),
+            Err(err) => {
+                warn!("Quote without available balance: {err:?}");
+                (None, None)
+            }
         }
+    } else {
+        (None, None)
     };
     // Merchant keys: the project's own figure (never cached, spec §7.2).
     let (project_available_raw, project_check_ok) = match (requester, &prepared.owner) {
@@ -642,19 +649,17 @@ pub async fn approve_withdrawal(
     let amount = row.amount_raw.0;
     let fee = row.fee_estimate_raw.map(|f| f.0).unwrap_or(0);
     let settings = state.db.asset_settings(token).await?;
-    if let Some(entry_id) = &row.address_book_entry_id {
-        let active = state
-            .db
-            .find_address_book_entry(entry_id)
-            .await?
-            .is_some_and(|entry| entry.is_active(Utc::now()) && entry.destination == row.destination);
-        if !active {
-            return Err(RuleError::Refused {
-                code: "address_book_entry_not_active",
-                message: "The address-book entry of this withdrawal was deleted".into(),
-            }
-            .into());
+    // The destination rule holds for whoever asked: a raw destination that
+    // matched a book entry at creation keeps that entry as information only,
+    // so a deleted entry blocks the withdrawal only when its caller needs
+    // the book (spec §7.4).
+    let requester = requester_of(state, &row).await?.ok_or_else(|| RuleError::Forbidden("The requester is no longer allowed".into()))?;
+    if rules::check_destination_rule(&requester, row.approval_required, book_entry_active(state, &row).await?, row.destination_kind()?).is_err() {
+        return Err(RuleError::Refused {
+            code: "address_book_entry_not_active",
+            message: "The address-book entry of this withdrawal was deleted".into(),
         }
+        .into());
     }
 
     let mut admission = state
@@ -703,7 +708,7 @@ pub async fn approve_withdrawal(
         .transition(
             id,
             &[WithdrawalStatus::PendingApproval],
-            WithdrawalStatus::Queued,
+            admin_transition(&row, WithdrawalEvent::Approve)?,
             &WithdrawalUpdate {
                 approved_by_id: Some(approver_id.to_string()),
                 ..Default::default()
@@ -714,6 +719,26 @@ pub async fn approve_withdrawal(
     admission.commit().await?;
     audit::record(state, actor, "withdrawal.approved", Some(("withdrawal", id)), json!({})).await;
     Ok(approved)
+}
+
+/// The status an admin action leads to, from the transition table (spec
+/// §7.3): a `Conflict` when the withdrawal is not in a status that allows
+/// it, so that no caller ever writes a status the machine refuses.
+fn admin_transition(row: &WithdrawalRow, event: WithdrawalEvent) -> Result<WithdrawalStatus, WithdrawalError> {
+    let lightning = row.network().map(|n| n == Network::Lightning).unwrap_or(false);
+    next_withdrawal_status(row.status()?, event, lightning)
+        .map_err(|_| WithdrawalError::Conflict(format!("This withdrawal cannot be {} now", event_verb(event))))
+}
+
+fn event_verb(event: WithdrawalEvent) -> &'static str {
+    match event {
+        WithdrawalEvent::Approve => "approved",
+        WithdrawalEvent::Reject => "rejected",
+        WithdrawalEvent::Cancel => "cancelled",
+        WithdrawalEvent::Replace => "bumped",
+        WithdrawalEvent::Abandon => "abandoned",
+        _ => "changed",
+    }
 }
 
 /// Reject a pending withdrawal: an ADMIN other than its requester.
@@ -732,7 +757,7 @@ pub async fn reject_withdrawal(
         .transition_withdrawal(
             id,
             &[WithdrawalStatus::PendingApproval],
-            WithdrawalStatus::Cancelled,
+            admin_transition(&row, WithdrawalEvent::Reject)?,
             &WithdrawalUpdate {
                 cancelled_by_id: Some(admin_id.to_string()),
                 cancel_reason: Some(CancelReason::Rejected),
@@ -767,26 +792,33 @@ pub async fn cancel_withdrawal(
     canceller: &Canceller,
     id: &str,
 ) -> Result<WithdrawalRow, WithdrawalError> {
-    let row = state.db.find_withdrawal(id).await?.ok_or(WithdrawalError::NotFound)?;
-    let by = match canceller {
+    // Invariant 2: a merchant key reaches its project's withdrawal through
+    // a query scoped on the project (a legacy key, its own); another
+    // project's is as absent as a missing one.
+    let (row, by) = match canceller {
         Canceller::ApiKey { id: key, project_id } => {
-            let visible = match project_id {
-                Some(project) => row.project_id.as_deref() == Some(project.as_str()),
-                None => row.api_key_id.as_deref() == Some(key.as_str()),
+            let filter = db::WithdrawalFilter {
+                api_key_id: project_id.is_none().then(|| key.clone()),
+                owner: match project_id {
+                    Some(project) => db::OwnerFilter::Project(project.clone()),
+                    None => db::OwnerFilter::Any,
+                },
+                ..Default::default()
             };
-            if !visible {
-                return Err(WithdrawalError::NotFound);
-            }
-            key
+            let row = state.db.find_withdrawal_visible(id, &filter).await?.ok_or(WithdrawalError::NotFound)?;
+            (row, key)
         }
-        Canceller::Admin(staff) => staff,
+        Canceller::Admin(staff) => {
+            let row = state.db.find_withdrawal(id).await?.ok_or(WithdrawalError::NotFound)?;
+            (row, staff)
+        }
     };
     let cancelled = state
         .db
         .transition_withdrawal(
             id,
             &[WithdrawalStatus::PendingApproval, WithdrawalStatus::Queued],
-            WithdrawalStatus::Cancelled,
+            admin_transition(&row, WithdrawalEvent::Cancel)?,
             &WithdrawalUpdate {
                 cancelled_by_id: Some(by.clone()),
                 cancel_reason: Some(CancelReason::Cancelled),
@@ -813,7 +845,7 @@ pub async fn bump_withdrawal(state: &AppState, actor: &Actor, id: &str) -> Resul
         .transition_withdrawal(
             id,
             &[WithdrawalStatus::Stuck],
-            WithdrawalStatus::Broadcast,
+            admin_transition(&row, WithdrawalEvent::Replace)?,
             &WithdrawalUpdate {
                 fee_cap_raw: Some(cap),
                 ..Default::default()
@@ -864,17 +896,40 @@ pub async fn recheck_before_signing(state: &AppState, row: &WithdrawalRow) -> an
     }
     let network = row.network()?;
     let token = row.token()?;
-    let requester = match (&row.api_key_id, &row.staff_id) {
+    let Some(requester) = requester_of(state, row).await? else {
+        return Ok(Err("requester_revoked"));
+    };
+    if rules::authorize(&requester, network, token).is_err() {
+        return Ok(Err("requester_revoked"));
+    }
+    // A raw destination that matched a book entry at creation keeps the
+    // entry as information: once the entry is gone, the rule decides on the
+    // destination alone (an OPEN key or an admin below the threshold may
+    // still send there; a BOOK key or an approval-level withdrawal may not).
+    let entry_active = book_entry_active(state, row).await?;
+    if rules::check_destination_rule(&requester, row.approval_required, entry_active, row.destination_kind()?).is_err() {
+        return Ok(Err("destination_not_allowed"));
+    }
+    if resolve::is_gateway_destination(state, network, &row.destination).await? {
+        return Ok(Err("destination_not_allowed"));
+    }
+    Ok(Ok(()))
+}
+
+/// The withdrawal's requester as it stands in the database now, `None`
+/// when it is revoked, expired, inactive or gone.
+async fn requester_of(state: &AppState, row: &WithdrawalRow) -> anyhow::Result<Option<Requester>> {
+    Ok(match (&row.api_key_id, &row.staff_id) {
         (Some(key_id), _) => {
             let Some(key) = state.db.find_api_key(key_id).await? else {
-                return Ok(Err("requester_revoked"));
+                return Ok(None);
             };
             let usable = key.status == domain::ApiKeyStatus::Active.as_db()
                 && key.expires_at.is_none_or(|deadline| deadline > Utc::now());
             if !usable {
-                return Ok(Err("requester_revoked"));
+                return Ok(None);
             }
-            Requester::ApiKey {
+            Some(Requester::ApiKey {
                 id: key.id.clone(),
                 project_id: key.project_id.clone(),
                 policy: key.withdrawal_policy(),
@@ -883,40 +938,32 @@ pub async fn recheck_before_signing(state: &AppState, row: &WithdrawalRow) -> an
                     .withdrawal_networks
                     .as_ref()
                     .map(|n| n.iter().filter_map(|n| Network::from_db(n).ok()).collect()),
-            }
+            })
         }
         (None, Some(staff_id)) => {
             let Some(staff) = state.db.find_staff_by_id(staff_id).await? else {
-                return Ok(Err("requester_revoked"));
+                return Ok(None);
             };
             if !staff.is_active {
-                return Ok(Err("requester_revoked"));
+                return Ok(None);
             }
-            Requester::Staff { id: staff.id, role: domain::StaffRole::from_db(&staff.role)? }
+            Some(Requester::Staff { id: staff.id, role: domain::StaffRole::from_db(&staff.role)? })
         }
-        (None, None) => return Ok(Err("requester_revoked")),
-    };
-    if rules::authorize(&requester, network, token).is_err() {
-        return Ok(Err("requester_revoked"));
-    }
-    let entry_active = match &row.address_book_entry_id {
+        (None, None) => None,
+    })
+}
+
+/// Whether the withdrawal's book entry (if any) is still active and still
+/// says the same destination.
+async fn book_entry_active(state: &AppState, row: &WithdrawalRow) -> anyhow::Result<bool> {
+    Ok(match &row.address_book_entry_id {
         Some(entry_id) => state
             .db
             .find_address_book_entry(entry_id)
             .await?
             .is_some_and(|entry| entry.is_active(Utc::now()) && entry.destination == row.destination),
         None => false,
-    };
-    if row.address_book_entry_id.is_some() && !entry_active {
-        return Ok(Err("destination_not_allowed"));
-    }
-    if rules::check_destination_rule(&requester, row.approval_required, entry_active, row.destination_kind()?).is_err() {
-        return Ok(Err("destination_not_allowed"));
-    }
-    if resolve::is_gateway_destination(state, network, &row.destination).await? {
-        return Ok(Err("destination_not_allowed"));
-    }
-    Ok(Ok(()))
+    })
 }
 
 /// Webhook body of a withdrawal event (its current state).

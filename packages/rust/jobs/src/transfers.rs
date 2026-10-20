@@ -97,6 +97,13 @@ fn insufficient(code: &'static str, message: &str) -> WithdrawalError {
 /// Record a transfer (spec §9): validation, the project or merchant-funds
 /// check inside the `withdrawal-asset:{TOKEN}` lock, the row, the ledger
 /// cache, the audit entry and `transfer_completed` to both sides.
+/// The unique index on `internal_transfers."idempotencyKey"` met on insert.
+fn is_idempotency_conflict(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<sqlx::Error>()
+        .and_then(|e| e.as_database_error())
+        .is_some_and(|e| e.is_unique_violation() && e.constraint().is_some_and(|c| c.contains("idempotencyKey")))
+}
+
 pub async fn create_transfer(
     state: &AppState,
     actor: &Actor,
@@ -160,8 +167,16 @@ pub async fn create_transfer(
             staff_id,
         },
     )
-    .await?;
-    admission.commit().await?;
+    .await
+    // Two requests with the same key but different tokens take different
+    // asset locks: the second one meets the unique index instead of the
+    // replay lookup, and is the same reuse (spec §9).
+    .map_err(|err| if is_idempotency_conflict(&err) { WithdrawalError::KeyReused } else { err.into() })?;
+    admission.commit().await
+    // Two requests with the same key but different tokens take different
+    // asset locks: the second one meets the unique index instead of the
+    // replay lookup, and is the same reuse (spec §9).
+    .map_err(|err| if is_idempotency_conflict(&err) { WithdrawalError::KeyReused } else { err.into() })?;
     ledger::invalidate_cache(state).await;
 
     info!(

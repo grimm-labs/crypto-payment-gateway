@@ -1018,10 +1018,10 @@ impl Db {
         let rows = sqlx::query_as::<_, WebhookDeliveryRow>(&format!(
             r#"
             SELECT * FROM (
-                SELECT DISTINCT ON ("webhookEndpointId") {WEBHOOK_DELIVERY_COLUMNS}
+                SELECT DISTINCT ON ("depositAddressId", "lightningPaymentId", "withdrawalId", "alertId", "transferId", "eventType", "depositId", "webhookEndpointId") {WEBHOOK_DELIVERY_COLUMNS}
                 FROM webhook_deliveries
                 WHERE "depositId" = $1 AND "webhookEndpointId" IS NOT NULL
-                ORDER BY "webhookEndpointId", "createdAt" DESC
+                ORDER BY "depositAddressId", "lightningPaymentId", "withdrawalId", "alertId", "transferId", "eventType", "depositId", "webhookEndpointId", "createdAt" DESC
             ) t
             WHERE t.status = 'FAILED'
             "#

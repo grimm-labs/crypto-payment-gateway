@@ -366,7 +366,7 @@ Gateway-owned addresses (deposit addresses, treasuries, their token accounts) ar
 | Method | Path | |
 |---|---|---|
 | POST | `/withdrawals` | Create (above) |
-| POST | `/withdrawals/quote` | Same body, no `Idempotency-Key`: `fee_estimate` / `fee_token`, `approval_required`, `destination_acceptable` for this key, `available` (the instance), `project_available` and `project_check_ok` — nothing is reserved |
+| POST | `/withdrawals/quote` | Same body, no `Idempotency-Key`: `fee_estimate` / `fee_token`, `approval_required`, `destination_acceptable` for this key, `project_available` and `project_check_ok` — nothing is reserved. `available` / `fee_available` (the instance's custody) are `null` for a key: staff only |
 | GET | `/withdrawals?status=&network=&token=&limit=&offset=` | The project's withdrawals (every key of the project, admin withdrawals attributed to it included) |
 | GET | `/withdrawals/{id}` | `404` for another project's |
 | POST | `/withdrawals/{id}/cancel` | A withdrawal of the project, while `pending_approval` / `queued` |
@@ -446,9 +446,9 @@ creation answers `409 "Create a project first"`.
 | GET · POST | `/withdrawals`, `/withdrawals/{id}` · `/withdrawals`, `/withdrawals/quote` | JWT · admin | List (`status`, `network`, `token`, `api_key_id`, `project_id` UUID or `merchant`) and detail with every signed transaction (fee bumps included) · create (`totp_code`, `project_id` UUID or `merchant` — gas assets merchant only) and quote — the merchant body, gas assets included |
 | POST | `/withdrawals/{id}/approve`, `/reject`, `/cancel`, `/bump`, `/abandon` | admin | Approve as an admin other than the requester (a single active admin may approve their own 24 h after creation); cancel while `pending_approval` / `queued`; on a `stuck` one, bump (doubles its fee cap) or abandon (only once the network proves none of its transactions can land) |
 | GET · POST/DELETE | `/address-book` · `/address-book`, `/address-book/{id}` | JWT · admin | List (`?project_id`) · add (`project_id` UUID or `merchant`, `network`, `destination`, `label`, `is_cold_storage`; usable 24 h later; a destination is allowed once per owner) / remove |
-| GET | `/treasury` | JWT | Per (network, token): treasury address, confirmed, reserved, available, unswept, unattributed, gas reserve and cap status, plus `outflows_frozen` |
+| GET | `/treasury` | JWT | Per (network, token): treasury address, confirmed, reserved, available, unswept, unattributed, gas reserve, and the hot-wallet cap status — per asset: `asset_holdings` sums the asset's treasuries over its networks and `cap_exceeded` compares that sum to the cap, on every row of the asset — plus `outflows_frozen` |
 | GET · POST | `/sweeps` · `/sweeps/run` | JWT · admin | Sweep history · plan sweeps now (optional `network`) |
-| GET · POST · POST | `/outflows` · `/outflows/freeze` · `/outflows/unfreeze` | JWT · JWT · admin | Freeze state · freeze every outflow (any staff, no TOTP) · lift it (TOTP; impossible while `OUTFLOWS_FROZEN=true`) |
+| GET · POST · POST | `/outflows` · `/outflows/freeze` · `/outflows/unfreeze` | JWT · JWT · admin | Freeze state (`frozen`, `forced_by_environment`, and `chain_mode` — the dashboard picks its block explorers from it) · freeze every outflow (any staff, no TOTP) · lift it (TOTP; impossible while `OUTFLOWS_FROZEN=true`) |
 | GET | `/alerts` | JWT | Gas reserve low, treasury cap exceeded, address-book entry added, withdrawal stuck, ledger shortfall |
 | GET | `/payout-requests` | admin | Former Lightning payout requests (read-only history) |
 | GET | `/stats?project_id=` · `/stats/deposits-timeseries?days=&project_id=` | JWT | Counters (addresses/deposits/webhooks by status) + confirmed volume · daily series |

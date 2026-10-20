@@ -232,7 +232,12 @@ pub struct TreasuryRow {
     pub gas_alert_below_raw: Option<String>,
     pub gas_low: bool,
     pub hot_wallet_cap_raw: Option<String>,
+    /// The cap is per asset (spec §7.5): `true` when the asset's treasuries
+    /// on every network together exceed it, on each of its rows.
     pub cap_exceeded: bool,
+    /// The asset's confirmed treasury balances summed over its networks —
+    /// what the cap is measured against; `None` while none is readable.
+    pub asset_holdings_raw: Option<String>,
     pub available: bool,
     /// Why the balance could not be read (client-safe).
     pub message: Option<String>,
@@ -306,13 +311,42 @@ pub async fn treasury_view(state: &AppState) -> Result<Vec<TreasuryRow>> {
                 gas_alert_below_raw: alert_below.map(|a| a.to_string()),
                 gas_low: matches!((confirmed, alert_below), (Some(c), Some(a)) if c < a),
                 hot_wallet_cap_raw: cap.map(|c| c.to_string()),
-                cap_exceeded: matches!((confirmed, cap), (Some(c), Some(cap)) if c > cap),
+                cap_exceeded: false,
+                asset_holdings_raw: None,
                 available: enabled && confirmed.is_some(),
                 message,
             });
         }
     }
+    apply_cap_per_asset(&mut rows);
     Ok(rows)
+}
+
+/// The hot-wallet cap is per asset (spec §7.5, §7.10): sum each asset's
+/// confirmed treasury balances over its networks, and mark every row of an
+/// asset above its cap — the same measure the monitor alerts on.
+pub fn apply_cap_per_asset(rows: &mut [TreasuryRow]) {
+    let mut holdings: HashMap<&'static str, u128> = HashMap::new();
+    for row in rows.iter() {
+        if let Some(confirmed) = row.confirmed_raw.as_deref().and_then(|c| c.parse::<u128>().ok()) {
+            let held = holdings.entry(row.token).or_default();
+            *held = held.saturating_add(confirmed);
+        }
+    }
+    for row in rows.iter_mut() {
+        let total = holdings.get(row.token).copied();
+        row.asset_holdings_raw = total.map(|t| t.to_string());
+        let cap = row.hot_wallet_cap_raw.as_deref().and_then(|c| c.parse::<u128>().ok());
+        row.cap_exceeded = matches!((total, cap), (Some(total), Some(cap)) if total > cap);
+    }
+}
+
+/// What "send excess to cold storage" moves: the asset's holdings above its
+/// cap, `None` within the cap or while a figure is unknown.
+pub fn asset_cap_excess(row: &TreasuryRow) -> Option<u128> {
+    let total = row.asset_holdings_raw.as_deref()?.parse::<u128>().ok()?;
+    let cap = row.hot_wallet_cap_raw.as_deref()?.parse::<u128>().ok()?;
+    (total > cap).then(|| total - cap)
 }
 
 /// Every 5 min: refresh the treasury balances and raise gas-reserve and
@@ -397,4 +431,53 @@ async fn monitor_once(state: &AppState) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn row(network: &'static str, token: &'static str, confirmed: Option<u128>, cap: Option<u128>) -> TreasuryRow {
+        TreasuryRow {
+            network,
+            token,
+            treasury_address: None,
+            token_account: None,
+            confirmed_raw: confirmed.map(|c| c.to_string()),
+            reserved_raw: "0".into(),
+            reserved_fees_raw: "0".into(),
+            available_raw: confirmed.map(|c| c.to_string()),
+            unswept_raw: "0".into(),
+            unattributed_raw: "0".into(),
+            gas_floor_raw: None,
+            gas_alert_below_raw: None,
+            gas_low: false,
+            hot_wallet_cap_raw: cap.map(|c| c.to_string()),
+            cap_exceeded: false,
+            asset_holdings_raw: None,
+            available: confirmed.is_some(),
+            message: None,
+        }
+    }
+
+    /// Spec §7.10 with §7.5: a cap is per asset, so USDT on three networks
+    /// is measured together — the monitor's alert and the dashboard rows
+    /// agree, and "send excess" works from the asset total.
+    #[test]
+    fn the_cap_is_measured_per_asset_across_networks() {
+        let mut rows = vec![
+            row("ethereum", "USDT", Some(60_000), Some(100_000)),
+            row("tron", "USDT", Some(50_000), Some(100_000)),
+            row("solana", "USDT", None, Some(100_000)),
+            row("ethereum", "ETH", Some(3), Some(50)),
+        ];
+        apply_cap_per_asset(&mut rows);
+        assert!(rows[0].cap_exceeded && rows[1].cap_exceeded && rows[2].cap_exceeded);
+        assert_eq!(rows[0].asset_holdings_raw.as_deref(), Some("110000"));
+        assert_eq!(rows[2].asset_holdings_raw.as_deref(), Some("110000"));
+        assert!(!rows[3].cap_exceeded);
+        assert_eq!(rows[3].asset_holdings_raw.as_deref(), Some("3"));
+        assert_eq!(asset_cap_excess(&rows[1]), Some(10_000));
+        assert_eq!(asset_cap_excess(&rows[3]), None);
+    }
 }

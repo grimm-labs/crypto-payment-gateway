@@ -122,6 +122,14 @@ pub fn authorize(requester: &Requester, network: Network, token: Token) -> Resul
     }
 }
 
+/// Whether a caller may see the treasury's figures (available balance, gas
+/// left for fees) on a quote: staff only. A merchant key gets its project's
+/// balance instead — nothing about custody reaches a project (projects spec
+/// invariant 7).
+pub fn custody_figures_visible(requester: &Requester) -> bool {
+    matches!(requester, Requester::Staff { .. })
+}
+
 /// `approvalRequired = amount ≥ threshold`, whoever asks.
 pub fn approval_required(amount: u128, threshold: u128) -> bool {
     amount >= threshold
@@ -337,6 +345,16 @@ mod tests {
             tokens: tokens.to_vec(),
             networks: networks.map(<[Network]>::to_vec),
         }
+    }
+
+    /// Projects spec invariant 7: no custody figure reaches a merchant key —
+    /// a quote shows the treasury's available balance to staff only.
+    #[test]
+    fn custody_figures_are_for_staff_only() {
+        assert!(custody_figures_visible(&admin()));
+        assert!(custody_figures_visible(&Requester::Staff { id: "s2".into(), role: StaffRole::Operator }));
+        assert!(!custody_figures_visible(&key(WithdrawalPolicy::Open, &[Token::Usdt], None)));
+        assert!(!custody_figures_visible(&key(WithdrawalPolicy::Book, &[Token::Btc], None)));
     }
 
     #[test]
