@@ -30,7 +30,14 @@ export function useCreateProject() {
   const queryClient = useQueryClient()
   return useMutation({
     mutationFn: (payload: CreateProjectPayload) => api<Project>("/projects", { body: payload }),
-    onSuccess: () => {
+    onSuccess: (created) => {
+      // The list knows the new project at once: selecting it right after
+      // creation must not read as a stale id (which the scope forgets).
+      queryClient.setQueryData<ProjectsResponse>(PROJECTS_QUERY_KEY, (current) =>
+        current && !current.projects.some((p) => p.id === created.id)
+          ? { ...current, projects: [...current.projects, created], unassigned: null }
+          : current,
+      )
       queryClient.invalidateQueries({ queryKey: PROJECTS_QUERY_KEY })
       // The first project may have attached keys, payments, endpoints…
       queryClient.invalidateQueries({ queryKey: ["api-keys"] })

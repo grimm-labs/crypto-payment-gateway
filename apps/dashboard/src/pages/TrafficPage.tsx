@@ -94,10 +94,14 @@ export function TrafficPage() {
   const { staff } = useAuth()
   const [searchParams, setSearchParams] = useSearchParams()
 
+  // A selected project shows the merchant surface of its keys (spec §14.2):
+  // staff requests carry no project, so the other surfaces would be empty.
+  const { scopeParam } = useProjectScope()
   const surfaceParam = searchParams.get("surface")
-  const surface: TrafficSurface = SURFACES.includes(surfaceParam as TrafficSurface)
-    ? (surfaceParam as TrafficSurface)
-    : "merchant"
+  const surface: TrafficSurface =
+    scopeParam === undefined && SURFACES.includes(surfaceParam as TrafficSurface)
+      ? (surfaceParam as TrafficSurface)
+      : "merchant"
   const windowParam = searchParams.get("window")
   const window: TrafficWindow = WINDOWS.includes(windowParam as TrafficWindow)
     ? (windowParam as TrafficWindow)
@@ -107,8 +111,6 @@ export function TrafficPage() {
   const apiKeyId = searchParams.get("key") ?? undefined
   const offset = Number(searchParams.get("offset") ?? 0)
 
-  // A selected project shows the merchant surface of its keys.
-  const { scopeParam } = useProjectScope()
   const overview = useTrafficOverview({ surface, window, project_id: scopeParam })
   const requests = useTrafficRequests({
     surface,
@@ -150,11 +152,16 @@ export function TrafficPage() {
         <div className="flex flex-wrap items-center gap-2">
           <Select
             value={surface}
+            disabled={scopeParam !== undefined}
             onValueChange={(value) =>
               updateParams({ surface: value, key: undefined, route: undefined, offset: undefined })
             }
           >
-            <SelectTrigger className="w-52" aria-label="Surface">
+            <SelectTrigger
+              className="w-52"
+              aria-label="Surface"
+              title={scopeParam !== undefined ? "A project shows the merchant surface of its keys" : undefined}
+            >
               <SelectValue />
             </SelectTrigger>
             <SelectContent>

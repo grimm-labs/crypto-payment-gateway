@@ -44,7 +44,8 @@ export function HotWalletCaps({ rows }: { rows: TreasuryRow[] }) {
       <CardHeader>
         <CardTitle>Hot-wallet caps</CardTitle>
         <CardDescription>
-          Above its cap, a treasury raises an alert. “Send excess to cold storage”
+          A cap is per asset: its treasuries on every network together raise the alert.
+          “Send excess to cold storage”
           prepares a normal withdrawal of the excess, debited from the owner you
           choose, to one of that owner&apos;s cold-storage entries (TOTP, approval
           above the threshold) — nothing moves automatically. When no single project
@@ -76,7 +77,8 @@ export function HotWalletCaps({ rows }: { rows: TreasuryRow[] }) {
                       )}
                     </p>
                     <p className="text-sm tabular-nums text-muted-foreground">
-                      {formatRaw(row.confirmed_raw, row.token)} held · cap{" "}
+                      {formatRaw(row.confirmed_raw, row.token)} held here ·{" "}
+                      {formatRaw(row.asset_holdings_raw, row.token)} {row.token} on every network · cap{" "}
                       {formatRaw(row.hot_wallet_cap_raw, row.token)}
                       {excess !== null && (
                         <>

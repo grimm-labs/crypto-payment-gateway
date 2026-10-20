@@ -4,6 +4,7 @@ import { Link, useSearchParams } from "react-router-dom"
 import { toast } from "sonner"
 
 import { CopyButton } from "@/components/shared/CopyButton"
+import { ProjectBadge } from "@/components/shared/ProjectBadge"
 import { JsonViewer } from "@/components/shared/JsonViewer"
 import { Pagination } from "@/components/shared/Pagination"
 import { QueryError } from "@/components/shared/QueryError"
@@ -280,6 +281,7 @@ export function DeliveriesPage() {
                           {networkLabel(webhook.network)}
                         </p>
                       )}
+                      <ProjectBadge projectId={webhook.project_id} className="mt-1 text-xs" />
                     </TableCell>
                     <TableCell>
                       <Badge variant="secondary" className="capitalize">

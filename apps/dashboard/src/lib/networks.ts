@@ -1,4 +1,4 @@
-import type { KeyWithdrawalToken, Network, Token } from "@/lib/types"
+import type { KeyWithdrawalToken, Network, Token, ChainMode } from "@/lib/types"
 
 /** Mirrors `domain::Network` — the order every selector uses. */
 export const NETWORKS: Network[] = ["tron", "ethereum", "solana", "bitcoin", "lightning"]
@@ -45,17 +45,27 @@ export function networksForTokens(tokens: readonly string[]): Network[] {
   )
 }
 
-const EXPLORER_TX: Partial<Record<Network, string>> = {
-  ethereum: "https://etherscan.io/tx/",
-  tron: "https://tronscan.org/#/transaction/",
-  solana: "https://solscan.io/tx/",
-  bitcoin: "https://mempool.space/tx/",
+const EXPLORER_TX: Record<ChainMode, Partial<Record<Network, (hash: string) => string>>> = {
+  mainnet: {
+    ethereum: (hash) => `https://etherscan.io/tx/${hash}`,
+    tron: (hash) => `https://tronscan.org/#/transaction/${hash}`,
+    solana: (hash) => `https://solscan.io/tx/${hash}`,
+    bitcoin: (hash) => `https://mempool.space/tx/${hash}`,
+  },
+  // CHAIN_MODE=testnet: Sepolia, Nile, devnet, testnet4 (config `ChainParams`).
+  testnet: {
+    ethereum: (hash) => `https://sepolia.etherscan.io/tx/${hash}`,
+    tron: (hash) => `https://nile.tronscan.org/#/transaction/${hash}`,
+    solana: (hash) => `https://solscan.io/tx/${hash}?cluster=devnet`,
+    bitcoin: (hash) => `https://mempool.space/testnet4/tx/${hash}`,
+  },
 }
 
-/** Block-explorer page of a transaction; null on lightning (a payment id). */
-export function explorerTxUrl(network: string, hash: string): string | null {
-  const base = EXPLORER_TX[network as Network]
-  return base ? `${base}${encodeURIComponent(hash)}` : null
+/** Block-explorer page of a transaction on the instance's chains; null on
+ *  lightning (a payment id). */
+export function explorerTxUrl(network: string, hash: string, mode: ChainMode = "mainnet"): string | null {
+  const build = EXPLORER_TX[mode][network as Network]
+  return build ? build(encodeURIComponent(hash)) : null
 }
 
 /** Stable key of a (network, token) pair — Ethereum appears once per token. */

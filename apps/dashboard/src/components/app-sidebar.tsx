@@ -42,7 +42,6 @@ import { ACCOUNT_SECURITY_PATH } from "@/lib/errors"
 
 const NAV_MAIN: Array<NavItem & { adminOnly?: boolean }> = [
   { title: "Overview", url: "/", icon: <LayoutDashboardIcon /> },
-  { title: "Projects", url: "/projects", icon: <FolderKanbanIcon /> },
   { title: "Payments", url: "/payments", icon: <ReceiptTextIcon /> },
   { title: "Deliveries", url: "/deliveries", icon: <SendIcon /> },
   { title: "Traffic", url: "/traffic", icon: <ActivityIcon /> },
@@ -56,7 +55,10 @@ const NAV_MAIN: Array<NavItem & { adminOnly?: boolean }> = [
   { title: "Lightning", url: "/lightning", icon: <ZapIcon />, adminOnly: true },
 ]
 
-const NAV_ADMIN: NavItem[] = [
+// The instance's settings. Any staff member sees the projects (admins manage
+// them, spec §14.2); the rest is admin-only on the API.
+const NAV_ADMIN: Array<NavItem & { anyStaff?: boolean }> = [
+  { title: "Projects", url: "/projects", icon: <FolderKanbanIcon />, anyStaff: true },
   { title: "API Keys", url: "/api-keys", icon: <KeyRoundIcon /> },
   { title: "Webhooks", url: "/webhooks", icon: <WebhookIcon /> },
   { title: "Staff", url: "/staff", icon: <UsersIcon /> },
@@ -74,6 +76,7 @@ export function AppSidebar({ ...props }: React.ComponentProps<typeof Sidebar>) {
   const location = useLocation()
   const isAdmin = staff?.role === "admin"
   const pendingApprovals = usePendingApprovalCount()
+  const adminItems = NAV_ADMIN.filter((item) => isAdmin || item.anyStaff)
   const mainItems = NAV_MAIN.filter((item) => isAdmin || !item.adminOnly).map((item) =>
     item.url === "/withdrawals" && pendingApprovals.data
       ? {
@@ -109,12 +112,12 @@ export function AppSidebar({ ...props }: React.ComponentProps<typeof Sidebar>) {
       </SidebarHeader>
       <SidebarContent>
         <NavMain items={mainItems} />
-        {isAdmin && (
+        {adminItems.length > 0 && (
           <SidebarGroup>
             <SidebarGroupLabel>Administration</SidebarGroupLabel>
             <SidebarGroupContent>
               <SidebarMenu>
-                {NAV_ADMIN.map((item) => (
+                {adminItems.map((item) => (
                   <SidebarMenuItem key={item.title}>
                     <SidebarMenuButton
                       asChild

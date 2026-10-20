@@ -69,15 +69,17 @@ export function approvalBlock(
 }
 
 /**
- * "Send excess to cold storage": `confirmed − cap` in base units (BigInt),
- * capped to what can actually leave (the available balance). null when the
- * treasury is within its cap or a figure is unknown.
+ * "Send excess to cold storage": the asset's holdings above its cap, in base
+ * units (BigInt) — the cap is per asset, every network together (spec §7.5),
+ * which is what `cap_exceeded` measures — capped to what can actually leave
+ * from this row's treasury (its available balance). null within the cap or
+ * while a figure is unknown.
  */
 export function capExcessRaw(row: TreasuryRow): bigint | null {
-  const confirmed = toBigInt(row.confirmed_raw)
+  const holdings = toBigInt(row.asset_holdings_raw)
   const cap = toBigInt(row.hot_wallet_cap_raw)
-  if (confirmed === null || cap === null || confirmed <= cap) return null
+  if (holdings === null || cap === null || holdings <= cap) return null
   const available = toBigInt(row.available_raw)
-  const excess = available === null ? confirmed - cap : minBigInt(confirmed - cap, available)
+  const excess = available === null ? holdings - cap : minBigInt(holdings - cap, available)
   return excess > 0n ? excess : null
 }

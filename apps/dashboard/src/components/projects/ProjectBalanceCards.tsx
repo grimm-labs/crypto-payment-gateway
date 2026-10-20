@@ -131,7 +131,9 @@ export function ProjectBalanceTables({
       byToken.set(balance.token, rows)
     }
   })
-  const tokens = [...byToken.keys()].sort()
+  // A token only the merchant funds hold (no project activity yet) still
+  // gets its table, from the ledger rows.
+  const tokens = [...new Set([...byToken.keys(), ...Object.keys(merchantRows ?? {})])].sort()
 
   return (
     <Card>

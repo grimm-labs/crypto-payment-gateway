@@ -45,6 +45,7 @@ export function OverviewPage() {
           <ProjectBalanceTables projects={projects} merchantRows={merchantRows} />
         )}
       </div>
+      {!selectedProject && (
       <div className="px-4 lg:px-6">
         <Card>
           <CardHeader>
@@ -80,6 +81,7 @@ export function OverviewPage() {
           </CardContent>
         </Card>
       </div>
+      )}
     </div>
   )
 }

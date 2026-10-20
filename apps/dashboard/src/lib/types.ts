@@ -713,6 +713,9 @@ export interface TreasuryRow {
   gas_low: boolean
   hot_wallet_cap: string | null
   hot_wallet_cap_raw: string | null
+  /** The cap is per asset: the asset's treasuries on every network together (what `cap_exceeded` measures). */
+  asset_holdings: string | null
+  asset_holdings_raw: string | null
   cap_exceeded: boolean
   /** Whether the balance could be read. */
   available: boolean
@@ -770,10 +773,14 @@ export interface Alert {
   created_at: string
 }
 
+export type ChainMode = "mainnet" | "testnet"
+
 export interface OutflowsState {
   frozen: boolean
   /** OUTFLOWS_FROZEN=true: the freeze cannot be lifted from the dashboard. */
   forced_by_environment: boolean
+  /** Which chains the instance runs on — the block explorers follow it. */
+  chain_mode: ChainMode
 }
 
 export interface AmountSetting {

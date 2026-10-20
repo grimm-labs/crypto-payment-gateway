@@ -162,8 +162,9 @@ function WithdrawalForm({
   const gasAsset = isGasOnlyToken(token)
   const effectiveOwner = gasAsset ? MERCHANT_OWNER : owner
   const ownerProject = projects.find((p) => p.id === effectiveOwner)
-  // Address-book choices follow the owner (spec §8.2).
-  const book = useAddressBook(network, effectiveOwner || undefined)
+  // Address-book choices follow the owner (spec §8.2): nothing is listed
+  // until one is chosen.
+  const book = useAddressBook(network, effectiveOwner || undefined, { enabled: effectiveOwner !== "" })
   const projectBalance = useProjectBalance(ownerProject?.id)
   const ownerAvailable = projectBalance.data?.balances.find(
     (b) => b.network === network && b.token === token,
@@ -171,7 +172,10 @@ function WithdrawalForm({
 
   const isBtc = isBtcNetwork(network)
   const isLightning = network === "lightning"
-  const entries = (book.data?.data ?? []).filter((e) => !coldStorageOnly || e.is_cold_storage)
+  const entries =
+    effectiveOwner === ""
+      ? []
+      : (book.data?.data ?? []).filter((e) => !coldStorageOnly || e.is_cold_storage)
   const entry = entries.find((e) => e.id === entryId)
   // Cold storage: when no single project covers the excess, show what each
   // one has, so the admin sends several withdrawals (spec §8.6).
@@ -364,7 +368,9 @@ function WithdrawalForm({
                 ? `Project available on ${networkLabel(network)}: ${formatAmount(ownerAvailable, token)}. An admin may exceed it; the balance then turns negative.`
                 : "The project's available balance is debited; an admin may exceed it."
               : effectiveOwner === MERCHANT_OWNER
-                ? "Draws on the merchant funds — what the gateway holds beyond the project balances (see the Treasury page)."
+                ? ledgerPair?.merchant_funds !== undefined && ledgerPair.merchant_funds !== null
+                  ? `Merchant funds on ${networkLabel(network)}: ${formatAmount(ledgerPair.merchant_funds, token)} — what the gateway holds beyond the project balances.`
+                  : "Draws on the merchant funds — what the gateway holds beyond the project balances (see the Treasury page)."
                 : "A withdrawal is always debited from a project, or from the merchant funds."}
         </p>
       </div>

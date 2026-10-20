@@ -123,13 +123,14 @@ export function useWithdrawalAction() {
 // --------------------------------------------------------------- address book
 
 /** `projectId`: one owner's entries (a project id or "merchant"); undefined = all. */
-export function useAddressBook(network?: Network, projectId?: string) {
+export function useAddressBook(network?: Network, projectId?: string, options?: { enabled?: boolean }) {
   return useQuery({
     queryKey: ["address-book", network ?? "all", projectId ?? "all"],
     queryFn: () =>
       api<{ data: AddressBookEntry[] }>(
         `/address-book${listParams({ network, project_id: projectId })}`,
       ),
+    enabled: options?.enabled ?? true,
   })
 }
 

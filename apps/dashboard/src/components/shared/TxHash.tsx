@@ -1,6 +1,7 @@
 import { ExternalLink } from "lucide-react"
 
 import { CopyButton } from "@/components/shared/CopyButton"
+import { useOutflows } from "@/hooks/withdrawals"
 import { shortHash } from "@/lib/format"
 import { explorerTxUrl } from "@/lib/networks"
 
@@ -15,8 +16,10 @@ export function TxHash({
   hash: string | null | undefined
   keep?: number
 }) {
+  // The explorers follow the instance's chains (mainnet or the testnets).
+  const outflows = useOutflows()
   if (!hash) return <span className="text-xs text-muted-foreground">—</span>
-  const url = explorerTxUrl(network, hash)
+  const url = explorerTxUrl(network, hash, outflows.data?.chain_mode ?? "mainnet")
   return (
     <div className="flex items-center gap-1">
       {url ? (
