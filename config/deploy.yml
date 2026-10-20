@@ -49,7 +49,9 @@ builder:
 # `StrictHostKeyChecking yes` (net-ssh then refuses unknown or changed keys).
 # Locally, keep the server's key in your own known_hosts the same way.
 ssh:
-  user: '<%= ENV["SSH_USER"].to_s.empty? ? "root" : ENV["SSH_USER"] %>'
+  # A dedicated deploy user in the docker group (audit #44): set SSH_USER=root
+  # explicitly to keep deploying as root.
+  user: '<%= ENV["SSH_USER"].to_s.empty? ? "deploy" : ENV["SSH_USER"] %>'
   config: true
   # Never expose the deployer's SSH agent to the server.
   forward_agent: false

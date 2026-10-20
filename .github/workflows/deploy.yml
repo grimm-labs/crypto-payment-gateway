@@ -15,8 +15,9 @@ run-name: Deployment - ${{ fromJSON('{"test":"Test","staging":"Staging","product
 # target), API_HOST, DASHBOARD_HOST, SSH_KNOWN_HOSTS (the server's host key line(s),
 # e.g. from `ssh-keyscan -t ed25519 <GATEWAY_HOST>` checked against
 # `ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub` on the server console).
-# Optional: APP_ENV (defaults to the environment name), SSH_USER (default root;
-# a deploy user in the docker group is the target), BITCOIN_ESPLORA_BASE_URL
+# Optional: APP_ENV (defaults to the environment name), SSH_USER (default
+# `deploy`, a user in the docker group; set it to `root` to keep deploying
+# as root), BITCOIN_ESPLORA_BASE_URL
 # (empty disables Bitcoin), TRUSTED_PROXIES, OUTFLOWS_FROZEN ("true" forces the
 # outflow freeze; empty = dashboard-managed).
 # Secrets (`secrets.*`, every one listed in .kamal/secrets), per environment:
@@ -193,7 +194,7 @@ jobs:
           GATEWAY_HOST: ${{ vars.GATEWAY_HOST }}
           API_HOST: ${{ vars.API_HOST }}
           DASHBOARD_HOST: ${{ vars.DASHBOARD_HOST }}
-          SSH_USER: ${{ vars.SSH_USER || 'root' }}
+          SSH_USER: ${{ vars.SSH_USER || 'deploy' }}
           APP_ENV: ${{ vars.APP_ENV || inputs.environment }}
           BITCOIN_ESPLORA_BASE_URL: ${{ vars.BITCOIN_ESPLORA_BASE_URL || '' }}
           TRUSTED_PROXIES: ${{ vars.TRUSTED_PROXIES || '' }}
