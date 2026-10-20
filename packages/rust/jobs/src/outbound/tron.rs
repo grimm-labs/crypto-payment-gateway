@@ -194,6 +194,7 @@ mod tests {
     struct FakeTron {
         outcome: Option<TronTxOutcome>,
         known: bool,
+        sent: std::sync::Mutex<Vec<Vec<u8>>>,
     }
 
     #[async_trait]
@@ -222,8 +223,9 @@ mod tests {
         async fn solidity_trc20_balance(&self, _: &str, _: &str) -> Result<u128> {
             unimplemented!()
         }
-        async fn broadcast(&self, _: &[u8]) -> Result<TronBroadcastOutcome> {
-            unimplemented!()
+        async fn broadcast(&self, signed: &[u8]) -> Result<TronBroadcastOutcome> {
+            self.sent.lock().unwrap().push(signed.to_vec());
+            Ok(TronBroadcastOutcome::Accepted)
         }
         async fn solidified_outcome(&self, _: &str) -> Result<Option<TronTxOutcome>> {
             Ok(self.outcome)
@@ -231,6 +233,17 @@ mod tests {
         async fn is_known(&self, _: &str) -> Result<bool> {
             Ok(self.known)
         }
+    }
+
+    /// Invariant 1: a crash between signing and broadcasting re-sends the
+    /// stored bytes, never a different transaction.
+    #[tokio::test]
+    async fn a_stored_transaction_is_rebroadcast_byte_for_byte() {
+        let rpc = FakeTron::default();
+        let mut tx = super::super::eth::tests::stored("0a02cafe", 0, 0);
+        tx.network = "TRON".into();
+        assert_eq!(broadcast(&rpc, &tx).await.unwrap(), BroadcastResult::Accepted);
+        assert_eq!(rpc.sent.lock().unwrap().as_slice(), &[hex::decode("0a02cafe").unwrap()]);
     }
 
     fn tx(expired_secs_ago: i64) -> OutboundTxRow {

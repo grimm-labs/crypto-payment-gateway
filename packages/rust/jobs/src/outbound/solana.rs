@@ -197,7 +197,11 @@ pub async fn observe(rpc: &dyn SolanaRpc, tx: &OutboundTxRow) -> Result<Observat
     let height = rpc.block_height().await?;
     match rpc.signature_status(&tx.tx_hash).await? {
         // A failed transaction still pays its fee (the rent was not spent).
-        Some(status) if status.failed => Ok(Observation::Landed { success: false, block: status.slot, confirmations: 1, fee }),
+        // Failure is final at `finalized` only, like success: a block seen
+        // at `confirmed` can still be dropped.
+        Some(status) if status.finalized && status.failed => {
+            Ok(Observation::Landed { success: false, block: status.slot, confirmations: 1, fee })
+        }
         Some(status) if status.finalized => Ok(Observation::Landed {
             success: true,
             block: status.slot,
@@ -227,6 +231,7 @@ mod tests {
         status: Option<SolanaSignatureStatus>,
         height: u64,
         account: Option<SolanaAccount>,
+        sent: std::sync::Mutex<Vec<SignedSolanaTx>>,
     }
 
     #[async_trait]
@@ -243,8 +248,9 @@ mod tests {
         async fn priority_fee(&self, _: &[String]) -> Result<u64> {
             unimplemented!()
         }
-        async fn send(&self, _: &SignedSolanaTx) -> Result<SolanaSendOutcome> {
-            unimplemented!()
+        async fn send(&self, signed: &SignedSolanaTx) -> Result<SolanaSendOutcome> {
+            self.sent.lock().unwrap().push(signed.clone());
+            Ok(SolanaSendOutcome::Accepted)
         }
         async fn signature_status(&self, _: &str) -> Result<Option<SolanaSignatureStatus>> {
             Ok(self.status.clone())
@@ -262,6 +268,19 @@ mod tests {
         tx.network = "SOLANA".into();
         tx.fee_params = json!({ "fee": 6_000, "rent": 2_039_280, "lastValidBlockHeight": 500 });
         tx
+    }
+
+    /// Invariant 1: a crash between signing and broadcasting re-sends the
+    /// stored bytes under the stored signature, never a different message.
+    #[tokio::test]
+    async fn a_stored_transaction_is_rebroadcast_byte_for_byte() {
+        let rpc = FakeSolana::default();
+        let tx = tx();
+        assert_eq!(broadcast(&rpc, &tx).await.unwrap(), BroadcastResult::Accepted);
+        let sent = rpc.sent.lock().unwrap();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].wire, vec![1u8]);
+        assert_eq!(sent[0].signature, tx.tx_hash);
     }
 
     #[tokio::test]
@@ -287,11 +306,19 @@ mod tests {
             Observation::Landed { success: true, block: 9, confirmations: 1, fee: 6_000 + 2_039_280 }
         );
         let failed = FakeSolana {
-            status: Some(SolanaSignatureStatus { slot: 9, finalized: false, failed: true }),
+            status: Some(SolanaSignatureStatus { slot: 9, finalized: true, failed: true }),
             height: 0,
             ..Default::default()
         };
         assert_eq!(observe(&failed, &tx()).await.unwrap(), Observation::Landed { success: false, block: 9, confirmations: 1, fee: 6_000 });
+        // A failure seen at `confirmed` is not final yet: the block may still
+        // be dropped. Success and failure both wait for `finalized`.
+        let failed_unfinalized = FakeSolana {
+            status: Some(SolanaSignatureStatus { slot: 9, finalized: false, failed: true }),
+            height: 0,
+            ..Default::default()
+        };
+        assert_eq!(observe(&failed_unfinalized, &tx()).await.unwrap(), Observation::Pending { stuck: false, resend: false });
         let confirmed = FakeSolana {
             status: Some(SolanaSignatureStatus { slot: 9, finalized: false, failed: false }),
             height: 0,

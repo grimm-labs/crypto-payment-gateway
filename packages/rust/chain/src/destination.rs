@@ -86,7 +86,8 @@ fn sats(amount_raw: u128) -> Result<u64, DestinationError> {
     u64::try_from(amount_raw).map_err(|_| DestinationError::Invalid("Amount is too large"))
 }
 
-/// 20-byte hex, all lowercase/uppercase or with a valid EIP-55 checksum;
+/// 20-byte hex, all lowercase or with a valid EIP-55 checksum (an
+/// all-uppercase address carries no checksum and is refused, spec §7.4);
 /// never the zero address or the USDT contract. Returns EIP-55.
 pub fn normalize_eth_address(raw: &str, usdt_contract: &str) -> Result<String, DestinationError> {
     let invalid = DestinationError::Invalid("Invalid Ethereum address");
@@ -96,8 +97,8 @@ pub fn normalize_eth_address(raw: &str, usdt_contract: &str) -> Result<String, D
     }
     let lower = hex.to_ascii_lowercase();
     let checksummed = eip55(&lower);
-    let mixed_case = hex.bytes().any(|b| b.is_ascii_lowercase()) && hex.bytes().any(|b| b.is_ascii_uppercase());
-    if mixed_case && checksummed[2..] != *hex {
+    let has_uppercase = hex.bytes().any(|b| b.is_ascii_uppercase());
+    if has_uppercase && checksummed[2..] != *hex {
         return Err(DestinationError::Invalid("Invalid Ethereum address checksum"));
     }
     if lower.bytes().all(|b| b == b'0') {
@@ -313,8 +314,13 @@ mod tests {
                 normalize_eth_address(&checksummed.to_ascii_lowercase(), USDT_ETH).unwrap(),
                 checksummed
             );
+            // Spec §7.4: lowercase or a valid EIP-55 checksum, nothing else —
+            // an all-uppercase address carries no checksum to verify.
             let upper = format!("0x{}", checksummed[2..].to_ascii_uppercase());
-            assert_eq!(normalize_eth_address(&upper, USDT_ETH).unwrap(), checksummed);
+            assert_eq!(
+                normalize_eth_address(&upper, USDT_ETH).unwrap_err(),
+                DestinationError::Invalid("Invalid Ethereum address checksum")
+            );
         }
         // One case flipped: bad checksum.
         let err = normalize_eth_address("0x5aaeb6053F3E94C9b9A09f33669435E7Ef1BeAed", USDT_ETH).unwrap_err();

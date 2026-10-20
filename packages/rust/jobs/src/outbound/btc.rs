@@ -212,10 +212,7 @@ pub async fn observe(rpc: &dyn EsploraRpc, tx: &OutboundTxRow) -> Result<Observa
                 fee,
             })
         }
-        Some(_) => {
-            let sent_at = tx.fee_params["sentAtHeight"].as_u64().unwrap_or(tip);
-            Ok(Observation::Pending { stuck: tip.saturating_sub(sent_at) >= BTC_STUCK_BLOCKS, resend: false })
-        }
+        Some(_) => Ok(Observation::Pending { stuck: stuck_since_sent(tx, tip), resend: false }),
         None => {
             for input in stored_inputs(tx) {
                 if let Some(spender) = rpc.spent_by(&input.txid, input.vout).await? {
@@ -224,9 +221,23 @@ pub async fn observe(rpc: &dyn EsploraRpc, tx: &OutboundTxRow) -> Result<Observa
                     }
                 }
             }
-            Ok(Observation::Pending { stuck: false, resend: tx.status()? == domain::OutboundTxStatus::Broadcast })
+            // Dropped from the mempool (fee floor in a congestion) or never
+            // accepted: the same bytes go out again, and the wait counts
+            // from the first send, so the fee bump runs instead of the
+            // same bytes forever.
+            Ok(Observation::Pending {
+                stuck: stuck_since_sent(tx, tip),
+                resend: tx.status()? == domain::OutboundTxStatus::Broadcast,
+            })
         }
     }
+}
+
+/// Waiting `BTC_STUCK_BLOCKS` blocks since the first send, whether the
+/// transaction sits in the mempool or fell out of it.
+fn stuck_since_sent(tx: &OutboundTxRow, tip: u64) -> bool {
+    let sent_at = tx.fee_params["sentAtHeight"].as_u64().unwrap_or(tip);
+    tip.saturating_sub(sent_at) >= BTC_STUCK_BLOCKS
 }
 
 #[cfg(test)]
@@ -238,6 +249,13 @@ mod tests {
     struct FakeEsplora {
         status: Option<BtcTxStatus>,
         spender: Option<String>,
+        sent: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl FakeEsplora {
+        fn with(status: Option<BtcTxStatus>, spender: Option<String>) -> Self {
+            Self { status, spender, sent: Default::default() }
+        }
     }
 
     #[async_trait]
@@ -251,8 +269,9 @@ mod tests {
         async fn fee_rate(&self, _: u32, _: u64, _: u64) -> Result<u64> {
             unimplemented!()
         }
-        async fn broadcast(&self, _: &str) -> Result<BtcBroadcastOutcome> {
-            unimplemented!()
+        async fn broadcast(&self, hex: &str) -> Result<BtcBroadcastOutcome> {
+            self.sent.lock().unwrap().push(hex.to_string());
+            Ok(BtcBroadcastOutcome::Accepted)
         }
         async fn tx_status(&self, _: &str) -> Result<Option<BtcTxStatus>> {
             Ok(self.status)
@@ -263,30 +282,52 @@ mod tests {
     }
 
     fn tx() -> OutboundTxRow {
+        tx_sent_at(1_000)
+    }
+
+    fn tx_sent_at(height: u64) -> OutboundTxRow {
         let mut tx = super::super::eth::tests::stored("0200", 0, 0);
         tx.network = "BITCOIN".into();
         tx.tx_hash = "ours".into();
         tx.fee_raw = Some(db::RawAmount(700));
         tx.fee_params = json!({
-            "sentAtHeight": 1_000,
+            "sentAtHeight": height,
             "inputs": [{ "txid": "aa", "vout": 0, "value": 5000, "address": "bc1q", "deposit_index": 3, "height": 900 }],
         });
         tx
     }
 
+    /// Invariant 1: a crash between signing and broadcasting re-sends the
+    /// stored bytes, never a different transaction.
+    #[tokio::test]
+    async fn a_stored_transaction_is_rebroadcast_byte_for_byte() {
+        let rpc = FakeEsplora::with(None, None);
+        assert_eq!(broadcast(&rpc, &tx()).await.unwrap(), BroadcastResult::Accepted);
+        assert_eq!(rpc.sent.lock().unwrap().as_slice(), &["0200".to_string()]);
+    }
+
     #[tokio::test]
     async fn a_transaction_whose_input_is_spent_elsewhere_is_dead() {
-        let double_spent = FakeEsplora { status: None, spender: Some("theirs".into()) };
+        let double_spent = FakeEsplora::with(None, Some("theirs".into()));
         assert_eq!(observe(&double_spent, &tx()).await.unwrap(), Observation::Dead("inputs_spent"));
-        let dropped = FakeEsplora { status: None, spender: None };
-        assert_eq!(observe(&dropped, &tx()).await.unwrap(), Observation::Pending { stuck: false, resend: true });
+        let dropped = FakeEsplora::with(None, None);
+        assert_eq!(observe(&dropped, &tx_sent_at(1_002)).await.unwrap(), Observation::Pending { stuck: false, resend: true });
+    }
+
+    /// A transaction the mempool dropped (fee floor in a congestion) is
+    /// re-sent, and escalates like one still waiting: after three blocks
+    /// it is stuck, so the fee bump runs instead of the same bytes forever.
+    #[tokio::test]
+    async fn dropped_transactions_are_stuck_after_three_blocks_too() {
+        let dropped = FakeEsplora::with(None, None);
+        assert_eq!(observe(&dropped, &tx_sent_at(1_000)).await.unwrap(), Observation::Pending { stuck: true, resend: true });
     }
 
     #[tokio::test]
     async fn mempool_transactions_are_stuck_after_three_blocks() {
-        let mempool = FakeEsplora { status: Some(BtcTxStatus { confirmed: false, block_height: None }), spender: None };
+        let mempool = FakeEsplora::with(Some(BtcTxStatus { confirmed: false, block_height: None }), None);
         assert_eq!(observe(&mempool, &tx()).await.unwrap(), Observation::Pending { stuck: true, resend: false });
-        let confirmed = FakeEsplora { status: Some(BtcTxStatus { confirmed: true, block_height: Some(1_001) }), spender: None };
+        let confirmed = FakeEsplora::with(Some(BtcTxStatus { confirmed: true, block_height: Some(1_001) }), None);
         assert_eq!(
             observe(&confirmed, &tx()).await.unwrap(),
             Observation::Landed { success: true, block: 1_001, confirmations: 3, fee: 700 }

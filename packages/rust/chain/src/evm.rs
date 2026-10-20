@@ -20,8 +20,10 @@ pub const ETH_TRANSFER_GAS: u64 = 21_000;
 pub const ERC20_GAS_ESTIMATE_PERCENT: u64 = 130;
 /// The replacement rule nodes enforce: +10 % on both fee fields.
 pub const REPLACEMENT_MIN_PERCENT: u128 = 110;
-/// `alchemy_getAssetTransfers` pages followed per poll (1000 transfers each).
-const ASSET_TRANSFER_MAX_PAGES: usize = 10;
+/// `alchemy_getAssetTransfers` pages followed per poll (1000 transfers
+/// each): a safety stop against a runaway `pageKey`, far beyond what one
+/// deposit address receives in the scan window.
+const ASSET_TRANSFER_MAX_PAGES: usize = 200;
 
 /// EIP-1559 fee fields, in wei per gas.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -217,6 +219,10 @@ pub(crate) fn native_eth_transfers(
 ) -> Vec<DetectedOnChainTransfer> {
     // BTreeMap: deterministic order.
     let mut by_hash: BTreeMap<String, (u128, u64)> = BTreeMap::new();
+    // Transactions with a transfer whose value is unreadable: a partial
+    // sum would be stored and never corrected (the deposit upsert keeps
+    // its amount), so the whole transaction waits for a complete read.
+    let mut unreadable: Vec<String> = Vec::new();
     for transfer in transfers {
         let is_eth_to_address = transfer.to.as_deref().is_some_and(|to| to.eq_ignore_ascii_case(address))
             && matches!(transfer.category.as_deref(), Some("external") | Some("internal"))
@@ -231,7 +237,8 @@ pub(crate) fn native_eth_transfers(
             continue;
         };
         let Some(value) = raw_contract.value.as_deref().and_then(|v| parse_hex_u128(v).ok()) else {
-            warn!("ETH transfer in {hash} without a usable rawContract.value — skipped");
+            warn!("ETH transfer in {hash} without a usable rawContract.value — transaction skipped");
+            unreadable.push(hash.to_ascii_lowercase());
             continue;
         };
         let Ok(block) = parse_hex_u64(&block) else {
@@ -243,7 +250,7 @@ pub(crate) fn native_eth_transfers(
     }
     by_hash
         .into_iter()
-        .filter(|(_, (amount, _))| *amount > 0)
+        .filter(|(hash, (amount, _))| *amount > 0 && !unreadable.contains(hash))
         .map(|(hash, (amount, block))| DetectedOnChainTransfer {
             tx_hash: hash,
             amount_raw: amount.to_string(),
@@ -758,6 +765,24 @@ mod tests {
         .unwrap();
         // A zero transfer settles nothing.
         assert!(native_eth_transfers(page.transfers, ADDRESS, 0x10).is_empty());
+        // One readable and one unreadable transfer in the same transaction:
+        // a partial sum would be stored and never corrected (the deposit
+        // upsert keeps its amount), so the whole transaction is skipped
+        // until a later poll reads it entirely.
+        let page: AssetTransfersPage = serde_json::from_str(
+            r#"{"transfers": [
+                {"blockNum": "0x10", "hash": "0xab", "to": "0x9858effd232b4033e47d90003d41ec34ecaeda94",
+                 "asset": "ETH", "category": "internal", "rawContract": {"value": "0x2386f26fc10000", "address": null}},
+                {"blockNum": "0x10", "hash": "0xab", "to": "0x9858effd232b4033e47d90003d41ec34ecaeda94",
+                 "asset": "ETH", "category": "internal", "rawContract": {"address": null}},
+                {"blockNum": "0x11", "hash": "0xcd", "to": "0x9858effd232b4033e47d90003d41ec34ecaeda94",
+                 "asset": "ETH", "category": "external", "rawContract": {"value": "0x1", "address": null}}
+            ]}"#,
+        )
+        .unwrap();
+        let detected = native_eth_transfers(page.transfers, ADDRESS, 0x11);
+        assert_eq!(detected.len(), 1);
+        assert_eq!(detected[0].tx_hash, "0xcd");
         // Wei beyond u64.
         assert_eq!(parse_hex_u128("0x3635c9adc5dea00000").unwrap(), 1_000 * 10u128.pow(18));
         assert_eq!(parse_hex_u128("0x").unwrap(), 0);

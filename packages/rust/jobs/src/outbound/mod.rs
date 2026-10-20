@@ -313,11 +313,16 @@ pub(crate) async fn transition(state: &AppState, row: &WithdrawalRow, event: Wit
     state.db.transition_withdrawal(&row.id, &[from], to, update).await
 }
 
+/// Invariant 3 (spec §7.11): while frozen, nothing new leaves — a SIGNED
+/// transaction stays stored until the freeze lifts — but one the network
+/// already saw (BROADCAST) may be re-sent as stored: it is public anyway.
+pub(crate) fn may_broadcast_while_frozen(status: OutboundTxStatus) -> bool {
+    status == OutboundTxStatus::Broadcast
+}
+
 /// Broadcast a stored transaction (if not frozen) and record the outcome.
 pub(crate) async fn broadcast_and_record(state: &AppState, tx: &OutboundTxRow) -> Result<()> {
-    // Invariant 3: nothing new leaves while frozen (it stays SIGNED and is
-    // re-broadcast once unfrozen).
-    if freeze::outflows_frozen(state).await {
+    if !may_broadcast_while_frozen(tx.status()?) && freeze::outflows_frozen(state).await {
         return Ok(());
     }
     match broadcast_stored(state, tx).await {
@@ -885,6 +890,17 @@ mod tests {
 
     fn landed(success: bool, confirmations: i32) -> Observation {
         Observation::Landed { success, block: 100, confirmations, fee: 21 }
+    }
+
+    /// Invariant 3 (spec §7.11): nothing new is broadcast while frozen; a
+    /// transaction the network already saw may be re-sent as stored.
+    #[test]
+    fn while_frozen_only_public_transactions_leave_again() {
+        assert!(!may_broadcast_while_frozen(OutboundTxStatus::Signed));
+        assert!(may_broadcast_while_frozen(OutboundTxStatus::Broadcast));
+        for status in [OutboundTxStatus::Confirmed, OutboundTxStatus::Failed, OutboundTxStatus::Replaced, OutboundTxStatus::Expired] {
+            assert!(!may_broadcast_while_frozen(status), "{status:?}");
+        }
     }
 
     #[test]

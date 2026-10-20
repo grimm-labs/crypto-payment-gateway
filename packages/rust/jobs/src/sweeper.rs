@@ -49,13 +49,20 @@ pub async fn sweep_loop(state: AppState, network: Network) {
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         interval.tick().await;
-        if !state.is_network_enabled(network) || freeze::outflows_frozen(&state).await {
+        if !state.is_network_enabled(network) || !planning_allowed(network, freeze::outflows_frozen(&state).await) {
             continue;
         }
         if let Err(err) = plan(&state, network).await {
             error!("{} sweep planning error: {err:#}", network.as_api());
         }
     }
+}
+
+/// Whether the planning pass of `network` runs: never while frozen (spec
+/// §7.11), except Bitcoin's, which only scans received amounts for the
+/// project ledger (spec §7.3) and never signs anything — BTC is not swept.
+pub fn planning_allowed(network: Network, frozen: bool) -> bool {
+    !frozen || network == Network::Bitcoin
 }
 
 /// Plan sweeps now (also the admin "run sweeps" action).
@@ -639,6 +646,22 @@ pub(crate) async fn bump(state: &AppState, tx: &OutboundTxRow) -> Result<()> {
         Err(reason) => {
             warn!("Gas top-up {} not bumped: {reason}", tx.tx_hash);
             Ok(())
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The freeze stops sweeps and top-ups (spec §7.11); the Bitcoin pass
+    /// only scans received amounts for the project ledger (spec §7.3), so
+    /// it keeps running — a long freeze must not under-credit projects.
+    #[test]
+    fn the_freeze_stops_every_planning_but_the_bitcoin_scan() {
+        for network in SWEPT_NETWORKS {
+            assert!(planning_allowed(network, false), "{network:?}");
+            assert_eq!(planning_allowed(network, true), network == Network::Bitcoin, "{network:?}");
         }
     }
 }
