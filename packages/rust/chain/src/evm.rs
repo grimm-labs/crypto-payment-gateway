@@ -2,7 +2,7 @@
 //! transactions (ETH and USDT `transfer`) built and encoded here, signed
 //! through `wallet::Signer`, and the RPC calls the outbound engine needs.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use alloy_consensus::{SignableTransaction, TxEip1559};
 use alloy_primitives::{Address, Bytes, Signature, TxKind, U256};
@@ -22,7 +22,9 @@ pub const ERC20_GAS_ESTIMATE_PERCENT: u64 = 130;
 pub const REPLACEMENT_MIN_PERCENT: u128 = 110;
 /// `alchemy_getAssetTransfers` pages followed per poll (1000 transfers
 /// each): a safety stop against a runaway `pageKey`, far beyond what one
-/// deposit address receives in the scan window.
+/// deposit address receives in the scan window. Past it, the transfers
+/// already read are processed (detection is idempotent) and the rest wait
+/// for the next poll.
 const ASSET_TRANSFER_MAX_PAGES: usize = 200;
 
 /// EIP-1559 fee fields, in wei per gas.
@@ -222,7 +224,7 @@ pub(crate) fn native_eth_transfers(
     // Transactions with a transfer whose value is unreadable: a partial
     // sum would be stored and never corrected (the deposit upsert keeps
     // its amount), so the whole transaction waits for a complete read.
-    let mut unreadable: Vec<String> = Vec::new();
+    let mut unreadable: BTreeSet<String> = BTreeSet::new();
     for transfer in transfers {
         let is_eth_to_address = transfer.to.as_deref().is_some_and(|to| to.eq_ignore_ascii_case(address))
             && matches!(transfer.category.as_deref(), Some("external") | Some("internal"))
@@ -236,12 +238,10 @@ pub(crate) fn native_eth_transfers(
         let (Some(hash), Some(block)) = (transfer.hash, transfer.block_num) else {
             continue;
         };
-        let Some(value) = raw_contract.value.as_deref().and_then(|v| parse_hex_u128(v).ok()) else {
-            warn!("ETH transfer in {hash} without a usable rawContract.value — transaction skipped");
-            unreadable.push(hash.to_ascii_lowercase());
-            continue;
-        };
-        let Ok(block) = parse_hex_u64(&block) else {
+        let value = raw_contract.value.as_deref().and_then(|v| parse_hex_u128(v).ok());
+        let (Some(value), Ok(block)) = (value, parse_hex_u64(&block)) else {
+            warn!("ETH transfer in {hash} with an unreadable value or block — transaction skipped");
+            unreadable.insert(hash.to_ascii_lowercase());
             continue;
         };
         let entry = by_hash.entry(hash.to_ascii_lowercase()).or_insert((0, block));
@@ -343,10 +343,13 @@ impl ChainClients {
             transfers.extend(page.transfers);
             page_key = page.page_key.filter(|key| !key.is_empty());
             if page_key.is_none() {
-                return Ok(native_eth_transfers(transfers, address, tip));
+                break;
             }
         }
-        anyhow::bail!("alchemy_getAssetTransfers: more than {ASSET_TRANSFER_MAX_PAGES} pages for one address")
+        if page_key.is_some() {
+            warn!("alchemy_getAssetTransfers: more than {ASSET_TRANSFER_MAX_PAGES} pages for {address} — the rest waits for the next poll");
+        }
+        Ok(native_eth_transfers(transfers, address, tip))
     }
 }
 
@@ -783,6 +786,17 @@ mod tests {
         let detected = native_eth_transfers(page.transfers, ADDRESS, 0x11);
         assert_eq!(detected.len(), 1);
         assert_eq!(detected[0].tx_hash, "0xcd");
+        // Same rule for a transfer whose block is unreadable.
+        let page: AssetTransfersPage = serde_json::from_str(
+            r#"{"transfers": [
+                {"blockNum": "0x10", "hash": "0xef", "to": "0x9858effd232b4033e47d90003d41ec34ecaeda94",
+                 "asset": "ETH", "category": "internal", "rawContract": {"value": "0x1", "address": null}},
+                {"blockNum": "nope", "hash": "0xef", "to": "0x9858effd232b4033e47d90003d41ec34ecaeda94",
+                 "asset": "ETH", "category": "internal", "rawContract": {"value": "0x1", "address": null}}
+            ]}"#,
+        )
+        .unwrap();
+        assert!(native_eth_transfers(page.transfers, ADDRESS, 0x11).is_empty());
         // Wei beyond u64.
         assert_eq!(parse_hex_u128("0x3635c9adc5dea00000").unwrap(), 1_000 * 10u128.pow(18));
         assert_eq!(parse_hex_u128("0x").unwrap(), 0);

@@ -653,14 +653,11 @@ pub async fn approve_withdrawal(
     // matched a book entry at creation keeps that entry as information only,
     // so a deleted entry blocks the withdrawal only when its caller needs
     // the book (spec §7.4).
-    let requester = requester_of(state, &row).await?.ok_or_else(|| RuleError::Forbidden("The requester is no longer allowed".into()))?;
-    if rules::check_destination_rule(&requester, row.approval_required, book_entry_active(state, &row).await?, row.destination_kind()?).is_err() {
-        return Err(RuleError::Refused {
-            code: "address_book_entry_not_active",
-            message: "The address-book entry of this withdrawal was deleted".into(),
-        }
-        .into());
-    }
+    let requester = requester_of(state, &row).await?.ok_or_else(|| RuleError::Refused {
+        code: "requester_revoked",
+        message: "The requesting key or staff member may no longer withdraw; reject this withdrawal".into(),
+    })?;
+    rules::check_destination_rule(&requester, row.approval_required, book_entry_active(state, &row).await?, row.destination_kind()?)?;
 
     let mut admission = state
         .db
@@ -708,7 +705,7 @@ pub async fn approve_withdrawal(
         .transition(
             id,
             &[WithdrawalStatus::PendingApproval],
-            admin_transition(&row, WithdrawalEvent::Approve)?,
+            transition_target(&row, WithdrawalEvent::Approve)?,
             &WithdrawalUpdate {
                 approved_by_id: Some(approver_id.to_string()),
                 ..Default::default()
@@ -721,10 +718,11 @@ pub async fn approve_withdrawal(
     Ok(approved)
 }
 
-/// The status an admin action leads to, from the transition table (spec
-/// §7.3): a `Conflict` when the withdrawal is not in a status that allows
-/// it, so that no caller ever writes a status the machine refuses.
-fn admin_transition(row: &WithdrawalRow, event: WithdrawalEvent) -> Result<WithdrawalStatus, WithdrawalError> {
+/// The status an API action (approve, reject, cancel, bump) leads to, from
+/// the transition table (spec §7.3): a `Conflict` when the withdrawal is not
+/// in a status that allows it, so that no caller ever writes a status the
+/// machine refuses.
+fn transition_target(row: &WithdrawalRow, event: WithdrawalEvent) -> Result<WithdrawalStatus, WithdrawalError> {
     let lightning = row.network().map(|n| n == Network::Lightning).unwrap_or(false);
     next_withdrawal_status(row.status()?, event, lightning)
         .map_err(|_| WithdrawalError::Conflict(format!("This withdrawal cannot be {} now", event_verb(event))))
@@ -757,7 +755,7 @@ pub async fn reject_withdrawal(
         .transition_withdrawal(
             id,
             &[WithdrawalStatus::PendingApproval],
-            admin_transition(&row, WithdrawalEvent::Reject)?,
+            transition_target(&row, WithdrawalEvent::Reject)?,
             &WithdrawalUpdate {
                 cancelled_by_id: Some(admin_id.to_string()),
                 cancel_reason: Some(CancelReason::Rejected),
@@ -818,7 +816,7 @@ pub async fn cancel_withdrawal(
         .transition_withdrawal(
             id,
             &[WithdrawalStatus::PendingApproval, WithdrawalStatus::Queued],
-            admin_transition(&row, WithdrawalEvent::Cancel)?,
+            transition_target(&row, WithdrawalEvent::Cancel)?,
             &WithdrawalUpdate {
                 cancelled_by_id: Some(by.clone()),
                 cancel_reason: Some(CancelReason::Cancelled),
@@ -845,7 +843,7 @@ pub async fn bump_withdrawal(state: &AppState, actor: &Actor, id: &str) -> Resul
         .transition_withdrawal(
             id,
             &[WithdrawalStatus::Stuck],
-            admin_transition(&row, WithdrawalEvent::Replace)?,
+            transition_target(&row, WithdrawalEvent::Replace)?,
             &WithdrawalUpdate {
                 fee_cap_raw: Some(cap),
                 ..Default::default()

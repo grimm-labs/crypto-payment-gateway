@@ -341,14 +341,6 @@ pub fn apply_cap_per_asset(rows: &mut [TreasuryRow]) {
     }
 }
 
-/// What "send excess to cold storage" moves: the asset's holdings above its
-/// cap, `None` within the cap or while a figure is unknown.
-pub fn asset_cap_excess(row: &TreasuryRow) -> Option<u128> {
-    let total = row.asset_holdings_raw.as_deref()?.parse::<u128>().ok()?;
-    let cap = row.hot_wallet_cap_raw.as_deref()?.parse::<u128>().ok()?;
-    (total > cap).then(|| total - cap)
-}
-
 /// Every 5 min: refresh the treasury balances and raise gas-reserve and
 /// hot-wallet-cap alerts.
 pub async fn treasury_monitor_loop(state: AppState) {
@@ -477,7 +469,5 @@ mod tests {
         assert_eq!(rows[2].asset_holdings_raw.as_deref(), Some("110000"));
         assert!(!rows[3].cap_exceeded);
         assert_eq!(rows[3].asset_holdings_raw.as_deref(), Some("3"));
-        assert_eq!(asset_cap_excess(&rows[1]), Some(10_000));
-        assert_eq!(asset_cap_excess(&rows[3]), None);
     }
 }

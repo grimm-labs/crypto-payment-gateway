@@ -172,10 +172,7 @@ function WithdrawalForm({
 
   const isBtc = isBtcNetwork(network)
   const isLightning = network === "lightning"
-  const entries =
-    effectiveOwner === ""
-      ? []
-      : (book.data?.data ?? []).filter((e) => !coldStorageOnly || e.is_cold_storage)
+  const entries = (book.data?.data ?? []).filter((e) => !coldStorageOnly || e.is_cold_storage)
   const entry = entries.find((e) => e.id === entryId)
   // Cold storage: when no single project covers the excess, show what each
   // one has, so the admin sends several withdrawals (spec §8.6).

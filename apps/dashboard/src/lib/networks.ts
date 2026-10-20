@@ -63,7 +63,7 @@ const EXPLORER_TX: Record<ChainMode, Partial<Record<Network, (hash: string) => s
 
 /** Block-explorer page of a transaction on the instance's chains; null on
  *  lightning (a payment id). */
-export function explorerTxUrl(network: string, hash: string, mode: ChainMode = "mainnet"): string | null {
+export function explorerTxUrl(network: string, hash: string, mode: ChainMode): string | null {
   const build = EXPLORER_TX[mode][network as Network]
   return build ? build(encodeURIComponent(hash)) : null
 }
