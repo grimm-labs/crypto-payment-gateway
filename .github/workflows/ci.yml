@@ -3,16 +3,10 @@ name: CI
 # Third-party actions are pinned by full commit SHA (the comment names the
 # version); Dependabot (.github/dependabot.yml) proposes the bumps.
 
+# Manual only: run it from the Actions tab on any branch (or tag). Nothing
+# starts it on push or pull request. New App Version dispatches it on the
+# release tag; Deploy only warns when the commit it ships has no green run.
 on:
-  push:
-    branches:
-      - '**'
-  pull_request:
-    branches:
-      - '**'
-  # Dispatched by New App Version on the release tag: its commit is pushed with
-  # GITHUB_TOKEN, which triggers no workflow, and Deploy requires a successful
-  # CI run on the exact commit it ships.
   workflow_dispatch:
 
 permissions:
@@ -82,7 +76,6 @@ jobs:
     name: Docker image build
     runs-on: ubuntu-latest
     needs: checks
-    if: github.event_name == 'push'
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:

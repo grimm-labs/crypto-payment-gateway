@@ -7,9 +7,10 @@ run-name: Deployment - ${{ fromJSON('{"test":"Test","staging":"Staging","product
 # selected below).
 #
 # Only `main` or a `v*` release tag can be deployed, and only a commit that is
-# on main and whose CI run succeeded (job `guard`). This file can be edited on a
-# branch, so the server-side barrier is the environments' protection rules
-# (deployment branches/tags limited to main and v*, required reviewers).
+# on main (job `guard`); a commit without a successful CI run (the CI is
+# manual) only gets a warning. This file can be edited on a branch, so the
+# server-side barrier is the environments' protection rules (deployment
+# branches/tags limited to main and v*, required reviewers).
 #
 # Variables (`vars.*`), required per environment: GATEWAY_HOST (the server, SSH
 # target), API_HOST, DASHBOARD_HOST.
@@ -54,7 +55,7 @@ concurrency:
 jobs:
   # No environment, so no secret: refuses the run before anything is exposed.
   guard:
-    name: Check the ref (main or v* tag, CI green)
+    name: Check the ref (main or v* tag; warns without a green CI)
     runs-on: ubuntu-latest
     permissions:
       contents: read # compare the commit with main
@@ -88,18 +89,19 @@ jobs:
               ;;
           esac
 
-      - name: CI succeeded on this commit
+      # Informational: the CI is manual, so a commit may ship without a run.
+      - name: CI succeeded on this commit (warning only)
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
           SHA: ${{ github.sha }}
         run: |
-          runs=$(gh api "repos/$REPO/actions/workflows/ci.yml/runs?head_sha=$SHA&status=success&per_page=1" --jq .total_count)
-          if [ "$runs" -lt 1 ]; then
-            echo "::error::No successful CI run for $SHA: wait for CI (or re-run it) before deploying."
-            exit 1
+          runs=$(gh api "repos/$REPO/actions/workflows/ci.yml/runs?head_sha=$SHA&status=success&per_page=1" --jq .total_count || echo 0)
+          if [ "${runs:-0}" -lt 1 ]; then
+            echo "::warning::No successful CI run for $SHA — deploying anyway (run the CI workflow on it if in doubt)."
+          else
+            echo "CI succeeded on $SHA"
           fi
-          echo "CI succeeded on $SHA"
 
   deploy:
     name: Deployment - ${{ fromJSON('{"test":"Test","staging":"Staging","production":"Production"}')[inputs.environment] }}

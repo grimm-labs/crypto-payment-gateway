@@ -684,8 +684,9 @@ wipe the database before any deposit (`docker volume rm crypto-payment-gateway-p
 the accessory stopped) and deploy again.
 
 **GitHub Actions → Deploy** (manual, pick the environment) runs `kamal deploy` — only from
-`main` or a `v*` tag, for a commit on `main` whose CI run succeeded (a `guard` job checks it
-before any secret is exposed). Per GitHub environment:
+`main` or a `v*` tag, for a commit on `main` (a `guard` job checks it before any secret is
+exposed; a commit without a successful run of the manual CI workflow only gets a warning).
+Per GitHub environment:
 
 - Variables: `GATEWAY_HOST` (server, SSH target), `API_HOST`, `DASHBOARD_HOST`
   (required); `APP_ENV` (defaults to the environment name), `SSH_USER` (default `deploy`: a
