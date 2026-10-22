@@ -687,9 +687,7 @@ the accessory stopped) and deploy again.
 `main` or a `v*` tag, for a commit on `main` whose CI run succeeded (a `guard` job checks it
 before any secret is exposed). Per GitHub environment:
 
-- Variables: `GATEWAY_HOST` (server, SSH target), `API_HOST`, `DASHBOARD_HOST`,
-  `SSH_KNOWN_HOSTS` (the server's pinned host key, e.g. from `ssh-keyscan -t ed25519
-  <GATEWAY_HOST>` checked against the server console — required: host keys are verified)
+- Variables: `GATEWAY_HOST` (server, SSH target), `API_HOST`, `DASHBOARD_HOST`
   (required); `APP_ENV` (defaults to the environment name), `SSH_USER` (default `deploy`: a
   dedicated user in the `docker` group — create it before the first deploy, or set the variable
   to `root` to keep deploying as root), `BITCOIN_ESPLORA_BASE_URL`,

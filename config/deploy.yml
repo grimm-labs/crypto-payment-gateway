@@ -44,10 +44,8 @@ builder:
 # re-creates its state under the new user's ~/.kamal), then delete
 # /root/.kamal/apps — it still holds the old env files, secrets included.
 #
-# Host keys are verified: the OpenSSH config files are loaded (config: true),
-# and the Deploy workflow writes a pinned ~/.ssh/known_hosts plus
-# `StrictHostKeyChecking yes` (net-ssh then refuses unknown or changed keys).
-# Locally, keep the server's key in your own known_hosts the same way.
+# The OpenSSH config files are loaded (config: true): the server's host key
+# is accepted on first contact and remembered in known_hosts, the OpenSSH way.
 ssh:
   # A dedicated deploy user in the docker group (audit #44): set SSH_USER=root
   # explicitly to keep deploying as root.

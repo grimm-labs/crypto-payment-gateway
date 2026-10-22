@@ -12,9 +12,7 @@ run-name: Deployment - ${{ fromJSON('{"test":"Test","staging":"Staging","product
 # (deployment branches/tags limited to main and v*, required reviewers).
 #
 # Variables (`vars.*`), required per environment: GATEWAY_HOST (the server, SSH
-# target), API_HOST, DASHBOARD_HOST, SSH_KNOWN_HOSTS (the server's host key line(s),
-# e.g. from `ssh-keyscan -t ed25519 <GATEWAY_HOST>` checked against
-# `ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub` on the server console).
+# target), API_HOST, DASHBOARD_HOST.
 # Optional: APP_ENV (defaults to the environment name), SSH_USER (default
 # `deploy`, a user in the docker group; set it to `root` to keep deploying
 # as root), BITCOIN_ESPLORA_BASE_URL
@@ -136,40 +134,12 @@ jobs:
       # Exact version: config/deploy.yml needs >= 2.12 (ssh.forward_agent).
       - run: gem install kamal -v 2.12.0 --no-document
 
-      # Host key pinned from SSH_KNOWN_HOSTS (never trust-on-first-use: a spoofed
-      # GATEWAY_HOST would receive the env file with the mnemonic) and
-      # StrictHostKeyChecking yes, which Kamal's net-ssh reads (ssh.config: true)
-      # and turns into its `:always` verifier. The key goes into an agent, never
-      # onto disk.
-      - name: SSH setup (pinned host key, key in an agent)
-        env:
-          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
-          SSH_KNOWN_HOSTS: ${{ vars.SSH_KNOWN_HOSTS }}
-          GATEWAY_HOST: ${{ vars.GATEWAY_HOST }}
-        run: |
-          if [ -z "$SSH_KNOWN_HOSTS" ]; then
-            echo "::error::The SSH_KNOWN_HOSTS variable is empty: set it to the server's host key line(s) in this environment."
-            exit 1
-          fi
-          install -d -m 700 ~/.ssh
-          printf '%s\n' "$SSH_KNOWN_HOSTS" > ~/.ssh/known_hosts
-          chmod 600 ~/.ssh/known_hosts
-          if ! ssh-keygen -F "$GATEWAY_HOST" -f ~/.ssh/known_hosts > /dev/null; then
-            echo "::error::SSH_KNOWN_HOSTS has no entry for GATEWAY_HOST."
-            exit 1
-          fi
-          cat > ~/.ssh/config <<'EOF'
-          Host *
-            StrictHostKeyChecking yes
-            UserKnownHostsFile ~/.ssh/known_hosts
-            GlobalKnownHostsFile /dev/null
-            ForwardAgent no
-          EOF
-          chmod 600 ~/.ssh/config
-          eval "$(ssh-agent -s)" > /dev/null
-          printf '%s\n' "$SSH_PRIVATE_KEY" | tr -d '\r' | ssh-add -
-          echo "SSH_AUTH_SOCK=$SSH_AUTH_SOCK" >> "$GITHUB_ENV"
-          echo "SSH_AGENT_PID=$SSH_AGENT_PID" >> "$GITHUB_ENV"
+      # The deploy key goes into an agent (never onto disk); the action stops
+      # it at the end of the job. The server's host key is accepted on first
+      # contact (net-ssh's default), not pinned.
+      - uses: webfactory/ssh-agent@dc588b651fe13675774614f8e6a936a468676387 # v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.SSH_PRIVATE_KEY }}
 
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
@@ -207,7 +177,3 @@ jobs:
           ALCHEMY_API_KEY: ${{ secrets.ALCHEMY_API_KEY || '' }}
           HELIUS_API_KEY: ${{ secrets.HELIUS_API_KEY || '' }}
           BREEZ_API_KEY: ${{ secrets.BREEZ_API_KEY || '' }}
-
-      - name: Stop the SSH agent
-        if: always()
-        run: ssh-agent -k > /dev/null 2>&1 || true
