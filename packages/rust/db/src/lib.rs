@@ -114,6 +114,14 @@ pub struct DepositAddressRow {
     pub updated_at: DateTime<Utc>,
 }
 
+#[derive(FromRow)]
+struct KeyedDepositAddressRow {
+    #[sqlx(flatten)]
+    row: DepositAddressRow,
+    #[sqlx(rename = "paramsHash")]
+    params_hash: Option<String>,
+}
+
 /// Which owned rows a listing shows: every row, one project's, or the
 /// merchant's (`"projectId" IS NULL`).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -160,6 +168,33 @@ pub struct DepositRow {
     pub detected_at: DateTime<Utc>,
     #[sqlx(rename = "confirmedAt")]
     pub confirmed_at: Option<DateTime<Utc>>,
+}
+
+/// A deposit address to create.
+#[derive(Debug, Clone)]
+pub struct NewDepositAddress<'a> {
+    pub network: Network,
+    pub token: Token,
+    pub address: &'a str,
+    pub derivation_index: i32,
+    pub expected_amount: Decimal,
+    pub expires_at: DateTime<Utc>,
+    /// End of the late watch (ADR 0005).
+    pub watch_until: DateTime<Utc>,
+    pub metadata: Value,
+    pub api_key_id: Option<&'a str>,
+    pub project_id: Option<&'a str>,
+    /// The `Idempotency-Key` of the request and the hash of its parameters
+    /// (merchant keys only).
+    pub idempotency: Option<(&'a str, &'a str)>,
+}
+
+/// Whether `err` is the unique violation of an idempotency key (a
+/// concurrent request with the same key won the race).
+pub fn is_idempotency_conflict(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<sqlx::Error>()
+        .and_then(|e| e.as_database_error())
+        .is_some_and(|e| e.is_unique_violation() && e.constraint().is_some_and(|c| c.contains("idempotencyKey")))
 }
 
 /// What recording a transfer did (ADR 0005).
@@ -385,45 +420,42 @@ impl Db {
         Ok(row.map(|(i,)| i).unwrap_or(0))
     }
 
-    #[allow(clippy::too_many_arguments)]
+    /// Create a PENDING deposit address, with its `pending` deliveries (see
+    /// `insert_event_deliveries` for `owner_filtered`). Returns the
+    /// endpoints of the deliveries written. A reused idempotency key fails
+    /// with a unique violation (`is_idempotency_conflict`).
     pub async fn create_deposit_address(
         &self,
-        network: Network,
-        token: Token,
-        address: &str,
-        derivation_index: i32,
-        expected_amount: Decimal,
-        expires_at: DateTime<Utc>,
-        watch_until: DateTime<Utc>,
-        metadata: Value,
-        api_key_id: Option<&str>,
-        project_id: Option<&str>,
+        new: NewDepositAddress<'_>,
         owner_filtered: bool,
     ) -> Result<(DepositAddressRow, Vec<String>)> {
         let id = Uuid::new_v4().to_string();
         let now = Utc::now();
+        let (idempotency_key, params_hash) = new.idempotency.unzip();
         let mut tx = self.pool.begin().await?;
         let row = sqlx::query_as::<_, DepositAddressRow>(&format!(
             r#"
             INSERT INTO deposit_addresses
-              (id, network, token, address, "derivationIndex", "expectedAmount", status, "expiresAt", metadata, "createdAt", "updatedAt", "apiKeyId", "projectId", "watchUntil")
+              (id, network, token, address, "derivationIndex", "expectedAmount", status, "expiresAt", metadata, "createdAt", "updatedAt", "apiKeyId", "projectId", "watchUntil", "idempotencyKey", "paramsHash")
             VALUES
-              ($1, $2::"Network", $3::"Token", $4, $5, $6, 'PENDING'::"DepositAddressStatus", $7, $8, $9, $9, $10, $11, $12)
+              ($1, $2::"Network", $3::"Token", $4, $5, $6, 'PENDING'::"DepositAddressStatus", $7, $8, $9, $9, $10, $11, $12, $13, $14)
             RETURNING {DEPOSIT_ADDRESS_COLUMNS}
             "#
         ))
         .bind(&id)
-        .bind(network.as_db())
-        .bind(token.as_db())
-        .bind(address)
-        .bind(derivation_index)
-        .bind(expected_amount)
-        .bind(expires_at)
-        .bind(metadata)
+        .bind(new.network.as_db())
+        .bind(new.token.as_db())
+        .bind(new.address)
+        .bind(new.derivation_index)
+        .bind(new.expected_amount)
+        .bind(new.expires_at)
+        .bind(new.metadata)
         .bind(now)
-        .bind(api_key_id)
-        .bind(project_id)
-        .bind(watch_until)
+        .bind(new.api_key_id)
+        .bind(new.project_id)
+        .bind(new.watch_until)
+        .bind(idempotency_key)
+        .bind(params_hash)
         .fetch_one(&mut *tx)
         .await?;
         // `pending` is written with the address (spec §4.5).
@@ -437,6 +469,24 @@ impl Db {
         .await?;
         tx.commit().await?;
         Ok((row, deliveries))
+    }
+
+    /// The payment a merchant key created with `idempotency_key`, and the
+    /// parameters hash it was created with.
+    pub async fn find_deposit_address_by_idempotency_key(
+        &self,
+        api_key_id: &str,
+        idempotency_key: &str,
+    ) -> Result<Option<(DepositAddressRow, String)>> {
+        let row = sqlx::query_as::<_, KeyedDepositAddressRow>(&format!(
+            r#"SELECT {DEPOSIT_ADDRESS_COLUMNS}, "paramsHash" FROM deposit_addresses
+               WHERE "apiKeyId" = $1 AND "idempotencyKey" = $2"#
+        ))
+        .bind(api_key_id)
+        .bind(idempotency_key)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|keyed| (keyed.row, keyed.params_hash.unwrap_or_default())))
     }
 
     /// Open (PENDING) payments created with this merchant key.

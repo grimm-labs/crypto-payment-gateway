@@ -168,12 +168,21 @@ pub(crate) fn validate_withdrawal_request(body: &WithdrawalRequest, merchant: bo
 
 /// The canonical UUID of the required `Idempotency-Key` header.
 pub(crate) fn idempotency_key(headers: &HeaderMap) -> Result<String, ApiError> {
-    let raw = headers
-        .get("idempotency-key")
-        .and_then(|value| value.to_str().ok())
-        .ok_or_else(|| ApiError::bad_request("Idempotency-Key header is required (UUID)"))?;
+    optional_idempotency_key(headers)?
+        .ok_or_else(|| ApiError::bad_request("Idempotency-Key header is required (UUID)"))
+}
+
+/// The canonical UUID of an optional `Idempotency-Key` header; `None` when
+/// absent (a value that is not a UUID is refused).
+pub(crate) fn optional_idempotency_key(headers: &HeaderMap) -> Result<Option<String>, ApiError> {
+    let Some(value) = headers.get("idempotency-key") else {
+        return Ok(None);
+    };
+    let raw = value
+        .to_str()
+        .map_err(|_| ApiError::bad_request("Idempotency-Key must be a UUID"))?;
     uuid::Uuid::parse_str(raw.trim())
-        .map(|uuid| uuid.hyphenated().to_string())
+        .map(|uuid| Some(uuid.hyphenated().to_string()))
         .map_err(|_| ApiError::bad_request("Idempotency-Key must be a UUID"))
 }
 

@@ -246,6 +246,15 @@ provider key, Breez SDK not connected…) and a generic `500` when the Lightning
 response carries `expected_amount_raw` (base units: sats for BTC, 10⁻⁶ for USDT, wei for
 ETH) next to `expected_amount`, and `project_id`: the payment belongs to the key's project.
 
+**Idempotency.** An optional `Idempotency-Key: <uuid>` header makes a retry safe: the same
+key, from the same API key, with the same parameters (network, token, amount, `expires_at`,
+`metadata`, `description`) answers **`200`** with the stored payment — no new address, no new
+invoice, no second `pending` webhook — whatever happened since (the network disabled, the
+deadline passed); the same key with other parameters answers `422 "Idempotency-Key reused with
+different parameters"`, and a value that is not a UUID `400`. Two concurrent requests with one
+key create one payment. Without the header every call creates a payment (`201`), as before.
+Staff creations from the dashboard ignore the header.
+
 Limits: `expected_amount` must be > 0 and ≤ 10¹² USDT (10⁵ ETH); an explicit `expires_at` must fall
 between now + 1 min and now + 1440 min (the default comes from Settings). A key may hold at
 most 1 000 open (`pending`) payments and create 120 per minute (`429` beyond); every key is

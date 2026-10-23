@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::time::Duration as StdDuration;
 
 use axum::extract::{DefaultBodyLimit, Path, Query, State};
-use axum::http::{header, HeaderName, Method, StatusCode};
+use axum::http::{header, HeaderMap, HeaderName, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Extension, Json, Router};
@@ -11,7 +11,7 @@ use config::{
     DEPOSIT_EXPIRY_MAX_MINUTES, DEPOSIT_EXPIRY_MIN_MINUTES, ETH_MAX_EXPECTED_AMOUNT,
     MAX_PENDING_ADDRESSES_PER_API_KEY, USDT_MAX_EXPECTED_AMOUNT,
 };
-use db::{AuditActor, DepositAddressRow, OwnerFilter, WebhookDeliveryRow};
+use db::{AuditActor, DepositAddressRow, NewDepositAddress, OwnerFilter, WebhookDeliveryRow};
 use domain::{
     decimal_to_raw, format_amount, parse_sats, raw_to_decimal, raw_to_decimal_string,
     required_confirmations, round_to_token, supports, DepositAddressStatus, Network, Token,
@@ -294,11 +294,21 @@ fn actor(api_key: Option<&CurrentApiKey>, staff: Option<&CurrentStaff>, ip: &Cli
     }
 }
 
+/// `Idempotency-Key` (optional, a UUID, merchant keys — spec §4.6): the same
+/// key with the same parameters answers `200` with the stored payment (no
+/// derivation, no invoice, no second `pending`); with other parameters
+/// `422`. Without it, every call creates a payment (`201`).
 async fn create_deposit_address(
     State(state): State<AppState>,
     api_key: Option<Extension<CurrentApiKey>>,
+    headers: HeaderMap,
     Json(body): Json<CreateDepositAddressRequest>,
 ) -> Result<(StatusCode, Json<DepositAddressResponse>), ApiError> {
+    let idempotency_key = match api_key.as_deref() {
+        Some(_) => withdrawals::optional_idempotency_key(&headers)?,
+        // The dashboard's creations carry no key.
+        None => None,
+    };
     let request = validate_create_request(&body)?;
     let network = request.network;
     // The owner (spec §5): the calling key's project, or the staff
@@ -321,6 +331,32 @@ async fn create_deposit_address(
             Some(id)
         }
     };
+    let requested_expiry = body
+        .expires_at
+        .as_deref()
+        .map(|exp| {
+            chrono::DateTime::parse_from_rfc3339(exp)
+                .map(|d| d.with_timezone(&Utc))
+                .map_err(|_| ApiError::bad_request("Invalid expires_at"))
+        })
+        .transpose()?;
+    let metadata = body.metadata.clone().unwrap_or_else(|| json!({}));
+    let params_hash = deposit_params_hash(&request, requested_expiry, &metadata);
+    // A replay is answered from storage, whatever happened since (network
+    // down, open-payment cap reached, deadline passed).
+    let idempotency = match (api_key.as_deref(), idempotency_key.as_deref()) {
+        (Some(key), Some(idempotency_key)) => {
+            if let Some(stored) = state
+                .db
+                .find_deposit_address_by_idempotency_key(&key.id, idempotency_key)
+                .await?
+            {
+                return replay_deposit_address(&state, stored, &params_hash).await;
+            }
+            Some((key.id.as_str(), idempotency_key))
+        }
+        _ => None,
+    };
     // An address nobody polls would never see its payment (#66).
     if !state.is_network_enabled(network) {
         return Err(ApiError::service_unavailable(format!(
@@ -330,13 +366,8 @@ async fn create_deposit_address(
     }
 
     let now = Utc::now();
-    let expires_at = match body.expires_at.as_deref() {
-        Some(exp) => {
-            let expires_at = chrono::DateTime::parse_from_rfc3339(exp)
-                .map(|d| d.with_timezone(&Utc))
-                .map_err(|_| ApiError::bad_request("Invalid expires_at"))?;
-            validate_expires_at(expires_at, now)?
-        }
+    let expires_at = match requested_expiry {
+        Some(expires_at) => validate_expires_at(expires_at, now)?,
         None => {
             let expiry_minutes = state.db.deposit_expiry_minutes().await?;
             now + Duration::minutes(expiry_minutes)
@@ -392,25 +423,41 @@ async fn create_deposit_address(
             .map_err(|e| ApiError::internal(e.to_string()))?,
     };
 
-    let metadata = body.metadata.unwrap_or_else(|| json!({}));
     // The late watch (ADR 0005): polled this long past the deadline.
     let watch_until = expires_at + Duration::hours(state.config.late_watch_hours);
-    let (row, deliveries) = state
+    let created = state
         .db
         .create_deposit_address(
-            network,
-            request.token,
-            &address,
-            derivation_index,
-            request.expected_amount,
-            expires_at,
-            watch_until,
-            metadata,
-            api_key.as_deref().map(|key| key.id.as_str()),
-            project_id.as_deref(),
+            NewDepositAddress {
+                network,
+                token: request.token,
+                address: &address,
+                derivation_index,
+                expected_amount: request.expected_amount,
+                expires_at,
+                watch_until,
+                metadata,
+                api_key_id: api_key.as_deref().map(|key| key.id.as_str()),
+                project_id: project_id.as_deref(),
+                idempotency: idempotency.map(|(_, key)| (key, params_hash.as_str())),
+            },
             jobs::projects::projects_exist(&state).await?,
         )
-        .await?;
+        .await;
+    let (row, deliveries) = match (created, idempotency) {
+        (Ok(created), _) => created,
+        // A concurrent request with the same key won the race: answer
+        // with its payment (this derivation index is simply skipped).
+        (Err(err), Some((api_key_id, key))) if db::is_idempotency_conflict(&err) => {
+            let stored = state
+                .db
+                .find_deposit_address_by_idempotency_key(api_key_id, key)
+                .await?
+                .ok_or_else(|| ApiError::internal(format!("idempotent payment vanished: {err:#}")))?;
+            return replay_deposit_address(&state, stored, &params_hash).await;
+        }
+        (Err(err), _) => return Err(err.into()),
+    };
 
     // The address is created PENDING, its `pending` deliveries written with
     // it: queue them. A queueing failure must not fail the creation (the
@@ -418,6 +465,47 @@ async fn create_deposit_address(
     queue_deliveries(&state, WebhookEventType::Pending, &row.id, &deliveries).await;
 
     Ok((StatusCode::CREATED, Json(to_response(&row, 0, &state.config)?)))
+}
+
+/// SHA-256 of the normalised creation request — what a replayed
+/// `Idempotency-Key` must match: network, token, the amount in base units,
+/// the requested deadline (none = the default), the metadata (canonical
+/// JSON) and the Lightning description.
+fn deposit_params_hash(
+    request: &ValidCreateRequest,
+    requested_expiry: Option<DateTime<Utc>>,
+    metadata: &Value,
+) -> String {
+    auth::sha256_hex(&format!(
+        "{}\n{}\n{}\n{}\n{}\n{}",
+        request.network.as_db(),
+        request.token.as_db(),
+        decimal_to_raw(request.expected_amount, request.token),
+        requested_expiry.map(|at| at.timestamp_millis().to_string()).unwrap_or_default(),
+        metadata,
+        request.description.as_deref().unwrap_or_default(),
+    ))
+}
+
+/// The answer to a replayed `Idempotency-Key`: the stored payment (`200`)
+/// when the parameters match, `422` otherwise.
+async fn replay_deposit_address(
+    state: &AppState,
+    (row, stored_hash): (DepositAddressRow, String),
+    params_hash: &str,
+) -> Result<(StatusCode, Json<DepositAddressResponse>), ApiError> {
+    check_replay(&stored_hash, params_hash)?;
+    let received_raw = state.db.confirmed_total_raw(&row.id).await?;
+    Ok((StatusCode::OK, Json(to_response(&row, received_raw, &state.config)?)))
+}
+
+fn check_replay(stored_hash: &str, params_hash: &str) -> Result<(), ApiError> {
+    if stored_hash != params_hash {
+        return Err(ApiError::unprocessable(
+            "Idempotency-Key reused with different parameters".into(),
+        ));
+    }
+    Ok(())
 }
 
 /// A create request that passed validation.
@@ -1415,6 +1503,59 @@ mod tests {
         assert_eq!(eth.token, "ETH");
         assert_eq!(eth.expected_amount, "0.05");
         assert_eq!(eth.expected_amount_raw, "50000000000000000");
+    }
+
+    #[test]
+    fn the_same_idempotency_key_replays_and_another_body_is_refused() {
+        let hash = |body: Value, expiry: Option<DateTime<Utc>>| {
+            let request = validate_create_request(&request(body.clone())).unwrap();
+            let metadata = body.get("metadata").cloned().unwrap_or_else(|| json!({}));
+            deposit_params_hash(&request, expiry, &metadata)
+        };
+        let body = json!({
+            "network": "tron", "token": "USDT", "expected_amount": "8.57",
+            "metadata": { "kivoo": { "attemptId": "a1" }, "b": 1 }
+        });
+        let at = DateTime::parse_from_rfc3339("2026-10-23T12:00:00Z").unwrap().with_timezone(&Utc);
+        let stored = hash(body.clone(), Some(at));
+        // Same parameters (key order and amount spelling aside): replayed.
+        let same = json!({
+            "network": "TRON", "token": "usdt", "expected_amount": "8.570",
+            "metadata": { "b": 1, "kivoo": { "attemptId": "a1" } }
+        });
+        assert_eq!(hash(same, Some(at)), stored);
+        assert!(check_replay(&stored, &stored).is_ok());
+        // Any other parameter: refused with 422.
+        for other in [
+            json!({ "network": "tron", "token": "USDT", "expected_amount": "8.58", "metadata": body["metadata"] }),
+            json!({ "network": "ethereum", "token": "USDT", "expected_amount": "8.57", "metadata": body["metadata"] }),
+            json!({ "network": "tron", "token": "USDT", "expected_amount": "8.57", "metadata": { "kivoo": { "attemptId": "a2" } } }),
+        ] {
+            let err = check_replay(&stored, &hash(other, Some(at))).unwrap_err();
+            assert_eq!(err.status, StatusCode::UNPROCESSABLE_ENTITY);
+            assert_eq!(err.message, "Idempotency-Key reused with different parameters");
+        }
+        assert_ne!(hash(body.clone(), Some(at + Duration::minutes(1))), stored);
+        assert_ne!(hash(body.clone(), None), stored);
+        // The Lightning memo counts.
+        let ln = |description: &str| {
+            hash(json!({ "network": "lightning", "token": "BTC", "expected_amount_sats": "10504", "description": description }), None)
+        };
+        assert_ne!(ln("Boutique · Kivoo"), ln("Autre · Kivoo"));
+    }
+
+    #[test]
+    fn the_idempotency_key_is_optional_and_a_uuid() {
+        let mut headers = HeaderMap::new();
+        assert_eq!(withdrawals::optional_idempotency_key(&headers).unwrap(), None);
+        headers.insert("idempotency-key", HeaderValue::from_static("6F1C7A8E-2F43-4D55-9A8B-1C2D3E4F5A6B"));
+        assert_eq!(
+            withdrawals::optional_idempotency_key(&headers).unwrap().as_deref(),
+            Some("6f1c7a8e-2f43-4d55-9a8b-1c2d3e4f5a6b")
+        );
+        headers.insert("idempotency-key", HeaderValue::from_static("attempt-1"));
+        let err = withdrawals::optional_idempotency_key(&headers).unwrap_err();
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
     }
 
     #[test]
