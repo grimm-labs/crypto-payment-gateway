@@ -285,6 +285,19 @@ row, in the transaction that confirms the deposit, and only from `pending`: the 
 fires exactly once, for the transfer whose confirmation made the total reach the amount. A
 short total at the deadline expires the payment as before.
 
+**Older funds never count.** A transfer included in a block more than 10 minutes
+(`domain::TRANSFER_BEFORE_PAYMENT_MARGIN_SECS`, the tolerated clock skew) older than the
+payment's creation was on the address before the payment existed — a restored derivation
+counter, the same seed on another instance, Bitcoin never swept — and is never one of its
+deposits: not recorded, not counted, no `late` webhook (it is logged at debug level). An
+unconfirmed (mempool) transfer always counts. The block time comes from Esplora
+(`status.block_time`), TronGrid (`block_timestamp`), Solana (`blockTime` of the signature,
+else Helius's `timestamp`) and Alchemy (`metadata.blockTimestamp` for ETH,
+`blockTimestamp` of the USDT log when the node returns it); without one on Ethereum, an upper
+bound from the height (`now − 12 s × blocks behind the tip`): missed slots only make a block
+older, so a recent transfer is never ignored, but an old one mined shortly before the margin
+may still count. Lightning is unaffected (a fixed-amount invoice).
+
 **The late watch.** A `paid` or `expired` address is still polled until `watch_until`
 (`expires_at` + `LATE_WATCH_HOURS`, 24 h by default, `0` turns the watch off), and after it
 while one of its deposits is still `detected`. A transfer first seen once the address left

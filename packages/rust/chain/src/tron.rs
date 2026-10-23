@@ -36,6 +36,8 @@ pub(crate) struct Trc20Tx {
     kind: Option<String>,
     /// Integer string in token base units.
     value: Option<String>,
+    /// Milliseconds since the epoch of the transaction's block.
+    block_timestamp: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -48,6 +50,8 @@ struct Trc20TokenInfo {
 pub(crate) struct Trc20Candidate {
     pub(crate) tx_id: String,
     pub(crate) amount_raw: String,
+    /// Unix seconds of its block (`block_timestamp`).
+    pub(crate) block_time: Option<i64>,
 }
 
 /// USDT `Transfer` events paying `address`. Anything else — another token,
@@ -67,6 +71,7 @@ pub(crate) fn usdt_transfers_to(txs: Vec<Trc20Tx>, usdt_contract: &str, address:
             Some(Trc20Candidate {
                 tx_id,
                 amount_raw: amount.to_string(),
+                block_time: tx.block_timestamp.map(|ms| ms.div_euclid(1000)),
             })
         })
         .collect()
@@ -273,8 +278,8 @@ mod tests {
         assert_eq!(
             candidates,
             vec![
-                Trc20Candidate { tx_id: TX_A.into(), amount_raw: "27033535803560".into() },
-                Trc20Candidate { tx_id: TX_B.into(), amount_raw: "26710221406060".into() },
+                Trc20Candidate { tx_id: TX_A.into(), amount_raw: "27033535803560".into(), block_time: Some(1_791_668_424) },
+                Trc20Candidate { tx_id: TX_B.into(), amount_raw: "26710221406060".into(), block_time: Some(1_791_630_024) },
             ]
         );
     }
@@ -301,8 +306,25 @@ mod tests {
         );
         assert_eq!(
             usdt_transfers_to(page(&json), USDT_TRON, ADDRESS),
-            vec![Trc20Candidate { tx_id: TX_B.into(), amount_raw: "25000000".into() }]
+            vec![Trc20Candidate { tx_id: TX_B.into(), amount_raw: "25000000".into(), block_time: Some(0) }]
         );
+    }
+
+    #[test]
+    fn a_trc20_transfer_mined_before_the_payment_is_not_its_deposit() {
+        // `block_timestamp` is in milliseconds; TronGrid lists solidified
+        // transfers only, so every one has a block.
+        let candidates = usdt_transfers_to(page(TRC20_PAGE), USDT_TRON, ADDRESS);
+        let (tx_a, tx_b) = (candidates[0].block_time, candidates[1].block_time);
+        // A payment created right after TX_A: TX_B (10 h 40 before) is old.
+        let created = 1_791_668_424 + 60;
+        assert!(!domain::predates_payment(tx_a, created));
+        assert!(domain::predates_payment(tx_b, created));
+        // Within the clock-skew margin: counted.
+        assert!(!domain::predates_payment(tx_a, 1_791_668_424 + domain::TRANSFER_BEFORE_PAYMENT_MARGIN_SECS));
+        assert!(domain::predates_payment(tx_a, 1_791_668_424 + domain::TRANSFER_BEFORE_PAYMENT_MARGIN_SECS + 1));
+        // No timestamp (an odd entry): never judged older.
+        assert!(!domain::predates_payment(None, created));
     }
 
     #[test]

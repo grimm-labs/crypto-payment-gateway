@@ -192,6 +192,15 @@ pub(crate) struct AssetTransfer {
     category: Option<String>,
     #[serde(rename = "rawContract")]
     raw_contract: Option<RawContract>,
+    /// `withMetadata: true`: the block's timestamp.
+    metadata: Option<AssetTransferMetadata>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AssetTransferMetadata {
+    /// RFC 3339 (`2026-10-23T12:00:00.000Z`).
+    #[serde(rename = "blockTimestamp")]
+    block_timestamp: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -214,13 +223,16 @@ pub(crate) struct AssetTransfersPage {
 /// is summed (a contract can forward ETH to it several times), like
 /// Esplora outputs for BTC. Filters are re-checked rather than trusted; a
 /// transfer without `rawContract.value` is skipped, never guessed.
+/// `now` (unix seconds) bounds the block time of a transfer without
+/// `metadata.blockTimestamp` (`eth_block_time_upper_bound`).
 pub(crate) fn native_eth_transfers(
     transfers: Vec<AssetTransfer>,
     address: &str,
     tip: u64,
+    now: i64,
 ) -> Vec<DetectedOnChainTransfer> {
-    // BTreeMap: deterministic order.
-    let mut by_hash: BTreeMap<String, (u128, u64)> = BTreeMap::new();
+    // BTreeMap: deterministic order; (amount, block, block time).
+    let mut by_hash: BTreeMap<String, (u128, u64, Option<i64>)> = BTreeMap::new();
     // Transactions with a transfer whose value is unreadable: a partial
     // sum would be stored and never corrected (the deposit upsert keeps
     // its amount), so the whole transaction waits for a complete read.
@@ -244,17 +256,26 @@ pub(crate) fn native_eth_transfers(
             unreadable.insert(hash.to_ascii_lowercase());
             continue;
         };
-        let entry = by_hash.entry(hash.to_ascii_lowercase()).or_insert((0, block));
+        let block_time = transfer
+            .metadata
+            .and_then(|metadata| metadata.block_timestamp)
+            .and_then(|ts| chrono::DateTime::parse_from_rfc3339(&ts).ok())
+            .map(|ts| ts.timestamp());
+        let entry = by_hash.entry(hash.to_ascii_lowercase()).or_insert((0, block, block_time));
         entry.0 = entry.0.saturating_add(value);
         entry.1 = entry.1.max(block);
+        entry.2 = entry.2.max(block_time);
     }
     by_hash
         .into_iter()
-        .filter(|(hash, (amount, _))| *amount > 0 && !unreadable.contains(hash))
-        .map(|(hash, (amount, block))| DetectedOnChainTransfer {
+        .filter(|(hash, (amount, _, _))| *amount > 0 && !unreadable.contains(hash))
+        .map(|(hash, (amount, block, block_time))| DetectedOnChainTransfer {
             tx_hash: hash,
             amount_raw: amount.to_string(),
             confirmations: confirmations_between(tip, block),
+            block_time: Some(
+                block_time.unwrap_or_else(|| crate::eth_block_time_upper_bound(now, tip.saturating_sub(block))),
+            ),
         })
         .collect()
 }
@@ -331,7 +352,9 @@ impl ChainClients {
                 "toAddress": address,
                 "category": ["external", "internal"],
                 "excludeZeroValue": true,
-                "withMetadata": false,
+                // The block timestamp: a transfer older than its payment is
+                // not a deposit of it.
+                "withMetadata": true,
                 "order": "asc",
                 "maxCount": "0x3e8",
             });
@@ -349,7 +372,7 @@ impl ChainClients {
         if page_key.is_some() {
             warn!("alchemy_getAssetTransfers: more than {ASSET_TRANSFER_MAX_PAGES} pages for {address} — the rest waits for the next poll");
         }
-        Ok(native_eth_transfers(transfers, address, tip))
+        Ok(native_eth_transfers(transfers, address, tip, chrono::Utc::now().timestamp()))
     }
 }
 
@@ -745,7 +768,7 @@ mod tests {
     fn native_transfers_are_summed_per_transaction() {
         let page: AssetTransfersPage = serde_json::from_str(ASSET_TRANSFERS).unwrap();
         assert_eq!(page.page_key.as_deref(), Some("6f9e3c6a-3c5b-4ad8-9d5b-6dfb1e09d0a4"));
-        let detected = native_eth_transfers(page.transfers, ADDRESS, 0x14a3c00 + 11);
+        let detected = native_eth_transfers(page.transfers, ADDRESS, 0x14a3c00 + 11, 1_800_000_000);
         assert_eq!(detected.len(), 2);
         assert_eq!(detected[0].tx_hash, "0xaaa1");
         assert_eq!(detected[0].amount_raw, "50000000000000000");
@@ -758,6 +781,33 @@ mod tests {
     }
 
     #[test]
+    fn native_eth_mined_before_the_payment_is_not_a_deposit() {
+        let transfer = |metadata: &str, block: &str| {
+            format!(
+                r#"{{"blockNum": "{block}", "hash": "0x{block}", "to": "0x9858effd232b4033e47d90003d41ec34ecaeda94",
+                    "asset": "ETH", "category": "external", "rawContract": {{"value": "0x1", "address": null}}{metadata}}}"#
+            )
+        };
+        let now = 1_800_000_000;
+        let created = now - 3_600;
+        let page: AssetTransfersPage = serde_json::from_str(&format!(
+            r#"{{"transfers": [{}, {}, {}]}}"#,
+            // `withMetadata`: the block timestamp, a day before the payment…
+            transfer(r#", "metadata": {"blockTimestamp": "2027-01-14T08:00:00.000Z"}"#, "0x10"),
+            // …or 5 minutes after it.
+            transfer(r#", "metadata": {"blockTimestamp": "2027-01-15T07:05:00.000Z"}"#, "0x11"),
+            // No metadata: the 12 s-per-block bound (0x20 − 0x12 = 14 blocks).
+            transfer("", "0x12"),
+        ))
+        .unwrap();
+        let detected = native_eth_transfers(page.transfers, ADDRESS, 0x20, now);
+        let times: Vec<Option<i64>> = detected.iter().map(|t| t.block_time).collect();
+        assert_eq!(times, vec![Some(1_799_913_600), Some(1_799_996_700), Some(now - 14 * 12)]);
+        let predates: Vec<bool> = times.iter().map(|t| domain::predates_payment(*t, created)).collect();
+        assert_eq!(predates, vec![true, false, false]);
+    }
+
+    #[test]
     fn last_page_and_hex_edge_cases() {
         let page: AssetTransfersPage = serde_json::from_str(r#"{"transfers": []}"#).unwrap();
         assert!(page.page_key.is_none());
@@ -767,7 +817,7 @@ mod tests {
         )
         .unwrap();
         // A zero transfer settles nothing.
-        assert!(native_eth_transfers(page.transfers, ADDRESS, 0x10).is_empty());
+        assert!(native_eth_transfers(page.transfers, ADDRESS, 0x10, 1_800_000_000).is_empty());
         // One readable and one unreadable transfer in the same transaction:
         // a partial sum would be stored and never corrected (the deposit
         // upsert keeps its amount), so the whole transaction is skipped
@@ -783,7 +833,7 @@ mod tests {
             ]}"#,
         )
         .unwrap();
-        let detected = native_eth_transfers(page.transfers, ADDRESS, 0x11);
+        let detected = native_eth_transfers(page.transfers, ADDRESS, 0x11, 1_800_000_000);
         assert_eq!(detected.len(), 1);
         assert_eq!(detected[0].tx_hash, "0xcd");
         // Same rule for a transfer whose block is unreadable.
@@ -796,7 +846,7 @@ mod tests {
             ]}"#,
         )
         .unwrap();
-        assert!(native_eth_transfers(page.transfers, ADDRESS, 0x11).is_empty());
+        assert!(native_eth_transfers(page.transfers, ADDRESS, 0x11, 1_800_000_000).is_empty());
         // Wei beyond u64.
         assert_eq!(parse_hex_u128("0x3635c9adc5dea00000").unwrap(), 1_000 * 10u128.pow(18));
         assert_eq!(parse_hex_u128("0x").unwrap(), 0);

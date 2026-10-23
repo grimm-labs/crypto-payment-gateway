@@ -55,6 +55,23 @@ pub struct DetectedOnChainTransfer {
     pub tx_hash: String,
     pub amount_raw: String,
     pub confirmations: i32,
+    /// Unix seconds of the transfer's block — Esplora `status.block_time`,
+    /// TronGrid `block_timestamp`, Solana `blockTime`, Ethereum the log's
+    /// `blockTimestamp` or else an upper bound from its height
+    /// (`eth_block_time_upper_bound`); `None` while unconfirmed (mempool).
+    /// A transfer older than its payment is not a deposit of it
+    /// (`domain::predates_payment`).
+    pub block_time: Option<i64>,
+}
+
+/// The latest a block `blocks_behind` the tip can have been mined: `now`
+/// minus one 12-second slot per block. Post-merge slots are 12 s and missed
+/// slots only make a block older than this, so the bound never makes a
+/// recent transfer look old (an old one close to the payment's creation
+/// can look recent). Used when Ethereum gives no block timestamp.
+pub fn eth_block_time_upper_bound(now: i64, blocks_behind: u64) -> i64 {
+    let elapsed = blocks_behind.saturating_mul(ETH_BLOCK_TIME_SECS);
+    now.saturating_sub(i64::try_from(elapsed).unwrap_or(i64::MAX))
 }
 
 #[derive(Clone)]
@@ -304,6 +321,7 @@ impl ChainClients {
                 tx_hash: candidate.tx_id,
                 amount_raw: candidate.amount_raw,
                 confirmations: confirmations_between(current_block, tx_block),
+                block_time: candidate.block_time,
             });
         }
         Ok(out)
@@ -335,7 +353,13 @@ impl ChainClients {
         )
         .await?;
 
-        eth_usdt_transfers(logs, &self.config.chain.usdt_eth, &recipient_topic, current_block)
+        eth_usdt_transfers(
+            logs,
+            &self.config.chain.usdt_eth,
+            &recipient_topic,
+            current_block,
+            chrono::Utc::now().timestamp(),
+        )
     }
 
     /// USDT transfers to the token account `address` (a deposit's
@@ -362,7 +386,7 @@ impl ChainClients {
         .await?;
 
         let mut out = Vec::new();
-        for signature in finalized_successful_signatures(signatures) {
+        for (signature, block_time) in finalized_successful_signatures(signatures) {
             let Some(parsed) = self.fetch_helius_parsed(api_key, &signature).await? else {
                 continue;
             };
@@ -370,7 +394,7 @@ impl ChainClients {
                 warn!("Helius answered for another transaction than {signature} — skipped");
                 continue;
             }
-            out.extend(helius_usdt_transfers(parsed, &self.config.chain.usdt_solana_mint, address));
+            out.extend(helius_usdt_transfers(parsed, &self.config.chain.usdt_solana_mint, address, block_time));
         }
         Ok(out)
     }
@@ -674,11 +698,14 @@ async fn json_rpc<T: DeserializeOwned>(
 /// USDT `Transfer` logs paying `recipient_topic`. Everything `eth_getLogs`
 /// was asked to filter on is checked again — contract, event, recipient —
 /// rather than trusted from the provider.
+/// `now`: unix seconds, for the block-time bound of a log without
+/// `blockTimestamp`.
 fn eth_usdt_transfers(
     logs: Vec<EthLog>,
     usdt_contract: &str,
     recipient_topic: &str,
     current_block: u64,
+    now: i64,
 ) -> Result<Vec<DetectedOnChainTransfer>> {
     let mut out = Vec::new();
     for log in logs {
@@ -706,18 +733,26 @@ fn eth_usdt_transfers(
         let block_number = parse_hex_u64(&block_hex)
             .context("eth_getLogs returned an invalid blockNumber")?;
         let value = parse_hex_u128(&data).context("eth_getLogs returned an invalid value")?;
+        let block_time = log
+            .block_timestamp
+            .as_deref()
+            .and_then(|ts| parse_hex_u64(ts).ok())
+            .and_then(|ts| i64::try_from(ts).ok())
+            .unwrap_or_else(|| eth_block_time_upper_bound(now, current_block.saturating_sub(block_number)));
         out.push(DetectedOnChainTransfer {
             tx_hash,
             amount_raw: value.to_string(),
             confirmations: confirmations_between(current_block, block_number),
+            block_time: Some(block_time),
         });
     }
     Ok(out)
 }
 
 /// Signatures of the finalized, successful transactions (`err` null) —
-/// a failed transaction moves no token even if it carries a transfer.
-fn finalized_successful_signatures(infos: Vec<SolanaSignatureInfo>) -> Vec<String> {
+/// a failed transaction moves no token even if it carries a transfer —
+/// with their `blockTime`.
+fn finalized_successful_signatures(infos: Vec<SolanaSignatureInfo>) -> Vec<(String, Option<i64>)> {
     infos
         .into_iter()
         .filter(|info| {
@@ -727,17 +762,19 @@ fn finalized_successful_signatures(infos: Vec<SolanaSignatureInfo>) -> Vec<Strin
                     .as_deref()
                     .is_none_or(|status| status == "finalized")
         })
-        .filter_map(|info| info.signature)
+        .filter_map(|info| info.signature.map(|signature| (signature, info.block_time)))
         .collect()
 }
 
 /// USDT transfers to the token account `address` in a Helius-parsed
 /// transaction; none when the transaction failed. Solana needs one finalized confirmation
 /// (`domain::required_confirmations`), which `commitment: finalized` gives.
+/// `block_time`: the signature's `blockTime`, else Helius's `timestamp`.
 fn helius_usdt_transfers(
     parsed: HeliusTransaction,
     usdt_mint: &str,
     address: &str,
+    block_time: Option<i64>,
 ) -> Vec<DetectedOnChainTransfer> {
     if parsed.transaction_error.is_some() {
         return vec![];
@@ -765,6 +802,7 @@ fn helius_usdt_transfers(
             tx_hash: parsed.signature.clone(),
             amount_raw,
             confirmations: 1,
+            block_time: block_time.or(parsed.timestamp),
         });
     }
     out
@@ -862,6 +900,9 @@ struct EthLog {
     transaction_hash: Option<String>,
     #[serde(rename = "blockNumber")]
     block_number: Option<String>,
+    /// Hex unix seconds, returned by recent nodes; absent otherwise.
+    #[serde(rename = "blockTimestamp")]
+    block_timestamp: Option<String>,
     /// `true` when the log was dropped by a reorg.
     removed: Option<bool>,
 }
@@ -884,6 +925,9 @@ struct SolanaSignatureInfo {
     err: Option<serde_json::Value>,
     #[serde(rename = "confirmationStatus")]
     confirmation_status: Option<String>,
+    /// Unix seconds of the block (`null` when the node does not know it).
+    #[serde(rename = "blockTime")]
+    block_time: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -894,6 +938,8 @@ struct HeliusTransaction {
     transaction_error: Option<serde_json::Value>,
     #[serde(rename = "tokenTransfers")]
     token_transfers: Option<Vec<HeliusTokenTransfer>>,
+    /// Unix seconds of the block.
+    timestamp: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -986,7 +1032,7 @@ mod tests {
             eth_log(&USDT_ETH.to_lowercase(), &[TRANSFER_TOPIC, from, &to.to_uppercase().replace("0X", "0x")], false),
         );
         let logs: Vec<EthLog> = serde_json::from_str(&logs).unwrap();
-        let transfers = eth_usdt_transfers(logs, USDT_ETH, &to, 0x14a3c2f + 11).unwrap();
+        let transfers = eth_usdt_transfers(logs, USDT_ETH, &to, 0x14a3c2f + 11, 1_800_000_000).unwrap();
         assert_eq!(transfers.len(), 1);
         assert_eq!(transfers[0].amount_raw, "25000000");
         assert_eq!(transfers[0].confirmations, 12);
@@ -1002,7 +1048,38 @@ mod tests {
             r#"[{ "data": "0x01", "blockNumber": "0x1", "transactionHash": "0xab", "topics": null }]"#,
         )
         .unwrap();
-        assert!(eth_usdt_transfers(logs, USDT_ETH, &recipient_topic(), 10).unwrap().is_empty());
+        assert!(eth_usdt_transfers(logs, USDT_ETH, &recipient_topic(), 10, 1_800_000_000).unwrap().is_empty());
+    }
+
+    #[test]
+    fn eth_usdt_logs_mined_before_the_payment_are_not_its_deposits() {
+        let from = "0x000000000000000000000000a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4";
+        let to = recipient_topic();
+        let now = 1_800_000_000;
+        let created = now - 3_600;
+        let log = eth_log(USDT_ETH, &[TRANSFER_TOPIC, from, &to], false);
+        let block = 0x14a3c2f;
+        let at = |tip: u64, log: &str| {
+            let logs: Vec<EthLog> = serde_json::from_str(&format!("[{log}]")).unwrap();
+            eth_usdt_transfers(logs, USDT_ETH, &to, tip, now).unwrap()[0].block_time
+        };
+        // No `blockTimestamp`: an upper bound of 12 s per block behind the tip.
+        // 7 200 blocks (24 h) behind: older than the payment.
+        assert_eq!(at(block + 7_200, &log), Some(now - 86_400));
+        assert!(domain::predates_payment(at(block + 7_200, &log), created));
+        // 50 blocks (10 min) behind: after the creation, counted.
+        assert!(!domain::predates_payment(at(block + 50, &log), created));
+        // Just inside / outside the margin (12 s steps).
+        assert!(!domain::predates_payment(at(block + 350, &log), created)); // created − 600 s
+        assert!(domain::predates_payment(at(block + 351, &log), created));
+        // `blockTimestamp` when the node sends it wins over the bound.
+        let stamped = log.replacen(r#""removed""#, &format!(r#""blockTimestamp": "0x{:x}", "removed""#, created - 86_400), 1);
+        assert_eq!(at(block + 1, &stamped), Some(created - 86_400));
+        assert!(domain::predates_payment(at(block + 1, &stamped), created));
+        // A log at the tip (or past it) is `now`: never older.
+        assert_eq!(at(block, &log), Some(now));
+        // Absurd distances saturate, never panic.
+        assert_eq!(eth_block_time_upper_bound(now, u64::MAX), now - i64::MAX);
     }
 
     #[test]
@@ -1056,7 +1133,10 @@ mod tests {
         let resp: RpcResponse<Vec<SolanaSignatureInfo>> = serde_json::from_str(SIGNATURES).unwrap();
         assert_eq!(
             finalized_successful_signatures(resp.result.unwrap()),
-            vec!["5h6xBEauJ3PK6SWCZ1PGjBvj8vDdWG3KpwATGy1ARAXFSDwt8GFXM7W5Ncn16wmqokgpiKRLuS83KUxyZyv2sUYv"]
+            vec![(
+                "5h6xBEauJ3PK6SWCZ1PGjBvj8vDdWG3KpwATGy1ARAXFSDwt8GFXM7W5Ncn16wmqokgpiKRLuS83KUxyZyv2sUYv".to_string(),
+                Some(1_702_345_325)
+            )]
         );
     }
 
@@ -1107,17 +1187,39 @@ mod tests {
             token_transfer(usdc, ATA, "100"),
             token_transfer(USDT_SOLANA, "3Gf3hU7pTkTGo8vCgx6ruqBJ3DqDWSWCDWJ9eG5Uf9yB", "7"),
         );
-        let detected = helius_usdt_transfers(helius("null", &transfers), USDT_SOLANA, ATA);
+        let detected = helius_usdt_transfers(helius("null", &transfers), USDT_SOLANA, ATA, Some(1_702_345_325));
         assert_eq!(detected.len(), 1);
         assert_eq!(detected[0].amount_raw, "25500000");
         assert_eq!(detected[0].confirmations, 1);
     }
 
     #[test]
+    fn solana_transfers_mined_before_the_payment_are_not_its_deposits() {
+        let transfers = format!("[{}]", token_transfer(USDT_SOLANA, ATA, "25"));
+        let block_time = |signature_time: Option<i64>| {
+            helius_usdt_transfers(helius("null", &transfers), USDT_SOLANA, ATA, signature_time)[0].block_time
+        };
+        // The signature's `blockTime` (here 2023-12-12), else Helius's
+        // `timestamp` — the same block.
+        assert_eq!(block_time(Some(1_702_345_325)), Some(1_702_345_325));
+        assert_eq!(block_time(None), Some(1_702_345_325));
+        let mined = block_time(None);
+        // A payment created a day later: old funds, not a deposit.
+        assert!(domain::predates_payment(mined, 1_702_345_325 + 86_400));
+        // A payment created before the block, or within the margin: counted.
+        assert!(!domain::predates_payment(mined, 1_702_345_325 - 60));
+        assert!(!domain::predates_payment(mined, 1_702_345_325 + domain::TRANSFER_BEFORE_PAYMENT_MARGIN_SECS));
+        assert!(domain::predates_payment(mined, 1_702_345_325 + domain::TRANSFER_BEFORE_PAYMENT_MARGIN_SECS + 1));
+        // Solana lists finalized transactions only (no mempool); without
+        // any time it is never judged older.
+        assert!(!domain::predates_payment(None, 1_702_345_325 + 86_400));
+    }
+
+    #[test]
     fn failed_helius_transactions_credit_nothing() {
         let transfers = format!("[{}]", token_transfer(USDT_SOLANA, ATA, "25"));
         let failed = helius(r#"{ "InstructionError": [0, { "Custom": 1 }] }"#, &transfers);
-        assert!(helius_usdt_transfers(failed, USDT_SOLANA, ATA).is_empty());
+        assert!(helius_usdt_transfers(failed, USDT_SOLANA, ATA, None).is_empty());
     }
 
     #[test]

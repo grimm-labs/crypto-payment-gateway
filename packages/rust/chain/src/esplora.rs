@@ -26,6 +26,8 @@ struct EsploraVout {
 struct EsploraTxStatus {
     confirmed: bool,
     block_height: Option<u64>,
+    /// Unix seconds of the block (confirmed transactions only).
+    block_time: Option<i64>,
 }
 
 /// `GET /address/{address}`.
@@ -68,6 +70,7 @@ pub(crate) fn esplora_transfers(
                 tx_hash: tx.txid,
                 amount_raw: amount.to_string(),
                 confirmations,
+                block_time: tx.status.confirmed.then_some(tx.status.block_time).flatten(),
             })
         })
         .collect()
@@ -154,6 +157,35 @@ mod tests {
             ]"#
         ));
         assert!(esplora_transfers(txs, ADDRESS, 12).is_empty());
+    }
+
+    #[test]
+    fn bitcoin_transfers_mined_before_the_payment_are_not_its_deposits() {
+        let created = 1_800_000_000;
+        let txs = txs(&format!(
+            r#"[
+                {{ "txid": "old", "vout": [{{ "scriptpubkey_address": "{ADDRESS}", "value": 3517100 }}],
+                   "status": {{ "confirmed": true, "block_height": 100, "block_time": {} }} }},
+                {{ "txid": "margin", "vout": [{{ "scriptpubkey_address": "{ADDRESS}", "value": 1 }}],
+                   "status": {{ "confirmed": true, "block_height": 101, "block_time": {} }} }},
+                {{ "txid": "new", "vout": [{{ "scriptpubkey_address": "{ADDRESS}", "value": 10450 }}],
+                   "status": {{ "confirmed": true, "block_height": 102, "block_time": {} }} }},
+                {{ "txid": "mempool", "vout": [{{ "scriptpubkey_address": "{ADDRESS}", "value": 10450 }}],
+                   "status": {{ "confirmed": false }} }}
+            ]"#,
+            created - 86_400,
+            created - domain::TRANSFER_BEFORE_PAYMENT_MARGIN_SECS,
+            created + 300,
+        ));
+        let transfers = esplora_transfers(txs, ADDRESS, 103);
+        let predates: Vec<(&str, bool)> = transfers
+            .iter()
+            .map(|t| (t.tx_hash.as_str(), domain::predates_payment(t.block_time, created)))
+            .collect();
+        // Older than creation: ignored; within the margin, after, mempool:
+        // counted.
+        assert_eq!(predates, vec![("old", true), ("margin", false), ("new", false), ("mempool", false)]);
+        assert_eq!(transfers[3].block_time, None);
     }
 
     #[test]

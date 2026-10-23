@@ -107,7 +107,10 @@ impl AppState {
 }
 
 /// Record a transfer seen on a watched address (ADR 0005). Every non-zero
-/// transfer is a deposit, `DETECTED` then `CONFIRMED`, whatever its amount:
+/// transfer is a deposit, `DETECTED` then `CONFIRMED`, whatever its amount
+/// — but one included in a block older than the payment (beyond the
+/// clock-skew margin, `domain::predates_payment`) is not: never recorded,
+/// counted or announced:
 /// the payment is the confirmed total of its address, paid from
 /// `100 − AMOUNT_TOLERANCE_PERCENT` % of the expected amount. `paid` fans
 /// out once, when this call set the address PAID; `late` when it confirmed
@@ -138,6 +141,18 @@ pub async fn process_detected_transfer(state: &AppState, transfer: DetectedTrans
         // Fast path of the rule the recording transaction applies again
         // under the address lock.
         None => {
+            // Funds the address held before the payment existed (a reused
+            // index, a restored derivation counter): never its deposits.
+            if domain::predates_payment(transfer.block_time, address.created_at.timestamp()) {
+                debug!(
+                    "Transfer {} to address {} is older than the payment (block at {:?}, created at {}) — not a deposit",
+                    transfer.tx_hash,
+                    address.id,
+                    transfer.block_time,
+                    address.created_at.timestamp()
+                );
+                return Ok(());
+            }
             let watch_open = address.watch_until > chrono::Utc::now();
             if domain::admit_transfer(network, status, watch_open) == domain::TransferAdmission::Ignore {
                 debug!(
@@ -252,6 +267,8 @@ pub fn lightning_transfer(
         tx_hash: payment.payment_id.clone(),
         amount_raw: payment.amount_sats.to_string(),
         confirmations: 1,
+        // A fixed-amount invoice issued for this payment: never older.
+        block_time: None,
     })
 }
 
@@ -1452,6 +1469,7 @@ async fn poll_network(state: &AppState, network: Network) -> Result<()> {
                             tx_hash: t.tx_hash,
                             amount_raw: t.amount_raw,
                             confirmations: t.confirmations,
+                            block_time: t.block_time,
                         },
                     )
                     .await

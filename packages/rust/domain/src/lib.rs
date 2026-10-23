@@ -724,6 +724,10 @@ pub struct DetectedTransfer {
     pub tx_hash: String,
     pub amount_raw: String,
     pub confirmations: i32,
+    /// Unix seconds of the transfer's block (an upper bound when the
+    /// provider gives no timestamp); `None` while it is unconfirmed
+    /// (mempool) and for Lightning (a fixed-amount invoice).
+    pub block_time: Option<i64>,
 }
 
 #[derive(Debug, Error)]
@@ -893,6 +897,21 @@ pub fn is_amount_paid(received_raw: u128, expected_raw: u128, tolerance_percent:
         // A total too large to scale is above any representable floor.
         None => true,
     }
+}
+
+/// The clock skew tolerated between the gateway and the chains: a transfer
+/// whose block is older than its payment's creation by more than this was
+/// on the address before the payment existed.
+pub const TRANSFER_BEFORE_PAYMENT_MARGIN_SECS: i64 = 10 * 60;
+
+/// Whether a transfer predates its payment (ADR 0005): included in a block
+/// more than `TRANSFER_BEFORE_PAYMENT_MARGIN_SECS` older than the payment's
+/// creation (`created_at`, unix seconds). Such a transfer is never a deposit
+/// of that payment — an address can hold older funds (a restored derivation
+/// counter, a seed reused by another instance; Bitcoin is never swept). An
+/// unconfirmed transfer (no block yet) never predates it.
+pub fn predates_payment(block_time: Option<i64>, created_at: i64) -> bool {
+    block_time.is_some_and(|block_time| block_time < created_at.saturating_sub(TRANSFER_BEFORE_PAYMENT_MARGIN_SECS))
 }
 
 /// How a transfer the gateway has not recorded yet is handled (ADR 0005).
@@ -1073,6 +1092,21 @@ mod tests {
         let expected = 8_570_000;
         assert!(!is_amount_paid(5_000_000, expected, 1.0));
         assert!(is_amount_paid(5_000_000 + 3_570_000, expected, 1.0));
+    }
+
+    #[test]
+    fn transfers_older_than_the_payment_are_not_its_deposits() {
+        let created = 1_800_000_000;
+        // Mined a day before the payment: old funds on the address.
+        assert!(predates_payment(Some(created - 86_400), created));
+        // After the creation, or within the clock-skew margin: counted.
+        assert!(!predates_payment(Some(created + 5), created));
+        assert!(!predates_payment(Some(created), created));
+        assert!(!predates_payment(Some(created - TRANSFER_BEFORE_PAYMENT_MARGIN_SECS), created));
+        assert!(predates_payment(Some(created - TRANSFER_BEFORE_PAYMENT_MARGIN_SECS - 1), created));
+        // Unconfirmed (mempool), Lightning: no block, counted.
+        assert!(!predates_payment(None, created));
+        assert_eq!(TRANSFER_BEFORE_PAYMENT_MARGIN_SECS, 600);
     }
 
     #[test]
