@@ -57,6 +57,8 @@ impl SweepRow {
 pub struct SweepCandidate {
     #[sqlx(rename = "depositAddressId")]
     pub deposit_address_id: String,
+    /// The account holding the tokens: the Solana token account when the
+    /// row has one (spec §4.4), the address otherwise.
     pub address: String,
     #[sqlx(rename = "derivationIndex")]
     pub derivation_index: i32,
@@ -279,7 +281,7 @@ impl Db {
     pub async fn sweep_candidates(&self, network: Network) -> Result<Vec<SweepCandidate>> {
         let rows = sqlx::query_as::<_, SweepCandidate>(&format!(
             r#"
-            SELECT a.id AS "depositAddressId", a.address, a."derivationIndex", a.token::text AS token
+            SELECT a.id AS "depositAddressId", COALESCE(a."tokenAccount", a.address) AS address, a."derivationIndex", a.token::text AS token
             FROM deposit_addresses a
             WHERE a.network = $1::"Network"
               AND {FINAL_ADDRESS}
@@ -309,7 +311,7 @@ impl Db {
     pub async fn final_deposit_addresses(&self, network: Network) -> Result<Vec<SweepCandidate>> {
         let rows = sqlx::query_as::<_, SweepCandidate>(&format!(
             r#"
-            SELECT a.id AS "depositAddressId", a.address, a."derivationIndex", a.token::text AS token
+            SELECT a.id AS "depositAddressId", COALESCE(a."tokenAccount", a.address) AS address, a."derivationIndex", a.token::text AS token
             FROM deposit_addresses a
             WHERE a.network = $1::"Network" AND {FINAL_ADDRESS}
               AND NOT EXISTS (

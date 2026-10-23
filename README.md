@@ -240,6 +240,14 @@ curl -X POST http://localhost:3000/api/v1/deposit-addresses \
   -d '{ "network": "lightning", "token": "BTC", "expected_amount_sats": "150000", "description": "order #123" }'
 ```
 
+**Solana: a wallet address.** On `solana` the `address` returned is the payment's own
+**wallet address** (the owner key `m/44'/501'/{index}'/0'`), which every wallet and exchange
+can pay: the payer's wallet creates the USDT token account as it sends (about 0.002 SOL of
+rent, paid by the payer). `token_account` is that associated token account — what the gateway
+watches and sweeps (the sweep closes it and its rent goes to the treasury). Payments created
+before this change keep their token account as `address` and a `null` `token_account`; they
+are watched and swept on their `address` as before.
+
 Creation returns `503 "<network> is not configured"` when the network is disabled (missing
 provider key, Breez SDK not connected…) and a generic `500` when the Lightning SDK fails
 (details are only logged). The invoice expiry equals the payment's `expires_at`. Every
@@ -1005,8 +1013,9 @@ bytes, never a second payment.
 confirmed funds of paid or expired payments move to the treasury once above the per-(network,
 token) minimum (ETH 0.01 · USDT-ERC20 50 · USDT-TRC20 20 · USDT-SPL 1 by default). A USDT
 deposit address on Ethereum or Tron first receives an exact **gas top-up** from the treasury;
-on Solana the treasury pays the fee and the emptied token account is closed (its rent comes
-back; the first sweep creates the treasury's own USDT token account). Bitcoin is never swept. Late deposits are deposits: swept and credited like any other. Funds
+on Solana the treasury pays the fee and the emptied token account (`token_account`, or the
+address of a payment from before Solana wallet addresses) is closed (its rent comes back; the
+first sweep creates the treasury's own USDT token account). Bitcoin is never swept. Late deposits are deposits: swept and credited like any other. Funds
 the gateway never recorded (a transfer after the late watch, another token) are swept too and
 reported as *unattributed*.
 

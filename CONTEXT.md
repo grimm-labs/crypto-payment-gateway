@@ -7,7 +7,7 @@ A custodial gateway that receives crypto payments for one merchant's projects on
 ### Receiving
 
 **Deposit address**:
-A one-off payment request: a fresh address (or a Lightning invoice) issued for one expected amount of one asset, which expires if unpaid.
+A one-off payment request: a fresh address (or a Lightning invoice) issued for one expected amount of one asset, which expires if unpaid. On Solana it is a wallet address, whose token account receives the tokens.
 _Avoid_: Payment address, invoice (except for Lightning)
 
 **Deposit**:

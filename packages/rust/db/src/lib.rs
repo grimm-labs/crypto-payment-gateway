@@ -73,7 +73,7 @@ pub struct Db {
 // TIMESTAMP(3) column into DateTime<Utc>, so every query that materializes a
 // row must cast enums to text and timestamps to timestamptz (stored values
 // are UTC instants) instead of using SELECT * / RETURNING *.
-const DEPOSIT_ADDRESS_COLUMNS: &str = r#"id, network::text AS network, token::text AS token, address, "derivationIndex", "expectedAmount", status::text AS status, "expiresAt" AT TIME ZONE 'UTC' AS "expiresAt", metadata, "apiKeyId", "projectId", "btcReceivedRaw"::text AS "btcReceivedRaw", "watchUntil" AT TIME ZONE 'UTC' AS "watchUntil", "createdAt" AT TIME ZONE 'UTC' AS "createdAt", "updatedAt" AT TIME ZONE 'UTC' AS "updatedAt""#;
+const DEPOSIT_ADDRESS_COLUMNS: &str = r#"id, network::text AS network, token::text AS token, address, "derivationIndex", "expectedAmount", status::text AS status, "expiresAt" AT TIME ZONE 'UTC' AS "expiresAt", metadata, "apiKeyId", "projectId", "btcReceivedRaw"::text AS "btcReceivedRaw", "watchUntil" AT TIME ZONE 'UTC' AS "watchUntil", "tokenAccount", "createdAt" AT TIME ZONE 'UTC' AS "createdAt", "updatedAt" AT TIME ZONE 'UTC' AS "updatedAt""#;
 const DEPOSIT_COLUMNS: &str = r#"id, "depositAddressId", "txHash", amount, "amountRaw", confirmations, status::text AS status, late, "detectedAt" AT TIME ZONE 'UTC' AS "detectedAt", "confirmedAt" AT TIME ZONE 'UTC' AS "confirmedAt""#;
 /// The confirmed total of the deposits selected, in base units (text).
 const CONFIRMED_TOTAL: &str = r#"COALESCE(SUM("amountRaw"::numeric), 0)::text"#;
@@ -108,10 +108,24 @@ pub struct DepositAddressRow {
     /// polled until then.
     #[sqlx(rename = "watchUntil")]
     pub watch_until: DateTime<Utc>,
+    /// Solana: the USDT token account of the owner in `address` (spec
+    /// §4.4). NULL elsewhere, and on Solana rows from before, whose
+    /// `address` is the token account itself.
+    #[sqlx(rename = "tokenAccount")]
+    pub token_account: Option<String>,
     #[sqlx(rename = "createdAt")]
     pub created_at: DateTime<Utc>,
     #[sqlx(rename = "updatedAt")]
     pub updated_at: DateTime<Utc>,
+}
+
+impl DepositAddressRow {
+    /// The account the tokens arrive on, which detection and sweeps read:
+    /// the token account when the row has one (Solana), the address
+    /// otherwise (every other network, and Solana rows from before).
+    pub fn watched_account(&self) -> &str {
+        self.token_account.as_deref().unwrap_or(&self.address)
+    }
 }
 
 #[derive(FromRow)]
@@ -176,6 +190,8 @@ pub struct NewDepositAddress<'a> {
     pub network: Network,
     pub token: Token,
     pub address: &'a str,
+    /// Solana: the USDT token account of `address` (the owner).
+    pub token_account: Option<&'a str>,
     pub derivation_index: i32,
     pub expected_amount: Decimal,
     pub expires_at: DateTime<Utc>,
@@ -436,9 +452,9 @@ impl Db {
         let row = sqlx::query_as::<_, DepositAddressRow>(&format!(
             r#"
             INSERT INTO deposit_addresses
-              (id, network, token, address, "derivationIndex", "expectedAmount", status, "expiresAt", metadata, "createdAt", "updatedAt", "apiKeyId", "projectId", "watchUntil", "idempotencyKey", "paramsHash")
+              (id, network, token, address, "derivationIndex", "expectedAmount", status, "expiresAt", metadata, "createdAt", "updatedAt", "apiKeyId", "projectId", "watchUntil", "idempotencyKey", "paramsHash", "tokenAccount")
             VALUES
-              ($1, $2::"Network", $3::"Token", $4, $5, $6, 'PENDING'::"DepositAddressStatus", $7, $8, $9, $9, $10, $11, $12, $13, $14)
+              ($1, $2::"Network", $3::"Token", $4, $5, $6, 'PENDING'::"DepositAddressStatus", $7, $8, $9, $9, $10, $11, $12, $13, $14, $15)
             RETURNING {DEPOSIT_ADDRESS_COLUMNS}
             "#
         ))
@@ -456,6 +472,7 @@ impl Db {
         .bind(new.watch_until)
         .bind(idempotency_key)
         .bind(params_hash)
+        .bind(new.token_account)
         .fetch_one(&mut *tx)
         .await?;
         // `pending` is written with the address (spec §4.5).
@@ -735,10 +752,11 @@ impl Db {
     }
 
     /// Every address issued on `network` (whatever token it was issued
-    /// for — an address can hold any token of its network).
+    /// for — an address can hold any token of its network), as the account
+    /// holding its tokens: the token account of a Solana row that has one.
     pub async fn addresses_for_network(&self, network: Network) -> Result<Vec<String>> {
         let rows: Vec<(String,)> = sqlx::query_as(
-            r#"SELECT DISTINCT address FROM deposit_addresses WHERE network = $1::"Network""#,
+            r#"SELECT DISTINCT COALESCE("tokenAccount", address) FROM deposit_addresses WHERE network = $1::"Network""#,
         )
         .bind(network.as_db())
         .fetch_all(&self.pool)
@@ -747,11 +765,15 @@ impl Db {
     }
 
     /// Whether `address` is a deposit address the gateway issued on
-    /// `network` (case-insensitive: Ethereum addresses come in two
-    /// casings). Withdrawals never go there (invariant 7).
+    /// `network`, or the token account of one (Solana) — case-insensitive:
+    /// Ethereum addresses come in two casings. Withdrawals never go there
+    /// (invariant 7).
     pub async fn is_deposit_address(&self, network: Network, address: &str) -> Result<bool> {
         let (found,): (bool,) = sqlx::query_as(
-            r#"SELECT EXISTS (SELECT 1 FROM deposit_addresses WHERE network = $1::"Network" AND lower(address) = lower($2))"#,
+            r#"SELECT EXISTS (
+                 SELECT 1 FROM deposit_addresses
+                 WHERE network = $1::"Network" AND (lower(address) = lower($2) OR "tokenAccount" = $2)
+               )"#,
         )
         .bind(network.as_db())
         .bind(address)
@@ -1447,4 +1469,42 @@ fn deposit_subject(event: WebhookEventType) -> Result<()> {
         anyhow::bail!("{} deliveries are not keyed on a deposit", event.as_api());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn row(network: Network, address: &str, token_account: Option<&str>) -> DepositAddressRow {
+        let now = Utc::now();
+        DepositAddressRow {
+            id: "a".into(),
+            network: network.as_db().into(),
+            token: Token::Usdt.as_db().into(),
+            address: address.into(),
+            derivation_index: 0,
+            expected_amount: Decimal::ONE,
+            status: DepositAddressStatus::Pending.as_db().into(),
+            expires_at: now,
+            metadata: Value::Null,
+            api_key_id: None,
+            project_id: None,
+            btc_received_raw: None,
+            watch_until: now,
+            token_account: token_account.map(str::to_string),
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    #[test]
+    fn a_solana_row_is_watched_on_its_token_account_an_old_one_on_its_address() {
+        // New: the owner's wallet address, its USDT token account watched.
+        let new = row(Network::Solana, "HAgk14JpMQLgt6rVgv7cBQFJWFto5Dqxi472uT3DKpqk", Some("6pXYguUixhfdydHDMgsvSy3sAWjStL2eEYh4KeYJAUDk"));
+        assert_eq!(new.watched_account(), "6pXYguUixhfdydHDMgsvSy3sAWjStL2eEYh4KeYJAUDk");
+        // Before: the address is the token account.
+        let old = row(Network::Solana, "6pXYguUixhfdydHDMgsvSy3sAWjStL2eEYh4KeYJAUDk", None);
+        assert_eq!(old.watched_account(), "6pXYguUixhfdydHDMgsvSy3sAWjStL2eEYh4KeYJAUDk");
+        assert_eq!(row(Network::Tron, "TAddr", None).watched_account(), "TAddr");
+    }
 }

@@ -338,6 +338,11 @@ impl ChainClients {
         eth_usdt_transfers(logs, &self.config.chain.usdt_eth, &recipient_topic, current_block)
     }
 
+    /// USDT transfers to the token account `address` (a deposit's
+    /// `tokenAccount`, or the address of a Solana row from before spec §4.4,
+    /// which is its token account): its finalized signatures, matched on
+    /// `toTokenAccount` — a wallet creating the account as it pays is
+    /// listed too.
     pub async fn poll_solana_address(
         &self,
         address: &str,
@@ -726,8 +731,8 @@ fn finalized_successful_signatures(infos: Vec<SolanaSignatureInfo>) -> Vec<Strin
         .collect()
 }
 
-/// USDT transfers to `address` in a Helius-parsed transaction; none when
-/// the transaction failed. Solana needs one finalized confirmation
+/// USDT transfers to the token account `address` in a Helius-parsed
+/// transaction; none when the transaction failed. Solana needs one finalized confirmation
 /// (`domain::required_confirmations`), which `commitment: finalized` gives.
 fn helius_usdt_transfers(
     parsed: HeliusTransaction,

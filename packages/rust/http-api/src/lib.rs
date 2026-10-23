@@ -417,10 +417,21 @@ async fn create_deposit_address(
                 })?;
             invoice.payment_request
         }
+        // Solana (spec §4.4): the owner's wallet address, its USDT token
+        // account watched; elsewhere the derived address.
         _ => state
             .wallet
-            .derive_address(network, derivation_index as u32)
+            .payment_address(network, derivation_index as u32)
             .map_err(|e| ApiError::internal(e.to_string()))?,
+    };
+    let token_account = match network {
+        Network::Solana => Some(
+            state
+                .wallet
+                .derive_address(network, derivation_index as u32)
+                .map_err(|e| ApiError::internal(e.to_string()))?,
+        ),
+        _ => None,
     };
 
     // The late watch (ADR 0005): polled this long past the deadline.
@@ -432,6 +443,7 @@ async fn create_deposit_address(
                 network,
                 token: request.token,
                 address: &address,
+                token_account: token_account.as_deref(),
                 derivation_index,
                 expected_amount: request.expected_amount,
                 expires_at,
@@ -1014,7 +1026,7 @@ fn to_response(
         ),
         expires_at: row.expires_at.to_rfc3339(),
         watch_until: row.watch_until.to_rfc3339(),
-        token_account: None,
+        token_account: row.token_account.clone(),
         created_at: row.created_at.to_rfc3339(),
     })
 }
@@ -1483,6 +1495,7 @@ mod tests {
             project_id: None,
             btc_received_raw: None,
             watch_until: now,
+            token_account: None,
             created_at: now,
             updated_at: now,
         };
@@ -1576,6 +1589,7 @@ mod tests {
             project_id: Some("p1".into()),
             btc_received_raw: None,
             watch_until: now + Duration::hours(24),
+            token_account: None,
             created_at: now,
             updated_at: now,
         };
@@ -1600,5 +1614,15 @@ mod tests {
         let btc = serde_json::to_value(to_response(&btc, 10_504, &config).unwrap()).unwrap();
         assert_eq!(btc["received_amount"], "0.00010504");
         assert_eq!(btc["required_confirmations"], 3);
+
+        // Solana (spec §4.4): the owner's address, the watched token account.
+        let mut solana = row.clone();
+        solana.network = Network::Solana.as_db().into();
+        solana.address = "HAgk14JpMQLgt6rVgv7cBQFJWFto5Dqxi472uT3DKpqk".into();
+        solana.token_account = Some("6pXYguUixhfdydHDMgsvSy3sAWjStL2eEYh4KeYJAUDk".into());
+        let solana = serde_json::to_value(to_response(&solana, 0, &config).unwrap()).unwrap();
+        assert_eq!(solana["address"], "HAgk14JpMQLgt6rVgv7cBQFJWFto5Dqxi472uT3DKpqk");
+        assert_eq!(solana["token_account"], "6pXYguUixhfdydHDMgsvSy3sAWjStL2eEYh4KeYJAUDk");
+        assert_eq!(solana["required_confirmations"], 1);
     }
 }

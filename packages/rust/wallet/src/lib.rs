@@ -82,8 +82,25 @@ impl WalletService {
         Ok(wallet)
     }
 
+    /// The account a deposit key's tokens sit on: the address itself,
+    /// except on Solana where it is the owner's USDT associated token
+    /// account (what Solana deposit rows from before spec §4.4 store as
+    /// their address).
     pub fn derive_address(&self, network: Network, index: u32) -> Result<String, WalletError> {
         self.address(KeyRef::Deposit { network, index })
+    }
+
+    /// The address a payer is shown for deposit key `index` (spec §4.4):
+    /// on Solana the owner's wallet address (`m/44'/501'/{index}'/0'`) —
+    /// the payer's wallet creates the token account (`derive_address`) as
+    /// it sends —, elsewhere `derive_address`.
+    pub fn payment_address(&self, network: Network, index: u32) -> Result<String, WalletError> {
+        match network {
+            Network::Solana => {
+                Ok(bs58::encode(self.solana_owner(KeyRef::Deposit { network, index })?).into_string())
+            }
+            _ => self.derive_address(network, index),
+        }
     }
 
     /// The treasury address of `network` (ADR 0002) — for Solana, the owner
@@ -437,6 +454,20 @@ mod tests {
             wallet.derive_address(Network::Solana, 1).unwrap(),
             "BZnBhSRppxtYwkMzjn6brVCEVqPgx7zeRhGuJaPmuv2V"
         );
+        // A payer is shown the owner (its wallet creates the token account).
+        assert_eq!(
+            wallet.payment_address(Network::Solana, 0).unwrap(),
+            "HAgk14JpMQLgt6rVgv7cBQFJWFto5Dqxi472uT3DKpqk"
+        );
+        assert_eq!(
+            wallet.payment_address(Network::Solana, 1).unwrap(),
+            "Hh8QwFUA6MtVu1qAoq12ucvFHNwCcVTV7hpWjeY1Hztb"
+        );
+        // Every other network is shown the derived address.
+        for network in [Network::Ethereum, Network::Tron, Network::Bitcoin] {
+            assert_eq!(wallet.payment_address(network, 3).unwrap(), wallet.derive_address(network, 3).unwrap());
+        }
+        assert!(wallet.payment_address(Network::Lightning, 0).is_err());
     }
 
     /// Treasury addresses of the test mnemonic (ADR 0002). Changing any of

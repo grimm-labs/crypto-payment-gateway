@@ -179,7 +179,8 @@ async fn confirmed_deposit_balance(state: &AppState, network: Network, token: To
             }
         }
         (Network::Tron, _) => TronRpc::solidity_trc20_balance(&state.chain, &state.config.chain.usdt_tron, address).await,
-        // The deposit address is the USDT token account itself.
+        // `address` is the deposit's USDT token account (the candidate's
+        // `tokenAccount`, or the address of a row from before spec §4.4).
         (Network::Solana, _) => SolanaRpc::token_balance(&state.chain, address).await,
         (Network::Bitcoin, _) => {
             let tip = chain::btc_tx::EsploraRpc::tip_height(&state.chain).await?;

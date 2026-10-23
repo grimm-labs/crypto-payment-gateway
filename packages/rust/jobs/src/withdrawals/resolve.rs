@@ -214,8 +214,10 @@ pub async fn is_gateway_destination(state: &AppState, network: Network, destinat
         if state.wallet.solana_usdt_token_account(KeyRef::Treasury(Network::Solana))? == destination {
             return Ok(true);
         }
-        // Deposit owners are not stored (the addresses are their token
-        // accounts): derive them.
+        // The owners of Solana rows from before spec §4.4 are not stored
+        // (their address is the token account; newer rows store the owner
+        // as address and the token account in "tokenAccount", both matched
+        // by `is_deposit_address`): derive every owner.
         let max_index = state.db.max_derivation_index(Network::Solana).await?;
         for index in 0..=u32::try_from(max_index.max(0)).unwrap_or(0) {
             let owner = state

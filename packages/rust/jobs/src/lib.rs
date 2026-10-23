@@ -1434,7 +1434,8 @@ async fn poll_network(state: &AppState, network: Network) -> Result<()> {
                 state.chain.poll_ethereum_native(&address.address).await
             }
             Network::Ethereum => state.chain.poll_ethereum_address(&address.address).await,
-            Network::Solana => state.chain.poll_solana_address(&address.address).await,
+            // New rows watch the owner's token account (spec §4.4).
+            Network::Solana => state.chain.poll_solana_address(address.watched_account()).await,
             Network::Bitcoin => state.chain.poll_bitcoin_address(&address.address).await,
             // Reconciled above from the Breez payment list, not per address.
             Network::Lightning => Ok(vec![]),
@@ -2234,6 +2235,7 @@ mod tests {
             project_id: Some("p1".into()),
             btc_received_raw: None,
             watch_until: now,
+            token_account: None,
             created_at: now,
             updated_at: now,
         }
