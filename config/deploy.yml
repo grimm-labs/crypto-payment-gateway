@@ -7,7 +7,9 @@
 # Required: GATEWAY_HOST (the environment's server, SSH target), APP_ENV, API_HOST,
 # DASHBOARD_HOST. A missing one stops kamal with a KeyError naming it.
 # Optional: SSH_USER (default root), TRUSTED_PROXIES, BITCOIN_ESPLORA_BASE_URL,
-# OUTFLOWS_FROZEN, KAMAL_IMAGE, KAMAL_REGISTRY_USERNAME.
+# OUTFLOWS_FROZEN, KAMAL_IMAGE, KAMAL_REGISTRY_USERNAME, and the chain mode of a
+# test instance: CHAIN_MODE (default mainnet) with TESTNET_USDT_ETH_CONTRACT,
+# TESTNET_USDT_TRON_CONTRACT, TESTNET_USDT_SOLANA_MINT (default empty).
 # Requires Kamal >= 2.12 (ssh.forward_agent); CI pins the exact version.
 #
 # One image (docker/Dockerfile target "all") runs as two roles: `api` (the Rust
@@ -103,6 +105,15 @@ servers:
         # "true" forces the outflow freeze at boot (no withdrawal, sweep or gas
         # top-up; the dashboard cannot lift it). Empty = the dashboard decides.
         OUTFLOWS_FROZEN: '<%= ENV.fetch("OUTFLOWS_FROZEN", "") %>'
+        # A test instance (README → Test instance): a non-production
+        # environment whose variables set CHAIN_MODE=testnet and the three
+        # test tokens standing in for USDT. Empty = mainnet, the contracts
+        # unused; APP_ENV=production refuses testnet at boot, and testnet
+        # without a contract fails the boot naming it.
+        CHAIN_MODE: '<%= ENV["CHAIN_MODE"].to_s.empty? ? "mainnet" : ENV["CHAIN_MODE"] %>'
+        TESTNET_USDT_ETH_CONTRACT: '<%= ENV.fetch("TESTNET_USDT_ETH_CONTRACT", "") %>'
+        TESTNET_USDT_TRON_CONTRACT: '<%= ENV.fetch("TESTNET_USDT_TRON_CONTRACT", "") %>'
+        TESTNET_USDT_SOLANA_MINT: '<%= ENV.fetch("TESTNET_USDT_SOLANA_MINT", "") %>'
       secret:
         # The custodial HD seed: every deposit address and the Lightning wallet.
         - WALLET_MNEMONIC

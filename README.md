@@ -809,7 +809,9 @@ Per GitHub environment:
   to `root` to keep deploying as root), `BITCOIN_ESPLORA_BASE_URL`,
   `TRUSTED_PROXIES` (defaults to the private docker ranges kamal-proxy lives in — a custom
   value must also list the server's public IP, which the dashboard's nginx reaches the API
-  through), `OUTFLOWS_FROZEN` (`true` holds the outflow freeze).
+  through), `OUTFLOWS_FROZEN` (`true` holds the outflow freeze); on a [test
+  instance](#test-instance) only, `CHAIN_MODE` (`testnet`; empty = `mainnet`) and
+  `TESTNET_USDT_ETH_CONTRACT`, `TESTNET_USDT_TRON_CONTRACT`, `TESTNET_USDT_SOLANA_MINT`.
 - Secrets: `SSH_PRIVATE_KEY`, `WALLET_MNEMONIC`, `JWT_SECRET`, `POSTGRES_PASSWORD`,
   `REDIS_PASSWORD` (at least 32 letters, digits, `-` or `_`, checked before the deploy — they
   go unencoded into the URLs: `openssl rand -hex 32`); optional provider keys
@@ -949,7 +951,7 @@ To report a vulnerability, use [GitHub Security Advisories](https://github.com/n
 | `BREEZ_STORAGE_DIR` | No | `./.breez-data` | Breez SDK local storage (SQLite), resolved to an absolute path at startup. Must persist across restarts (docker compose mounts the `breez_data` volume) |
 | `OUTFLOWS_FROZEN` | No | `false` | `true` forces the [outflow freeze](#treasury-sweeps--withdrawals-operator-runbook): no withdrawal, sweep or gas top-up leaves the gateway, and the dashboard cannot lift it while set |
 | `LATE_WATCH_HOURS` | No | `24` | Hours a paid or expired payment stays watched past its deadline, for [late deposits](#payments-the-total-of-their-transfers) (0–72; `0` turns the watch off) |
-| `CHAIN_MODE` | No | `mainnet` | `testnet` (development only) moves every network to its test chain — see [Testnet mode](#testnet-mode) |
+| `CHAIN_MODE` | No | `mainnet` | `testnet` (refused with `APP_ENV=production`) moves every network to its test chain — see [Testnet mode](#testnet-mode) |
 | `TESTNET_USDT_ETH_CONTRACT`, `TESTNET_USDT_TRON_CONTRACT`, `TESTNET_USDT_SOLANA_MINT` | With `CHAIN_MODE=testnet` | — | Test tokens standing in for USDT |
 
 \* Required for monitoring on the respective network.
@@ -1076,13 +1078,55 @@ longer be cancelled. Tron transactions are built by TronGrid, then decoded and c
 
 ## Testnet mode
 
-`CHAIN_MODE=testnet` (refused unless `APP_ENV=development`) moves the provider defaults to
+`CHAIN_MODE=testnet` (refused with `APP_ENV=production`) moves the provider defaults to
 Sepolia, Nile and Solana devnet — point `BITCOIN_ESPLORA_BASE_URL` at a testnet4 Esplora
 (`https://mempool.space/testnet4/api`) — checks those chains' identities at boot,
 derives Bitcoin addresses with coin type `1'` (`tb1…`, deposits and treasury alike) and
 connects Lightning to Spark regtest. There is no canonical testnet USDT: set
 `TESTNET_USDT_ETH_CONTRACT`, `TESTNET_USDT_TRON_CONTRACT` and `TESTNET_USDT_SOLANA_MINT` to
-the test tokens you use. Never point a testnet instance at a mainnet database.
+the test tokens you use (blank counts as unset: testnet without them fails the boot naming
+the missing one). Never point a testnet instance at a mainnet database.
+
+Only the chain mode depends on it: outside `APP_ENV=development` a testnet instance keeps
+every rule of production — the public test mnemonics are refused, Postgres and Redis need
+verified TLS (or `ALLOW_INSECURE_TRANSPORT=true` on a private network, as under Kamal),
+providers and webhook endpoints must be public `https://`, cookies are `Secure`, HSTS is sent.
+**Production always runs mainnet**: `APP_ENV=production` refuses `CHAIN_MODE=testnet` at boot.
+
+### Test instance
+
+A test instance is a **non-production environment** (e.g. `test`) whose GitHub variables
+set `CHAIN_MODE=testnet` and the three `TESTNET_USDT_*` contracts; production always runs
+mainnet. It is deployed like any environment (**GitHub Actions → Deploy**, the same
+`config/deploy.yml`, which passes `CHAIN_MODE` — `mainnet` when the variable is empty — and
+the contracts — empty by default — to the api role): an environment becomes a test instance
+only when its own `CHAIN_MODE` variable says `testnet`. Give it its own server and database:
+mainnet and testnet rows must never mix. Merchants point their test environment at it
+(Kivoo's test environment does).
+
+1. **Its own server** (one server per environment: its Postgres and Redis accessories are
+   separate), prepared like production (Docker, the `deploy` user).
+2. **The environment's variables**: `GATEWAY_HOST`, `API_HOST`, `DASHBOARD_HOST`;
+   `CHAIN_MODE=testnet`; `TESTNET_USDT_ETH_CONTRACT` (a Sepolia ERC-20),
+   `TESTNET_USDT_TRON_CONTRACT` (a Nile TRC-20), `TESTNET_USDT_SOLANA_MINT` (a devnet SPL
+   mint) — the test tokens standing in for USDT, 6 decimals; `BITCOIN_ESPLORA_BASE_URL` =
+   `https://mempool.space/testnet4/api`. Its secrets: its own `WALLET_MNEMONIC` (never the
+   production one, never a public test vector — refused), `JWT_SECRET`, `POSTGRES_PASSWORD`,
+   `REDIS_PASSWORD`, and the keys of the test networks: `TRONGRID_API_KEY` (Nile),
+   `ALCHEMY_API_KEY` (an app on Sepolia), `HELIUS_API_KEY` (devnet), `BREEZ_API_KEY` (Spark
+   regtest).
+3. **Deploy**, open `/setup` at once (first admin), create the project, its API key and the
+   webhook endpoint of the test environment.
+4. **Fund it from faucets** — test coins have no value, but the gateway needs them like real
+   ones: Sepolia ETH (an Ethereum Sepolia faucet: Alchemy, Google Cloud Web3) on the Ethereum
+   treasury, Nile TRX (the Nile faucet, `nileex.io`) on the Tron treasury — its first TRX
+   transfer activates it —, devnet SOL (`faucet.solana.com`, or `solana airdrop 2 <address>
+   --url devnet`) on the Solana treasury; the treasury addresses are on Dashboard → Treasury.
+   Get testnet4 bitcoin from a testnet4 faucet, and the test tokens from whoever minted them
+   (or mint your own ERC-20 / TRC-20 / SPL token, 6 decimals, and set its contract). Pay its
+   payments with test wallets (MetaMask on Sepolia, TronLink on Nile, Phantom or Solflare on
+   devnet, any testnet4 wallet); Lightning on Spark regtest only if a regtest wallet can pay
+   it.
 
 ## USDT contracts
 

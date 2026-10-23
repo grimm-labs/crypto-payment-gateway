@@ -162,7 +162,8 @@ pub const ETHEREUM_MAINNET_CHAIN_ID: u64 = 1;
 pub const ETHEREUM_SEPOLIA_CHAIN_ID: u64 = 11_155_111;
 
 /// Which chains the gateway talks to. `Testnet` (Sepolia, Nile, devnet,
-/// testnet4, Spark regtest) is development-only.
+/// testnet4, Spark regtest) is refused with `APP_ENV=production`
+/// (`PRODUCTION_ENV`): production always runs on mainnet.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChainMode {
     Mainnet,
@@ -258,6 +259,10 @@ pub const JWT_SECRET_MIN_LEN: usize = 32;
 /// mnemonic, plain-text Redis/Postgres, `http://` providers and webhooks)
 /// are tolerated.
 pub const DEVELOPMENT_ENV: &str = "development";
+/// The `APP_ENV` under which `CHAIN_MODE=testnet` is refused (spec §4.7):
+/// production always runs on mainnet. Any other environment may be a test
+/// instance, and keeps every rule of production unless it is development.
+pub const PRODUCTION_ENV: &str = "production";
 
 /// Mnemonics published as BIP39 test vectors (and in this repo's
 /// `.env.example`): anyone can derive their keys, so they are refused
@@ -330,8 +335,8 @@ pub struct AppConfig {
     /// Escape hatch for Redis/Postgres without TLS outside development
     /// (`ALLOW_INSECURE_TRANSPORT=true`, warned loudly at boot).
     pub allow_insecure_transport: bool,
-    /// `CHAIN_MODE` (mainnet unless set to testnet in development) and the
-    /// identities/contracts it implies.
+    /// `CHAIN_MODE` (mainnet unless set to testnet outside production) and
+    /// the identities/contracts it implies.
     pub chain: ChainParams,
     /// `OUTFLOWS_FROZEN=true` forces the outflow freeze: the dashboard
     /// setting cannot lift it while set.
@@ -412,7 +417,7 @@ impl AppConfig {
         let wallet_mnemonic = vars.required("WALLET_MNEMONIC")?;
         let database_url = vars.required("DATABASE_URL")?;
         let redis_url = vars.required("REDIS_URL")?;
-        let chain = chain_params(&vars, development)?;
+        let chain = chain_params(&vars, &app_env)?;
         // Testnet mode points the default provider URLs at the test chains.
         let testnet = chain.is_testnet();
         let (trongrid, eth_rpc, helius_rpc, helius_api) = if testnet {
@@ -660,22 +665,27 @@ impl<F: Fn(&str) -> Option<String>> Vars<'_, F> {
 }
 
 /// `CHAIN_MODE` and, in testnet mode, the test-token contracts (required:
-/// there is no canonical testnet USDT). Testnet is development-only — a
-/// production instance must never confirm testnet "payments".
+/// there is no canonical testnet USDT; blank counts as unset). Testnet is
+/// refused with `APP_ENV=production` (whatever its case or surrounding
+/// blanks) — a production instance must never confirm testnet "payments".
+/// Only the chain mode is relaxed: a test instance outside development keeps
+/// every other production rule (`AppConfig::validate` relaxes them in
+/// development only).
 fn chain_params<F: Fn(&str) -> Option<String>>(
     vars: &Vars<'_, F>,
-    development: bool,
+    app_env: &str,
 ) -> Result<ChainParams> {
     let mode: ChainMode = vars.parse_or("CHAIN_MODE", ChainMode::Mainnet)?;
     if mode == ChainMode::Mainnet {
         return Ok(ChainParams::mainnet());
     }
-    if !development {
-        bail!("CHAIN_MODE=testnet is only accepted with APP_ENV={DEVELOPMENT_ENV}");
+    if app_env.trim().eq_ignore_ascii_case(PRODUCTION_ENV) {
+        bail!("CHAIN_MODE=testnet is refused with APP_ENV={PRODUCTION_ENV}: production always runs on mainnet");
     }
     let required = |key: &str| {
-        vars.optional(key)
-            .with_context(|| format!("{key} is required with CHAIN_MODE=testnet"))
+        vars.optional(key).with_context(|| {
+            format!("{key} is required with CHAIN_MODE=testnet (the test token standing in for USDT)")
+        })
     };
     Ok(ChainParams {
         mode,
@@ -1041,10 +1051,14 @@ mod tests {
     }
 
     #[test]
-    fn testnet_mode_is_development_only_and_needs_its_contracts() {
+    fn testnet_mode_works_in_development_and_needs_its_contracts() {
         let mut vars = vec![("CHAIN_MODE", "testnet")];
         let err = config_with(&vars).unwrap_err();
-        assert!(format!("{err:#}").contains("TESTNET_USDT_ETH_CONTRACT"), "{err:#}");
+        assert!(format!("{err:#}").contains("TESTNET_USDT_ETH_CONTRACT is required with CHAIN_MODE=testnet"), "{err:#}");
+        // Blank contracts (an empty deploy variable) are missing ones.
+        let mut blank = vars.clone();
+        blank.extend([("TESTNET_USDT_ETH_CONTRACT", ""), ("TESTNET_USDT_TRON_CONTRACT", " "), ("TESTNET_USDT_SOLANA_MINT", "")]);
+        assert!(format!("{:#}", config_with(&blank).unwrap_err()).contains("TESTNET_USDT_ETH_CONTRACT"));
 
         vars.extend_from_slice(&TESTNET_CONTRACTS);
         let config = config_with(&vars).unwrap();
@@ -1060,13 +1074,71 @@ mod tests {
         vars.push(("TRONGRID_BASE_URL", "https://custom.example"));
         assert_eq!(config_with(&vars).unwrap().trongrid_base_url, "https://custom.example");
 
-        let mut production: Vec<(&str, &str)> = vec![("CHAIN_MODE", "testnet")];
-        production.extend_from_slice(&TESTNET_CONTRACTS);
-        let err = production_with(&production).unwrap_err();
-        assert!(format!("{err:#}").contains("CHAIN_MODE=testnet"), "{err:#}");
-
         let err = config_with(&[("CHAIN_MODE", "devnet")]).unwrap_err();
         assert!(format!("{err:#}").contains("CHAIN_MODE"));
+    }
+
+    /// `production_with` plus `CHAIN_MODE=testnet`, its contracts and `APP_ENV`.
+    fn testnet_with(app_env: &str, extra: &[(&str, &str)]) -> Result<AppConfig> {
+        let mut vars: Vec<(&str, &str)> = vec![("CHAIN_MODE", "testnet"), ("APP_ENV", app_env)];
+        vars.extend_from_slice(&TESTNET_CONTRACTS);
+        vars.extend_from_slice(extra);
+        production_with(&vars)
+    }
+
+    #[test]
+    fn testnet_mode_is_refused_in_production_only() {
+        for env in ["production", "Production", " production "] {
+            let err = testnet_with(env, &[]).unwrap_err();
+            assert!(
+                format!("{err:#}").contains("CHAIN_MODE=testnet is refused with APP_ENV=production"),
+                "{env:?}: {err:#}"
+            );
+        }
+        // Any other environment may be a test instance (development: above).
+        for env in ["test", "staging", "qa"] {
+            let config = testnet_with(env, &[]).unwrap();
+            assert!(config.chain.is_testnet(), "{env}");
+            assert_eq!(config.app_env, env);
+            assert!(!config.is_development());
+            assert_eq!(config.trongrid_base_url, "https://nile.trongrid.io");
+        }
+        // Mainnet runs anywhere, an empty CHAIN_MODE (deploy default) included.
+        for env in ["production", "test", "staging", "development"] {
+            for mode in ["mainnet", ""] {
+                let config = production_with(&[("APP_ENV", env), ("CHAIN_MODE", mode)]).unwrap();
+                assert!(!config.chain.is_testnet(), "{env} {mode:?}");
+            }
+        }
+        // Empty test contracts (deploy defaults) are ignored on mainnet.
+        let config = production_with(&[
+            ("TESTNET_USDT_ETH_CONTRACT", ""),
+            ("TESTNET_USDT_TRON_CONTRACT", ""),
+            ("TESTNET_USDT_SOLANA_MINT", ""),
+        ])
+        .unwrap();
+        assert_eq!(config.chain, ChainParams::mainnet());
+    }
+
+    #[test]
+    fn a_test_instance_keeps_every_production_rule_but_the_chain_mode() {
+        for env in ["test", "staging"] {
+            let err = testnet_with(env, &[]).map(|_| ()).err();
+            assert!(err.is_none(), "{env}: {err:?}");
+            // Contracts still required.
+            let err = production_with(&[("CHAIN_MODE", "testnet"), ("APP_ENV", env)]).unwrap_err();
+            assert!(format!("{err:#}").contains("TESTNET_USDT_ETH_CONTRACT"), "{err:#}");
+            // No public mnemonic, verified TLS, https providers.
+            let public = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+            let err = testnet_with(env, &[("WALLET_MNEMONIC", public)]).unwrap_err();
+            assert!(format!("{err:#}").contains("public BIP39 test vector"), "{err:#}");
+            let err = testnet_with(env, &[("REDIS_URL", "redis://redis.internal:6379")]).unwrap_err();
+            assert!(format!("{err:#}").contains("rediss://"), "{err:#}");
+            let err = testnet_with(env, &[("DATABASE_URL", "postgresql://db/app")]).unwrap_err();
+            assert!(format!("{err:#}").contains("verify-full"), "{err:#}");
+            let err = testnet_with(env, &[("BITCOIN_ESPLORA_BASE_URL", "http://esplora.local/api")]).unwrap_err();
+            assert!(format!("{err:#}").contains("BITCOIN_ESPLORA_BASE_URL"), "{err:#}");
+        }
     }
 
     #[test]

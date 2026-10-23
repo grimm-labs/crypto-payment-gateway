@@ -18,7 +18,12 @@ run-name: Deployment - ${{ fromJSON('{"test":"Test","staging":"Staging","product
 # `deploy`, a user in the docker group; set it to `root` to keep deploying
 # as root), BITCOIN_ESPLORA_BASE_URL
 # (empty disables Bitcoin), TRUSTED_PROXIES, OUTFLOWS_FROZEN ("true" forces the
-# outflow freeze; empty = dashboard-managed).
+# outflow freeze; empty = dashboard-managed). A test instance is a
+# non-production environment (e.g. `test`) whose variables set CHAIN_MODE=testnet
+# and the three test-token contracts TESTNET_USDT_ETH_CONTRACT,
+# TESTNET_USDT_TRON_CONTRACT, TESTNET_USDT_SOLANA_MINT; unset = mainnet.
+# Production always runs mainnet (the gateway refuses testnet with
+# APP_ENV=production).
 # Secrets (`secrets.*`, every one listed in .kamal/secrets), per environment:
 # SSH_PRIVATE_KEY, WALLET_MNEMONIC, JWT_SECRET, POSTGRES_PASSWORD and
 # REDIS_PASSWORD (the accessories', >= 32 letters, digits, `-` or `_`, e.g.
@@ -171,6 +176,11 @@ jobs:
           BITCOIN_ESPLORA_BASE_URL: ${{ vars.BITCOIN_ESPLORA_BASE_URL || '' }}
           TRUSTED_PROXIES: ${{ vars.TRUSTED_PROXIES || '' }}
           OUTFLOWS_FROZEN: ${{ vars.OUTFLOWS_FROZEN || '' }}
+          # Test instances only: empty = mainnet (config/deploy.yml).
+          CHAIN_MODE: ${{ vars.CHAIN_MODE || '' }}
+          TESTNET_USDT_ETH_CONTRACT: ${{ vars.TESTNET_USDT_ETH_CONTRACT || '' }}
+          TESTNET_USDT_TRON_CONTRACT: ${{ vars.TESTNET_USDT_TRON_CONTRACT || '' }}
+          TESTNET_USDT_SOLANA_MINT: ${{ vars.TESTNET_USDT_SOLANA_MINT || '' }}
           WALLET_MNEMONIC: ${{ secrets.WALLET_MNEMONIC }}
           POSTGRES_PASSWORD: ${{ secrets.POSTGRES_PASSWORD }}
           REDIS_PASSWORD: ${{ secrets.REDIS_PASSWORD }}
