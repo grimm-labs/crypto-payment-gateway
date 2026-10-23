@@ -236,6 +236,10 @@ pub const BTC_CONFIRMATIONS_MIN: i32 = 1;
 /// Below this a warning is logged (RBF double-spends get easy).
 pub const BTC_CONFIRMATIONS_RECOMMENDED: i32 = 3;
 pub const AMOUNT_TOLERANCE_PERCENT_MAX: f64 = 5.0;
+/// The late watch (ADR 0005): a paid or expired address keeps being polled
+/// this many hours past its deadline (`LATE_WATCH_HOURS`, 0 turns it off).
+pub const LATE_WATCH_HOURS_DEFAULT: i64 = 24;
+pub const LATE_WATCH_HOURS_MAX: i64 = 72;
 pub const ACCESS_TOKEN_TTL_MAX_MINUTES: i64 = 60;
 pub const REFRESH_TOKEN_TTL_MAX_DAYS: i64 = 90;
 pub const JWT_SECRET_MIN_LEN: usize = 32;
@@ -288,6 +292,8 @@ pub struct AppConfig {
     pub eth_confirmations: i32,
     pub tron_confirmations: i32,
     pub amount_tolerance_percent: f64,
+    /// Hours a paid or expired address stays watched past its deadline.
+    pub late_watch_hours: i64,
     pub trongrid_api_key: Option<String>,
     pub alchemy_api_key: Option<String>,
     pub helius_api_key: Option<String>,
@@ -338,6 +344,7 @@ impl std::fmt::Debug for AppConfig {
             .field("eth_confirmations", &self.eth_confirmations)
             .field("tron_confirmations", &self.tron_confirmations)
             .field("amount_tolerance_percent", &self.amount_tolerance_percent)
+            .field("late_watch_hours", &self.late_watch_hours)
             .field("trongrid_api_key", &redact(&self.trongrid_api_key))
             .field("alchemy_api_key", &redact(&self.alchemy_api_key))
             .field("helius_api_key", &redact(&self.helius_api_key))
@@ -426,6 +433,7 @@ impl AppConfig {
             eth_confirmations: vars.parse_or("ETH_CONFIRMATIONS", 12)?,
             tron_confirmations: vars.parse_or("TRON_CONFIRMATIONS", 19)?,
             amount_tolerance_percent: vars.parse_or("AMOUNT_TOLERANCE_PERCENT", 1.0)?,
+            late_watch_hours: vars.parse_or("LATE_WATCH_HOURS", LATE_WATCH_HOURS_DEFAULT)?,
             trongrid_api_key: vars.optional("TRONGRID_API_KEY"),
             alchemy_api_key: vars.optional("ALCHEMY_API_KEY"),
             helius_api_key: vars.optional("HELIUS_API_KEY"),
@@ -495,6 +503,9 @@ impl AppConfig {
         }
         if !(0.0..=AMOUNT_TOLERANCE_PERCENT_MAX).contains(&self.amount_tolerance_percent) {
             bail!("AMOUNT_TOLERANCE_PERCENT must be between 0 and {AMOUNT_TOLERANCE_PERCENT_MAX}");
+        }
+        if !(0..=LATE_WATCH_HOURS_MAX).contains(&self.late_watch_hours) {
+            bail!("LATE_WATCH_HOURS must be between 0 and {LATE_WATCH_HOURS_MAX}");
         }
         if self.polling_interval_seconds == 0 {
             bail!("POLLING_INTERVAL_SECONDS must be at least 1");
@@ -933,6 +944,8 @@ mod tests {
             ("TRON_CONFIRMATIONS", "1"),
             ("AMOUNT_TOLERANCE_PERCENT", "100"),
             ("AMOUNT_TOLERANCE_PERCENT", "-1"),
+            ("LATE_WATCH_HOURS", "73"),
+            ("LATE_WATCH_HOURS", "-1"),
             ("ACCESS_TOKEN_TTL_MINUTES", "0"),
             ("ACCESS_TOKEN_TTL_MINUTES", "1440"),
             ("REFRESH_TOKEN_TTL_DAYS", "365"),
@@ -943,6 +956,15 @@ mod tests {
         }
         let config = config_with(&[("BTC_CONFIRMATIONS", "1"), ("AMOUNT_TOLERANCE_PERCENT", "5")]).unwrap();
         assert_eq!(config.btc_confirmations, 1);
+    }
+
+    #[test]
+    fn the_late_watch_lasts_24_hours_by_default_and_can_be_turned_off() {
+        assert_eq!(config_with(&[]).unwrap().late_watch_hours, 24);
+        assert_eq!(config_with(&[("LATE_WATCH_HOURS", "0")]).unwrap().late_watch_hours, 0);
+        assert_eq!(config_with(&[("LATE_WATCH_HOURS", "72")]).unwrap().late_watch_hours, 72);
+        let err = config_with(&[("LATE_WATCH_HOURS", "a day")]).unwrap_err();
+        assert!(format!("{err:#}").contains("LATE_WATCH_HOURS"));
     }
 
     #[test]

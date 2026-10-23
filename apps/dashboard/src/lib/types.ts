@@ -186,7 +186,17 @@ export interface DepositAddress {
   expected_amount: string
   /** Base units of the row's token: sats for BTC, wei for ETH, 10^-6 for USDT. */
   expected_amount_raw: string
+  /** Confirmed total of the address, late deposits included (ADR 0005). */
+  received_amount: string
+  /** The same in base units ("0" when nothing is confirmed). */
+  received_amount_raw: string
+  /** Confirmations a deposit needs on this network. */
+  required_confirmations: number
   expires_at: string
+  /** End of the late watch: transfers are still recorded until then. */
+  watch_until: string
+  /** Solana only: the USDT token account the gateway watches. */
+  token_account: string | null
   created_at: string
 }
 
@@ -210,6 +220,8 @@ export interface Deposit {
   amount_raw: string
   confirmations: number
   status: DepositStatus
+  /** First seen once the address had left `pending` (it never changes it). */
+  late: boolean
   confirmed_at: string | null
   /** Most recent delivery across all endpoints (legacy aggregate). */
   webhook: DepositWebhook | null
@@ -226,6 +238,7 @@ export type WebhookEventType =
   | "pending"
   | "paid"
   | "expired"
+  | "late"
   | "payout_succeeded"
   | "payout_failed"
   | "withdrawal_pending_approval"

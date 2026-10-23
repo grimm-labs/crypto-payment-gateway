@@ -81,6 +81,7 @@ const ALLOWED_EVENTS: Record<OwnerKind, WebhookEventType[]> = {
     "pending",
     "paid",
     "expired",
+    "late",
     "withdrawal_pending_approval",
     "withdrawal_broadcast",
     "withdrawal_confirmed",
@@ -114,8 +115,17 @@ const EVENT_GROUPS: Array<{ title: string; options: EventOption[] }> = [
     title: "Payments",
     options: [
       { value: "pending", label: "Pending", description: "A payment address is created" },
-      { value: "paid", label: "Paid", description: "A deposit is confirmed on-chain" },
+      {
+        value: "paid",
+        label: "Paid",
+        description: "The confirmed transfers to an address reach its amount",
+      },
       { value: "expired", label: "Expired", description: "An address expires unpaid" },
+      {
+        value: "late",
+        label: "Late deposit",
+        description: "A transfer to an address already paid or expired is confirmed",
+      },
     ],
   },
   {

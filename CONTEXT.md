@@ -11,11 +11,19 @@ A one-off payment request: a fresh address (or a Lightning invoice) issued for o
 _Avoid_: Payment address, invoice (except for Lightning)
 
 **Deposit**:
-An incoming on-chain or Lightning transfer credited to a deposit address.
+An incoming on-chain or Lightning transfer credited to a deposit address, whatever its amount. A deposit address is paid when the confirmed total of its deposits reaches its expected amount, less the tolerance; more pays too.
 _Avoid_: Payment, incoming transaction
 
+**Late deposit**:
+A deposit first seen once its address was already paid or expired, during the late watch that follows the deadline; it is the project's money but never changes the address's status.
+_Avoid_: Overpayment, orphan deposit
+
+**Late watch**:
+The hours after a deposit address's deadline during which it is still watched for late deposits.
+_Avoid_: Grace period (that is the 10 minutes before an address expires)
+
 **Unattributed funds**:
-Value sitting on a deposit address that settled no payment (outside tolerance, arrived after expiry, wrong asset); it is swept like the rest but flagged.
+Value sitting on a deposit address that the gateway never recorded as a deposit (arrived after the late watch, wrong asset); it is swept like the rest but flagged.
 _Avoid_: Orphan funds, lost funds
 
 ### Sending

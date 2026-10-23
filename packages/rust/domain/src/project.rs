@@ -217,6 +217,7 @@ impl WebhookEventType {
             Self::Pending
             | Self::Paid
             | Self::Expired
+            | Self::Late
             | Self::WithdrawalPendingApproval
             | Self::WithdrawalBroadcast
             | Self::WithdrawalConfirmed
@@ -241,6 +242,7 @@ pub fn allowed_events(owner: OwnerKind) -> &'static [WebhookEventType] {
             WebhookEventType::Pending,
             WebhookEventType::Paid,
             WebhookEventType::Expired,
+            WebhookEventType::Late,
             WebhookEventType::WithdrawalPendingApproval,
             WebhookEventType::WithdrawalBroadcast,
             WebhookEventType::WithdrawalConfirmed,
@@ -395,14 +397,14 @@ mod tests {
         }
         // Payment subjects always belong to a project; withdrawals may be
         // merchant funds.
-        for event in [E::Pending, E::Paid, E::Expired] {
+        for event in [E::Pending, E::Paid, E::Expired, E::Late] {
             assert!(!is_event_allowed(OwnerKind::Merchant, event));
         }
         for event in [E::WithdrawalPendingApproval, E::WithdrawalBroadcast, E::WithdrawalConfirmed, E::WithdrawalFailed, E::WithdrawalCancelled] {
             assert!(is_event_allowed(OwnerKind::Merchant, event));
             assert!(is_event_allowed(OwnerKind::Project, event));
         }
-        assert_eq!(allowed_events(OwnerKind::Project).len(), 9);
+        assert_eq!(allowed_events(OwnerKind::Project).len(), 10);
         assert_eq!(allowed_events(OwnerKind::Merchant).len(), 13);
     }
 

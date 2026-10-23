@@ -1949,6 +1949,9 @@ async fn retry_webhook_delivery(
         Err(RetriggerError::NothingToRetry) => {
             Err(ApiError::conflict("No failed webhook delivery to retry"))
         }
+        Err(RetriggerError::NoDepositEvent) => {
+            Err(ApiError::conflict("This deposit notifies no webhook event"))
+        }
         Err(RetriggerError::Other(err)) => Err(ApiError::internal(format!("{err:#}"))),
     }
 }

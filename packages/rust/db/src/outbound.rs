@@ -259,6 +259,20 @@ impl Db {
         Ok(locked.then_some(AdvisoryGuard { _tx: tx }))
     }
 
+    /// Whether `tx_hash` is a transaction the gateway signed on `network`
+    /// (a gas top-up to a deposit address is never a deposit of it).
+    /// Ethereum hashes come in two casings.
+    pub async fn is_gateway_outbound_tx(&self, network: Network, tx_hash: &str) -> Result<bool> {
+        let (found,): (bool,) = sqlx::query_as(
+            r#"SELECT EXISTS (SELECT 1 FROM outbound_transactions WHERE network = $1::"Network" AND lower("txHash") = lower($2))"#,
+        )
+        .bind(network.as_db())
+        .bind(tx_hash)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(found)
+    }
+
     pub async fn find_outbound_tx(&self, id: &str) -> Result<Option<OutboundTxRow>> {
         let row = sqlx::query_as::<_, OutboundTxRow>(&format!(
             "SELECT {OUTBOUND_COLUMNS} FROM outbound_transactions WHERE id = $1"

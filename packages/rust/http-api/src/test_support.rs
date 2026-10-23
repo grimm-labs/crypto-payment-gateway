@@ -68,8 +68,8 @@ async fn stub_redis() -> u16 {
     port
 }
 
-pub(crate) async fn test_state() -> AppState {
-    let redis_port = stub_redis().await;
+/// The development config of the router tests (`redis_port`: the stub's).
+fn config_with_redis(redis_port: u16) -> AppConfig {
     let vars: HashMap<&str, String> = HashMap::from([
         ("WALLET_MNEMONIC", TEST_MNEMONIC.to_string()),
         ("DATABASE_URL", "postgresql://postgres:postgres@127.0.0.1:1/never".to_string()),
@@ -77,7 +77,17 @@ pub(crate) async fn test_state() -> AppState {
         ("JWT_SECRET", "x".repeat(32)),
         ("APP_ENV", "development".to_string()),
     ]);
-    let config = Arc::new(AppConfig::from_lookup(|key| vars.get(key).cloned()).expect("test config"));
+    AppConfig::from_lookup(|key| vars.get(key).cloned()).expect("test config")
+}
+
+/// The config of `test_state`, for pure handler helpers.
+pub(crate) fn test_config() -> AppConfig {
+    config_with_redis(1)
+}
+
+pub(crate) async fn test_state() -> AppState {
+    let redis_port = stub_redis().await;
+    let config = Arc::new(config_with_redis(redis_port));
     let wallet = WalletService::with_chains(
         TEST_MNEMONIC,
         WalletChains {

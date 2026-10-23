@@ -11,7 +11,10 @@ and a per-asset balance kept as a ledger over the pooled treasuries.
 ## Features
 
 - Create unique deposit addresses per payment (`POST /api/v1/deposit-addresses`)
-- Monitor blockchain transfers and confirm deposits
+- Monitor blockchain transfers and confirm deposits: a payment is the **confirmed total of
+  every transfer** to its address, paid from 99 % of the expected amount (an overpayment
+  pays too), and its address stays watched **24 hours after its deadline** so late money is
+  recorded and reported — see [Payments: the total of their transfers](#payments-the-total-of-their-transfers)
 - **Projects**: several applications on one instance. Every API key, payment, webhook
   endpoint and address-book entry belongs to a project (endpoints, entries and admin
   withdrawals may belong to the **merchant funds** instead); a key only sees its project, a
@@ -19,7 +22,8 @@ and a per-asset balance kept as a ledger over the pooled treasuries.
   and a key cannot withdraw beyond it. Admins move funds between projects with **internal
   transfers** and reconcile the balances against the holdings — see [Projects](#projects)
 - Send webhooks for payment lifecycle events — `pending` (address created), `paid`
-  (deposit confirmed), `expired` — to every active endpoint **subscribed to that event** and
+  (its confirmed total reached the amount), `expired`, `late` (a late deposit confirmed) —
+  to every active endpoint **subscribed to that event** and
   **owned by the payment's project** (alerts and Lightning payouts go to the merchant's
   endpoints); endpoints are managed from the dashboard (**Webhooks**, admin), with
   per-endpoint delivery state
@@ -251,6 +255,39 @@ A payment is not expired the second its deadline passes: it keeps being polled f
 minutes (a transfer broadcast just before the deadline is still credited), and a payment
 with a `detected` deposit waiting for confirmations is held up to 24 h past its deadline.
 
+### Payments: the total of their transfers
+
+(ADR [0005](docs/adr/0005-un-paiement-est-la-somme-de-ses-envois.md).) Every non-zero transfer
+to a deposit address is recorded as a deposit, `detected` then `confirmed`, whatever its
+amount. The payment is the **confirmed total** of its deposits: the address turns `paid` once
+`total × 100 ≥ expected × (100 − AMOUNT_TOLERANCE_PERCENT)` — 99 % by default, compared in
+base units with integer arithmetic. There is no upper bound: an overpayment pays, and the
+surplus is reported in `received_amount`. A buyer whose exchange takes its fee off the amount
+can send twice (5 then 3.57 USDT pay 8.57). The decision is taken under a lock of the address
+row, in the transaction that confirms the deposit, and only from `pending`: the `paid` webhook
+fires exactly once, for the transfer whose confirmation made the total reach the amount. A
+short total at the deadline expires the payment as before.
+
+**The late watch.** A `paid` or `expired` address is still polled until `watch_until`
+(`expires_at` + `LATE_WATCH_HOURS`, 24 h by default, `0` turns the watch off), and after it
+while one of its deposits is still `detected`. A transfer first seen once the address left
+`pending` is a **late deposit** (`deposits[].late: true`): it is followed to its
+confirmations, counts in `received_amount` and in the project balance like any deposit, is
+swept like any other, and **never changes the address's status** — an expired payment stays
+`expired` even when a late transfer completes it; the receiver decides (Kivoo pays the order
+when the late total reaches 99 %). Its confirmation fires the `late` webhook
+(`deposit_late`). A transfer seen after the watch is not recorded: it is left to the sweeps as
+unattributed funds. Lightning is unchanged: an invoice is paid once, for its amount, and is
+never watched once paid or expired (an expired invoice cannot be paid). The gateway's own gas
+top-ups to a deposit address are never recorded as deposits.
+
+**Polling cost.** Each monitor pass reads one provider call per watched address with a
+300 ms pause between addresses (`ADDRESS_REQUEST_DELAY_MS`), so a 10-second cycle carries
+about 33 addresses per network; beyond that the passes run back to back (300 watched
+addresses ≈ 1.5 min per pass, 1 000 ≈ 5 min) and detection slows accordingly. The watched set
+is the open payments plus those of the last `LATE_WATCH_HOURS` past their deadline; open
+payments are polled first.
+
 ### List deposit addresses
 
 ```bash
@@ -271,7 +308,36 @@ Query params (optional):
 curl http://localhost:3000/api/v1/deposit-addresses/<id>
 ```
 
-`404` for another project's payment. Each entry in the returned `deposits[]` includes a `webhook` object with the delivery state (`status`: `pending` / `delivered` / `failed`, `attempts`, `last_response`, `updated_at`), or `null` if no delivery was attempted yet. Endpoint URLs and delivery errors are admin data: they only appear on the dashboard (`/api/admin/v1`), never on `/api/v1`.
+`404` for another project's payment. Besides the fields of the creation response, it carries
+(the list too):
+
+| Field | Meaning |
+|---|---|
+| `received_amount` | Confirmed total of the address, late deposits included, formatted like `expected_amount` |
+| `received_amount_raw` | The same in base units (`"0"` when nothing is confirmed) |
+| `required_confirmations` | Confirmations a deposit needs on the network (Tron 19, Ethereum 12, Bitcoin 3, Solana 1, Lightning 1) |
+| `watch_until` | End of the late watch (RFC 3339) |
+| `token_account` | Solana: the USDT token account the gateway watches; `null` elsewhere |
+
+```json
+{
+  "id": "0b6c…", "project_id": "6f1c…", "address": "TJ8m…", "network": "tron", "token": "USDT",
+  "status": "paid", "expected_amount": "8.57", "expected_amount_raw": "8570000",
+  "received_amount": "8.57", "received_amount_raw": "8570000", "required_confirmations": 19,
+  "expires_at": "2026-10-23T12:00:00+00:00", "watch_until": "2026-10-24T12:00:00+00:00",
+  "token_account": null, "created_at": "2026-10-23T11:00:00+00:00",
+  "metadata": { "kivoo": { "attemptId": "…" } },
+  "deposits": [
+    { "id": "…", "tx_hash": "…", "amount": "3.570000", "amount_raw": "3570000", "confirmations": 19,
+      "status": "confirmed", "late": false, "confirmed_at": "…", "webhook": { … }, "webhooks": [ … ] },
+    { "id": "…", "tx_hash": "…", "amount": "5.000000", "amount_raw": "5000000", "confirmations": 19,
+      "status": "confirmed", "late": false, "confirmed_at": "…", "webhook": null, "webhooks": [] }
+  ]
+}
+```
+
+`deposits[].late` is `true` for a transfer first seen once the address had left `pending`.
+Each entry in the returned `deposits[]` includes a `webhook` object with the delivery state (`status`: `pending` / `delivered` / `failed`, `attempts`, `last_response`, `updated_at`), or `null` if no delivery was attempted yet. Endpoint URLs and delivery errors are admin data: they only appear on the dashboard (`/api/admin/v1`), never on `/api/v1`.
 
 ### Retry a webhook delivery
 
@@ -492,6 +558,7 @@ and only receives those **about its owner**:
 | `pending` | A deposit address is created | `payment_pending` |
 | `paid` | A deposit is confirmed on-chain | `deposit_confirmed` |
 | `expired` | A pending address passes its expiry unpaid | `payment_expired` |
+| `late` | A late deposit (first seen once its address was paid or expired, within the late watch) is confirmed | `deposit_late` |
 | `payout_succeeded` | An outgoing Lightning wallet payment the gateway did **not** make as a withdrawal completed (the wallet may be shared; token sends are not reported) | `payout_succeeded` |
 | `payout_failed` | Such a payment failed | `payout_failed` |
 | `withdrawal_pending_approval` | A withdrawal waits for a second admin | `withdrawal_pending_approval` |
@@ -517,7 +584,7 @@ endpoints only. Hence the events an endpoint may subscribe to depend on its owne
 
 | Endpoint owner | Allowed events |
 |---|---|
-| project | `pending`, `paid`, `expired`, the five `withdrawal_*`, `transfer_completed` |
+| project | `pending`, `paid`, `expired`, `late`, the five `withdrawal_*`, `transfer_completed` |
 | merchant | the five `withdrawal_*` (merchant-funds withdrawals only), `transfer_completed`, `payout_succeeded`, `payout_failed`, `gas_reserve_low`, `treasury_cap_exceeded`, `address_book_entry_added`, `withdrawal_stuck`, `ledger_shortfall` |
 
 Other events are refused with `422`. Before the first project exists (an upgraded instance)
@@ -579,7 +646,10 @@ Internal transfer payload (`from` / `to`: `{ "type": "project", "id": "uuid" }` 
 }
 ```
 
-Payload on confirmed deposit (`paid`, historical shape plus `project_id`):
+Payload of `paid` (historical shape plus `project_id`, `expected_amount_raw` and
+`received_amount_raw`): `amount` / `tx_hash` / `confirmations` are those of the transfer whose
+confirmation paid the address; `received_amount_raw` is the confirmed total of the address
+when the webhook is sent. It fires once per payment.
 
 ```json
 {
@@ -590,16 +660,35 @@ Payload on confirmed deposit (`paid`, historical shape plus `project_id`):
     "address": "T...",
     "network": "tron",
     "token": "USDT",
-    "amount": "25.00",
+    "amount": "25.000000",
     "amount_raw": "25000000",
     "tx_hash": "abc...",
     "confirmations": 19,
-    "status": "confirmed"
+    "status": "confirmed",
+    "expected_amount_raw": "25000000",
+    "received_amount_raw": "25000000"
   }
 }
 ```
 
-Payload for `pending` / `expired` (no deposit yet — `deposit_id` is the deposit-address id, like above):
+Payload of `late` (`deposit_late`): the `paid` payload of the late transfer plus
+`address_status` (`paid` or `expired`, which a late deposit never changes):
+
+```json
+{
+  "event_type": "deposit_late",
+  "data": {
+    "deposit_id": "uuid", "project_id": "uuid", "address": "T...", "network": "tron", "token": "USDT",
+    "amount": "8.570000", "amount_raw": "8570000", "tx_hash": "def...", "confirmations": 19,
+    "status": "confirmed", "expected_amount_raw": "8570000", "received_amount_raw": "8570000",
+    "address_status": "expired"
+  }
+}
+```
+
+Payload for `pending` / `expired` (no deposit — `deposit_id` is the deposit-address id, like
+above); `expired` also carries `received_amount_raw`, the confirmed total of a partial payment
+(`"0"` when nothing arrived):
 
 ```json
 {
@@ -833,6 +922,7 @@ To report a vulnerability, use [GitHub Security Advisories](https://github.com/n
 | `BREEZ_API_KEY` | No* | — | Breez SDK Spark API key ([breez.technology](https://breez.technology)). Unset disables Lightning |
 | `BREEZ_STORAGE_DIR` | No | `./.breez-data` | Breez SDK local storage (SQLite), resolved to an absolute path at startup. Must persist across restarts (docker compose mounts the `breez_data` volume) |
 | `OUTFLOWS_FROZEN` | No | `false` | `true` forces the [outflow freeze](#treasury-sweeps--withdrawals-operator-runbook): no withdrawal, sweep or gas top-up leaves the gateway, and the dashboard cannot lift it while set |
+| `LATE_WATCH_HOURS` | No | `24` | Hours a paid or expired payment stays watched past its deadline, for [late deposits](#payments-the-total-of-their-transfers) (0–72; `0` turns the watch off) |
 | `CHAIN_MODE` | No | `mainnet` | `testnet` (development only) moves every network to its test chain — see [Testnet mode](#testnet-mode) |
 | `TESTNET_USDT_ETH_CONTRACT`, `TESTNET_USDT_TRON_CONTRACT`, `TESTNET_USDT_SOLANA_MINT` | With `CHAIN_MODE=testnet` | — | Test tokens standing in for USDT |
 
@@ -855,8 +945,9 @@ managed from the dashboard (admin only). The ledger tuning is fixed in code: bal
 the Esplora API (tip height + the address's latest transactions: mempool and last 25
 confirmed); the amount of a transaction is the sum of its outputs to the address. A
 `detected` deposit is not final (a replaced mempool transaction never confirms). Below
-`BTC_CONFIRMATIONS` (3) the deposit is `detected`; at 3 confirmations it is `confirmed`, the
-payment flips to `paid` and the `paid` webhook fires. One transaction paying several gateway
+`BTC_CONFIRMATIONS` (3) the deposit is `detected`; at 3 confirmations it is `confirmed`, and
+the payment flips to `paid` (the `paid` webhook fires) once its confirmed total reaches the
+amount. One transaction paying several gateway
 addresses yields one deposit per address. No reorg rollback (3 confirmations is the
 mitigation) and no RBF tracking — a replaced mempool transaction never confirms and the
 payment expires normally. Deposit addresses are never swept: Bitcoin withdrawals spend their
@@ -871,7 +962,8 @@ is disconnected cleanly on SIGINT/SIGTERM; a connection failure at boot only dis
 Lightning.
 
 Both reuse the existing `pending` / `paid` / `expired` webhooks unchanged (`network`:
-`bitcoin`/`lightning`, `token`: `BTC`, `amount` in BTC, `amount_raw` in sats).
+`bitcoin`/`lightning`, `token`: `BTC`, `amount` in BTC, `amount_raw` in sats); on-chain
+Bitcoin is watched late like the other networks, Lightning never.
 
 ### Custody note
 
@@ -896,8 +988,9 @@ confirmed funds of paid or expired payments move to the treasury once above the 
 token) minimum (ETH 0.01 · USDT-ERC20 50 · USDT-TRC20 20 · USDT-SPL 1 by default). A USDT
 deposit address on Ethereum or Tron first receives an exact **gas top-up** from the treasury;
 on Solana the treasury pays the fee and the emptied token account is closed (its rent comes
-back; the first sweep creates the treasury's own USDT token account). Bitcoin is never swept. Funds that settled no payment are swept too and reported as
-*unattributed*.
+back; the first sweep creates the treasury's own USDT token account). Bitcoin is never swept. Late deposits are deposits: swept and credited like any other. Funds
+the gateway never recorded (a transfer after the late watch, another token) are swept too and
+reported as *unattributed*.
 
 Before going live:
 

@@ -14,8 +14,8 @@ use config::{
 use db::{AuditActor, DepositAddressRow, OwnerFilter, WebhookDeliveryRow};
 use domain::{
     decimal_to_raw, format_amount, parse_sats, raw_to_decimal, raw_to_decimal_string,
-    round_to_token, supports,
-    DepositAddressStatus, Network, Token, WebhookDeliveryStatus, WebhookEventType, BTC_MAX_SATS,
+    required_confirmations, round_to_token, supports, DepositAddressStatus, Network, Token,
+    WebhookDeliveryStatus, WebhookEventType, BTC_MAX_SATS,
 };
 use jobs::{
     get_cached_wallet_balances, get_live_balances, lightning_payment_entry,
@@ -393,6 +393,8 @@ async fn create_deposit_address(
     };
 
     let metadata = body.metadata.unwrap_or_else(|| json!({}));
+    // The late watch (ADR 0005): polled this long past the deadline.
+    let watch_until = expires_at + Duration::hours(state.config.late_watch_hours);
     let row = state
         .db
         .create_deposit_address(
@@ -402,6 +404,7 @@ async fn create_deposit_address(
             derivation_index,
             request.expected_amount,
             expires_at,
+            watch_until,
             metadata,
             api_key.as_deref().map(|key| key.id.as_str()),
             project_id.as_deref(),
@@ -414,7 +417,7 @@ async fn create_deposit_address(
         tracing::warn!("Failed to queue PENDING webhook for address {}: {err:#}", row.id);
     }
 
-    Ok((StatusCode::CREATED, Json(to_response(&row)?)))
+    Ok((StatusCode::CREATED, Json(to_response(&row, 0, &state.config)?)))
 }
 
 /// A create request that passed validation.
@@ -578,9 +581,11 @@ async fn list_deposit_addresses(
         .db
         .list_deposit_addresses(status, network, &owner, limit, offset)
         .await?;
+    let ids: Vec<String> = rows.iter().map(|row| row.id.clone()).collect();
+    let received = state.db.confirmed_totals_raw(&ids).await?;
     let data = rows
         .iter()
-        .map(to_response)
+        .map(|row| to_response(row, received.get(&row.id).copied().unwrap_or(0), &state.config))
         .collect::<Result<Vec<_>, _>>()?;
 
     Ok(Json(ListResponse {
@@ -637,7 +642,8 @@ async fn get_deposit_address(
         .collect();
 
     let token = Token::from_db(&row.token).map_err(ApiError::from)?;
-    let mut base = serde_json::to_value(to_response(&row)?)?;
+    let received_raw = state.db.confirmed_total_raw(&row.id).await?;
+    let mut base = serde_json::to_value(to_response(&row, received_raw, &state.config)?)?;
     if let Some(obj) = base.as_object_mut() {
         obj.insert("metadata".into(), row.metadata);
         obj.insert(
@@ -683,6 +689,8 @@ async fn get_deposit_address(
                         "amount_raw": d.amount_raw,
                         "confirmations": d.confirmations,
                         "status": domain::DepositStatus::from_db(&d.status).map(|s| s.as_api()).unwrap_or("detected"),
+                        // First seen once the address had left `pending`.
+                        "late": d.late,
                         "confirmed_at": d.confirmed_at.map(|t| t.to_rfc3339()),
                         "webhook": webhook,
                         "webhooks": webhooks,
@@ -760,6 +768,9 @@ async fn retry_deposit_webhook(
         )),
         Err(RetriggerError::NothingToRetry) => {
             Err(ApiError::conflict("No failed webhook delivery to retry"))
+        }
+        Err(RetriggerError::NoDepositEvent) => {
+            Err(ApiError::conflict("This deposit notifies no webhook event"))
         }
         Err(RetriggerError::Other(err)) => Err(ApiError::internal(format!("{err:#}"))),
         Err(err) => Err(ApiError::internal(format!("{err:?}"))),
@@ -885,10 +896,17 @@ async fn get_wallet_balances(State(state): State<AppState>) -> Result<Json<Value
     Ok(Json(serde_json::to_value(resp)?))
 }
 
-fn to_response(row: &DepositAddressRow) -> Result<DepositAddressResponse, ApiError> {
+/// `received_raw`: the confirmed total of the address (late deposits
+/// included, ADR 0005), in base units.
+fn to_response(
+    row: &DepositAddressRow,
+    received_raw: u128,
+    config: &config::AppConfig,
+) -> Result<DepositAddressResponse, ApiError> {
     let network = Network::from_db(&row.network).map_err(ApiError::from)?;
     let token = Token::from_db(&row.token).map_err(ApiError::from)?;
     let status = DepositAddressStatus::from_db(&row.status).map_err(ApiError::from)?;
+    let received_raw = received_raw.to_string();
     Ok(DepositAddressResponse {
         id: row.id.clone(),
         project_id: row.project_id.clone(),
@@ -898,7 +916,17 @@ fn to_response(row: &DepositAddressRow) -> Result<DepositAddressResponse, ApiErr
         status: status.as_api().to_string(),
         expected_amount: row.expected_amount.normalize().to_string(),
         expected_amount_raw: decimal_to_raw(row.expected_amount, token),
+        received_amount: raw_to_decimal_string(&received_raw, token).map_err(ApiError::from)?,
+        received_amount_raw: received_raw,
+        required_confirmations: required_confirmations(
+            network,
+            config.tron_confirmations,
+            config.eth_confirmations,
+            config.btc_confirmations,
+        ),
         expires_at: row.expires_at.to_rfc3339(),
+        watch_until: row.watch_until.to_rfc3339(),
+        token_account: None,
         created_at: row.created_at.to_rfc3339(),
     })
 }
@@ -947,7 +975,19 @@ struct DepositAddressResponse {
     expected_amount: String,
     /// Base units: sats for BTC, 10^-6 for USDT.
     expected_amount_raw: String,
+    /// The confirmed total of the address, late deposits included (ADR
+    /// 0005), formatted like `expected_amount`.
+    received_amount: String,
+    /// The same in base units (`"0"` when nothing is confirmed).
+    received_amount_raw: String,
+    /// Confirmations a deposit needs on this network.
+    required_confirmations: i32,
     expires_at: String,
+    /// End of the late watch: transfers are still recorded until then.
+    watch_until: String,
+    /// Solana only: the USDT token account the gateway watches; `null`
+    /// elsewhere.
+    token_account: Option<String>,
     created_at: String,
 }
 
@@ -1354,24 +1394,70 @@ mod tests {
             api_key_id: None,
             project_id: None,
             btc_received_raw: None,
+            watch_until: now,
             created_at: now,
             updated_at: now,
         };
-        let btc = to_response(&row(Network::Lightning, dec!(0.00150000))).unwrap();
+        let config = crate::test_support::test_config();
+        let btc = to_response(&row(Network::Lightning, dec!(0.00150000)), 0, &config).unwrap();
         assert_eq!(btc.expected_amount, "0.0015");
         assert_eq!(btc.expected_amount_raw, "150000");
         assert_eq!(btc.network, "lightning");
         assert_eq!(btc.token, "BTC");
 
-        let usdt = to_response(&row(Network::Tron, dec!(25.50000000))).unwrap();
+        let usdt = to_response(&row(Network::Tron, dec!(25.50000000)), 0, &config).unwrap();
         assert_eq!(usdt.expected_amount, "25.5");
         assert_eq!(usdt.expected_amount_raw, "25500000");
 
         let mut eth = row(Network::Ethereum, dec!(0.050000000000000000));
         eth.token = Token::Eth.as_db().into();
-        let eth = to_response(&eth).unwrap();
+        let eth = to_response(&eth, 0, &config).unwrap();
         assert_eq!(eth.token, "ETH");
         assert_eq!(eth.expected_amount, "0.05");
         assert_eq!(eth.expected_amount_raw, "50000000000000000");
+    }
+
+    #[test]
+    fn the_status_reads_the_confirmed_total_and_the_watch() {
+        let now = Utc::now();
+        let config = crate::test_support::test_config();
+        let row = DepositAddressRow {
+            id: "a".into(),
+            network: Network::Tron.as_db().into(),
+            token: Token::Usdt.as_db().into(),
+            address: "T-addr".into(),
+            derivation_index: 0,
+            expected_amount: dec!(8.57),
+            status: DepositAddressStatus::Expired.as_db().into(),
+            expires_at: now,
+            metadata: json!({}),
+            api_key_id: None,
+            project_id: Some("p1".into()),
+            btc_received_raw: None,
+            watch_until: now + Duration::hours(24),
+            created_at: now,
+            updated_at: now,
+        };
+        // 5 + 3.57 USDT confirmed.
+        let response = serde_json::to_value(to_response(&row, 8_570_000, &config).unwrap()).unwrap();
+        assert_eq!(response["received_amount"], "8.57");
+        assert_eq!(response["received_amount_raw"], "8570000");
+        assert_eq!(response["expected_amount_raw"], "8570000");
+        assert_eq!(response["required_confirmations"], 19);
+        assert_eq!(response["watch_until"], (now + Duration::hours(24)).to_rfc3339());
+        assert_eq!(response["token_account"], Value::Null);
+        assert_eq!(response["status"], "expired");
+
+        let nothing = serde_json::to_value(to_response(&row, 0, &config).unwrap()).unwrap();
+        assert_eq!(nothing["received_amount"], "0");
+        assert_eq!(nothing["received_amount_raw"], "0");
+
+        let mut btc = row.clone();
+        btc.network = Network::Bitcoin.as_db().into();
+        btc.token = Token::Btc.as_db().into();
+        btc.expected_amount = dec!(0.00010504);
+        let btc = serde_json::to_value(to_response(&btc, 10_504, &config).unwrap()).unwrap();
+        assert_eq!(btc["received_amount"], "0.00010504");
+        assert_eq!(btc["required_confirmations"], 3);
     }
 }

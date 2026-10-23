@@ -6,6 +6,7 @@ import { toast } from "sonner"
 import { CopyButton } from "@/components/shared/CopyButton"
 import { ProjectBadge } from "@/components/shared/ProjectBadge"
 import { StatusBadge } from "@/components/shared/StatusBadge"
+import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import {
   Card,
@@ -156,8 +157,22 @@ export function PaymentDetailPage() {
             <dl className="grid grid-cols-2 gap-x-4 gap-y-2 text-sm">
               <dt className="text-muted-foreground">Expected amount</dt>
               <dd className="tabular-nums">{formatAmount(data.expected_amount, data.token)}</dd>
+              <dt className="text-muted-foreground">Received (confirmed)</dt>
+              <dd className="tabular-nums">{formatAmount(data.received_amount, data.token)}</dd>
               <dt className="text-muted-foreground">Expires at</dt>
               <dd>{formatDate(data.expires_at)}</dd>
+              {!isLightning && (
+                <>
+                  <dt className="text-muted-foreground">Watched until</dt>
+                  <dd>{formatDate(data.watch_until)}</dd>
+                </>
+              )}
+              {data.token_account && (
+                <>
+                  <dt className="text-muted-foreground">Token account</dt>
+                  <dd className="break-all font-mono text-xs">{data.token_account}</dd>
+                </>
+              )}
               <dt className="text-muted-foreground">Created at</dt>
               <dd>{formatDate(data.created_at)}</dd>
               <dt className="text-muted-foreground">ID</dt>
@@ -218,7 +233,14 @@ export function PaymentDetailPage() {
                     </TableCell>
                     <TableCell>{deposit.confirmations}</TableCell>
                     <TableCell>
-                      <StatusBadge status={deposit.status} />
+                      <div className="flex items-center gap-1">
+                        <StatusBadge status={deposit.status} />
+                        {deposit.late && (
+                          <Badge variant="outline" title="Arrived after the payment was paid or expired">
+                            late
+                          </Badge>
+                        )}
+                      </div>
                     </TableCell>
                     <TableCell>
                       {(deposit.webhooks?.length ?? 0) > 0 ? (

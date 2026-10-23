@@ -14,9 +14,9 @@ use config::{
 use db::Db;
 use db::DepositAddressRow;
 use domain::{
-    format_amount, raw_to_decimal, raw_to_decimal_string, required_confirmations,
+    decimal_to_raw, format_amount, raw_to_decimal, raw_to_decimal_string, required_confirmations,
     DetectedTransfer, DepositAddressStatus, DepositStatus, Network, Owner, Token,
-    WebhookDeliveryStatus, WebhookEventType, WebhookSubject, is_amount_within_tolerance,
+    WebhookDeliveryStatus, WebhookEventType, WebhookSubject,
 };
 use lightning_client::{
     LightningClient, LightningEvent, PaymentDirection, ReceivedPayment, WalletPayment,
@@ -105,18 +105,21 @@ impl AppState {
     }
 }
 
+/// Record a transfer seen on a watched address (ADR 0005). Every non-zero
+/// transfer is a deposit, `DETECTED` then `CONFIRMED`, whatever its amount:
+/// the payment is the confirmed total of its address, paid from
+/// `100 − AMOUNT_TOLERANCE_PERCENT` % of the expected amount. `paid` fans
+/// out once, when this call set the address PAID; `late` when it confirmed
+/// a late deposit (first seen once the address had left PENDING).
 pub async fn process_detected_transfer(state: &AppState, transfer: DetectedTransfer) -> Result<()> {
     let address = match state.db.find_deposit_address(&transfer.deposit_address_id).await? {
         Some(a) => a,
         None => return Ok(()),
     };
 
-    if address.status != DepositAddressStatus::Pending.as_db() {
-        return Ok(());
-    }
-
     let network = Network::from_db(&address.network)?;
     let token = Token::from_db(&address.token)?;
+    let status = DepositAddressStatus::from_db(&address.status)?;
     let required = required_confirmations(
         network,
         state.config.tron_confirmations,
@@ -124,13 +127,24 @@ pub async fn process_detected_transfer(state: &AppState, transfer: DetectedTrans
         state.config.btc_confirmations,
     );
 
-    if let Some(existing) = state
+    let existing = state
         .db
         .find_deposit_by_address_and_tx(&transfer.deposit_address_id, &transfer.tx_hash)
-        .await?
-    {
-        if existing.status == DepositStatus::Confirmed.as_db() {
-            return Ok(());
+        .await?;
+    match &existing {
+        Some(existing) if existing.status == DepositStatus::Confirmed.as_db() => return Ok(()),
+        Some(_) => {}
+        // Fast path of the rule the recording transaction applies again
+        // under the address lock.
+        None => {
+            let watch_open = address.watch_until > chrono::Utc::now();
+            if domain::admit_transfer(network, status, watch_open) == domain::TransferAdmission::Ignore {
+                debug!(
+                    "Transfer {} to address {} after its late watch — left to the sweeps",
+                    transfer.tx_hash, address.id
+                );
+                return Ok(());
+            }
         }
     }
 
@@ -140,28 +154,20 @@ pub async fn process_detected_transfer(state: &AppState, transfer: DetectedTrans
         debug!("Ignoring zero-amount transfer {} to address {}", transfer.tx_hash, address.id);
         return Ok(());
     }
-    let amount_str = amount.normalize().to_string();
-    let is_confirmed = transfer.confirmations >= required;
-
-    if !is_amount_within_tolerance(
-        &amount_str,
-        &address.expected_amount.to_string(),
-        state.config.amount_tolerance_percent,
-    ) {
-        warn!(
-            "Deposit amount {amount_str} outside tolerance for address {}",
-            address.id
-        );
+    // A gas top-up of a sweep reaches the address from the treasury: the
+    // gateway's own money, never a deposit.
+    if existing.is_none() && state.db.is_gateway_outbound_tx(network, &transfer.tx_hash).await? {
+        debug!("Ignoring the gateway's own transaction {} to address {}", transfer.tx_hash, address.id);
         return Ok(());
     }
-
-    let status = if is_confirmed {
+    let is_confirmed = transfer.confirmations >= required;
+    let deposit_status = if is_confirmed {
         DepositStatus::Confirmed
     } else {
         DepositStatus::Detected
     };
 
-    let deposit = state
+    let Some(recorded) = state
         .db
         .upsert_deposit_and_maybe_pay(
             &transfer.deposit_address_id,
@@ -169,23 +175,53 @@ pub async fn process_detected_transfer(state: &AppState, transfer: DetectedTrans
             amount,
             &transfer.amount_raw,
             transfer.confirmations,
-            status,
-            is_confirmed,
+            deposit_status,
+            state.config.amount_tolerance_percent,
         )
-        .await?;
+        .await?
+    else {
+        return Ok(());
+    };
+    if recorded.deposit.late && existing.is_none() {
+        info!(
+            "Late deposit {} of {} {} to address {} ({})",
+            recorded.deposit.id,
+            amount.normalize(),
+            token.as_api(),
+            address.id,
+            status.as_api()
+        );
+    }
 
-    // Fan out to the address owner's endpoints subscribed to PAID (spec
-    // §10.1); none configured is a no-op.
-    if is_confirmed {
+    // Fan out to the address owner's endpoints subscribed to the event
+    // (spec §10.1); none configured is a no-op.
+    if let Some(event) = deposit_event(&recorded) {
+        if event == WebhookEventType::Paid {
+            info!("Address {} paid by its confirmed total", address.id);
+        }
         let owners = webhooks::SubjectOwners::One(Owner::from_project_id(address.project_id.as_deref()));
-        for endpoint in webhooks::endpoints_for(state, WebhookEventType::Paid, &owners).await? {
-            if !state.db.has_delivered_webhook(&deposit.id, &endpoint.id).await? {
-                enqueue_webhook(state, WebhookEventType::Paid, &deposit.id, &endpoint.id).await?;
+        let deposit_id = &recorded.deposit.id;
+        for endpoint in webhooks::endpoints_for(state, event, &owners).await? {
+            if !state.db.has_delivered_deposit_webhook(event, deposit_id, &endpoint.id).await? {
+                enqueue_webhook(state, event, deposit_id, &endpoint.id).await?;
             }
         }
     }
 
     Ok(())
+}
+
+/// The event a recorded transfer fires: `paid` when it set its address
+/// PAID, `late` when it confirmed a late deposit, nothing otherwise (a
+/// partial transfer, a detection, a repeat).
+pub fn deposit_event(recorded: &db::RecordedDeposit) -> Option<WebhookEventType> {
+    if recorded.paid {
+        Some(WebhookEventType::Paid)
+    } else if recorded.newly_confirmed && recorded.deposit.late {
+        Some(WebhookEventType::Late)
+    } else {
+        None
+    }
 }
 
 /// Map a settled Lightning payment to its gateway invoice row. `None` for
@@ -638,6 +674,9 @@ pub enum RetriggerError {
     /// No FAILED delivery to replay (merchant replays never resend a
     /// delivered webhook).
     NothingToRetry,
+    /// A confirmed deposit that notifies nothing: neither late nor part of
+    /// a paid address (a partial payment that expired, ADR 0005).
+    NoDepositEvent,
     Other(anyhow::Error),
 }
 
@@ -647,17 +686,32 @@ impl From<anyhow::Error> for RetriggerError {
     }
 }
 
-/// Manual replay for the dashboard: for every active PAID-subscribed
-/// endpoint of the deposit's owner, reset the delivery row to PENDING / 0
-/// attempts, then schedule an immediate attempt. Never touches `deposits`
-/// or `deposit_addresses`.
+/// The event a confirmed deposit notifies on a replay (ADR 0005): `late`
+/// for a late deposit, `paid` for a deposit of a paid address — never a
+/// `deposit_confirmed` for a partial payment that expired. `None` for a
+/// deposit whose address is gone.
+async fn deposit_replay_event(state: &AppState, deposit: &db::DepositRow) -> Result<Option<WebhookEventType>> {
+    if deposit.late {
+        return Ok(Some(WebhookEventType::Late));
+    }
+    let Some(address) = state.db.find_deposit_address(&deposit.deposit_address_id).await? else {
+        return Ok(None);
+    };
+    Ok((address.status == DepositAddressStatus::Paid.as_db()).then_some(WebhookEventType::Paid))
+}
+
+/// Manual replay for the dashboard: for every active endpoint of the
+/// deposit's owner subscribed to its event (`paid`, or `late` for a late
+/// deposit), reset the delivery row to PENDING / 0 attempts, then schedule
+/// an immediate attempt. Never touches `deposits` or `deposit_addresses`.
 pub async fn retrigger_webhook(state: &AppState, deposit_id: &str) -> Result<(), RetriggerError> {
     let deposit = state
         .db
         .find_deposit(deposit_id)
         .await?
         .ok_or(RetriggerError::DepositNotFound)?;
-    let endpoints = webhooks::endpoints_for_subject(state, WebhookEventType::Paid, &deposit.id)
+    let event = if deposit.late { WebhookEventType::Late } else { WebhookEventType::Paid };
+    let endpoints = webhooks::endpoints_for_subject(state, event, &deposit.id)
         .await?
         .ok_or(RetriggerError::DepositNotFound)?;
     if endpoints.is_empty() {
@@ -666,13 +720,17 @@ pub async fn retrigger_webhook(state: &AppState, deposit_id: &str) -> Result<(),
     if deposit.status != DepositStatus::Confirmed.as_db() {
         return Err(RetriggerError::DepositNotConfirmed);
     }
+    if deposit_replay_event(state, &deposit).await? != Some(event) {
+        return Err(RetriggerError::NoDepositEvent);
+    }
 
     for endpoint in &endpoints {
-        state.db.reset_webhook_delivery(&deposit.id, &endpoint.id).await?;
-        enqueue_webhook(state, WebhookEventType::Paid, &deposit.id, &endpoint.id).await?;
+        state.db.reset_deposit_webhook_delivery(event, &deposit.id, &endpoint.id).await?;
+        enqueue_webhook(state, event, &deposit.id, &endpoint.id).await?;
     }
     info!(
-        "Webhook retriggered for deposit {deposit_id} towards {} endpoint(s)",
+        "Webhook retriggered for deposit {deposit_id} ({}) towards {} endpoint(s)",
+        event.as_api(),
         endpoints.len()
     );
     Ok(())
@@ -680,8 +738,8 @@ pub async fn retrigger_webhook(state: &AppState, deposit_id: &str) -> Result<(),
 
 /// Merchant replay of a confirmed deposit's webhooks: only the deliveries
 /// that ended FAILED, and only towards endpoints still active and
-/// subscribed to PAID — a delivered webhook is never sent again from the
-/// merchant API. Returns the number of deliveries re-queued.
+/// subscribed to their event — a delivered webhook is never sent again from
+/// the merchant API. Returns the number of deliveries re-queued.
 pub async fn retrigger_failed_deposit_webhooks(
     state: &AppState,
     deposit_id: &str,
@@ -694,23 +752,30 @@ pub async fn retrigger_failed_deposit_webhooks(
     if deposit.status != DepositStatus::Confirmed.as_db() {
         return Err(RetriggerError::DepositNotConfirmed);
     }
-    // The deposit owner's endpoints only (spec §10.1).
-    let eligible: Vec<String> = webhooks::endpoints_for_subject(state, WebhookEventType::Paid, &deposit.id)
-        .await?
-        .ok_or(RetriggerError::DepositNotFound)?
-        .into_iter()
-        .map(|endpoint| endpoint.id)
-        .collect();
     let mut retried = 0;
-    for delivery in state.db.failed_paid_deliveries(&deposit.id).await? {
+    // The deposit owner's endpoints only (spec §10.1), per event.
+    let mut eligible: Vec<(WebhookEventType, Vec<String>)> = Vec::new();
+    for delivery in state.db.failed_deposit_deliveries(&deposit.id).await? {
         let Some(endpoint_id) = delivery.webhook_endpoint_id.as_deref() else {
             continue;
         };
-        if !eligible.iter().any(|id| id == endpoint_id) {
+        let Ok(event) = WebhookEventType::from_db(&delivery.event_type) else {
+            continue;
+        };
+        if !eligible.iter().any(|(known, _)| *known == event) {
+            let endpoints = webhooks::endpoints_for_subject(state, event, &deposit.id)
+                .await?
+                .ok_or(RetriggerError::DepositNotFound)?;
+            eligible.push((event, endpoints.into_iter().map(|endpoint| endpoint.id).collect()));
+        }
+        let allowed = eligible
+            .iter()
+            .any(|(known, ids)| *known == event && ids.iter().any(|id| id == endpoint_id));
+        if !allowed {
             continue;
         }
         state.db.reset_webhook_delivery_by_id(&delivery.id).await?;
-        enqueue_webhook(state, WebhookEventType::Paid, &deposit.id, endpoint_id).await?;
+        enqueue_webhook(state, event, &deposit.id, endpoint_id).await?;
         retried += 1;
     }
     if retried == 0 {
@@ -808,8 +873,8 @@ pub async fn retrigger_failed_webhooks(state: &AppState) -> Result<usize, Retrig
         };
         for endpoint_id in target_endpoints.iter().map(String::as_str) {
             let result: Result<()> = async {
-                if event == WebhookEventType::Paid {
-                    state.db.reset_webhook_delivery(subject_id, endpoint_id).await?;
+                if event.subject() == WebhookSubject::Deposit {
+                    state.db.reset_deposit_webhook_delivery(event, subject_id, endpoint_id).await?;
                 } else {
                     let row = state
                         .db
@@ -832,8 +897,8 @@ pub async fn retrigger_failed_webhooks(state: &AppState) -> Result<usize, Retrig
     Ok(retried)
 }
 
-/// Deliver one queued webhook. `subject_id` is a deposit id for PAID, a
-/// deposit-address id for PENDING/EXPIRED, a Lightning payment id for
+/// Deliver one queued webhook. `subject_id` is a deposit id for PAID and
+/// LATE, a deposit-address id for PENDING/EXPIRED, a Lightning payment id for
 /// payout events, a withdrawal id for withdrawal events and an alert id for
 /// alert events (`WebhookEventType::subject`).
 pub async fn deliver_webhook(
@@ -966,7 +1031,7 @@ async fn prepare_delivery(
     endpoint_id: &str,
 ) -> Result<Option<(db::WebhookDeliveryRow, serde_json::Value, chrono::DateTime<chrono::Utc>)>> {
     match event {
-        WebhookEventType::Paid => {
+        WebhookEventType::Paid | WebhookEventType::Late => {
             let Some(deposit) = state.db.find_deposit(subject_id).await? else {
                 return Ok(None);
             };
@@ -976,27 +1041,10 @@ async fn prepare_delivery(
             };
             let delivery = state
                 .db
-                .get_or_create_webhook_delivery(subject_id, endpoint_id)
+                .get_or_create_deposit_webhook_delivery(event, subject_id, endpoint_id)
                 .await?;
-            let network = Network::from_db(&address.network)?;
-            let token = Token::from_db(&address.token)?;
-            // Historical shape — `data.deposit_id` is deposit_addresses.id
-            // on purpose (see AGENTS.md); existing receivers depend on it.
-            let payload = serde_json::json!({
-                "event_type": event.payload_event_type(),
-                "data": {
-                    "deposit_id": deposit.deposit_address_id,
-                    "project_id": address.project_id,
-                    "address": address.address,
-                    "network": network.as_api(),
-                    "token": token.as_api(),
-                    "amount": format_amount(deposit.amount, token),
-                    "amount_raw": deposit.amount_raw,
-                    "tx_hash": deposit.tx_hash,
-                    "confirmations": deposit.confirmations,
-                    "status": "confirmed",
-                },
-            });
+            let received_raw = state.db.confirmed_total_raw(&address.id).await?;
+            let payload = deposit_event_payload(event, &address, &deposit, received_raw)?;
             let occurred_at = deposit.confirmed_at.unwrap_or(deposit.detected_at);
             Ok(Some((delivery, payload, occurred_at)))
         }
@@ -1012,7 +1060,11 @@ async fn prepare_delivery(
                 WebhookEventType::Pending => address.created_at,
                 _ => address.updated_at,
             };
-            Ok(Some((delivery, address_event_payload(event, &address)?, occurred_at)))
+            let received_raw = match event {
+                WebhookEventType::Expired => Some(state.db.confirmed_total_raw(&address.id).await?),
+                _ => None,
+            };
+            Ok(Some((delivery, address_event_payload(event, &address, received_raw)?, occurred_at)))
         }
         WebhookEventType::PayoutSucceeded | WebhookEventType::PayoutFailed => {
             let Some(lightning) = &state.lightning else {
@@ -1116,9 +1168,14 @@ async fn close_undeliverable(
     endpoint_id: &str,
     reason: &str,
 ) -> Result<()> {
-    let row = match event {
-        WebhookEventType::Paid => state.db.find_webhook_delivery(subject_id, endpoint_id).await?,
-        event => {
+    let row = match event.subject() {
+        WebhookSubject::Deposit => {
+            state
+                .db
+                .find_deposit_webhook_delivery(event, subject_id, endpoint_id)
+                .await?
+        }
+        _ => {
             state
                 .db
                 .find_subject_webhook_delivery(event, subject_id, endpoint_id)
@@ -1131,15 +1188,54 @@ async fn close_undeliverable(
     Ok(())
 }
 
-/// Payload of an address-scoped event. Mirrors the PAID payload's naming:
-/// `data.deposit_id` is deposit_addresses.id.
-fn address_event_payload(
+/// Payload of a deposit event: `paid` (`deposit_confirmed`, the historical
+/// shape — `data.deposit_id` is deposit_addresses.id on purpose, see
+/// AGENTS.md; existing receivers depend on it) and `late` (`deposit_late`,
+/// the same plus `address_status`). Both carry the expected amount and the
+/// confirmed total of the address in base units (ADR 0005).
+pub fn deposit_event_payload(
     event: WebhookEventType,
     address: &DepositAddressRow,
+    deposit: &db::DepositRow,
+    received_raw: u128,
 ) -> Result<serde_json::Value> {
     let network = Network::from_db(&address.network)?;
     let token = Token::from_db(&address.token)?;
-    Ok(serde_json::json!({
+    let mut payload = serde_json::json!({
+        "event_type": event.payload_event_type(),
+        "data": {
+            "deposit_id": deposit.deposit_address_id,
+            "project_id": address.project_id,
+            "address": address.address,
+            "network": network.as_api(),
+            "token": token.as_api(),
+            "amount": format_amount(deposit.amount, token),
+            "amount_raw": deposit.amount_raw,
+            "tx_hash": deposit.tx_hash,
+            "confirmations": deposit.confirmations,
+            "status": "confirmed",
+            "expected_amount_raw": decimal_to_raw(address.expected_amount, token),
+            "received_amount_raw": received_raw.to_string(),
+        },
+    });
+    if event == WebhookEventType::Late {
+        let status = DepositAddressStatus::from_db(&address.status)?;
+        payload["data"]["address_status"] = serde_json::json!(status.as_api());
+    }
+    Ok(payload)
+}
+
+/// Payload of an address-scoped event. Mirrors the PAID payload's naming:
+/// `data.deposit_id` is deposit_addresses.id. `expired` also carries the
+/// confirmed total (`received_raw`, a partial payment).
+fn address_event_payload(
+    event: WebhookEventType,
+    address: &DepositAddressRow,
+    received_raw: Option<u128>,
+) -> Result<serde_json::Value> {
+    let network = Network::from_db(&address.network)?;
+    let token = Token::from_db(&address.token)?;
+    let mut payload = serde_json::json!({
         "event_type": event.payload_event_type(),
         "data": {
             "deposit_id": address.id,
@@ -1152,7 +1248,11 @@ fn address_event_payload(
             "expires_at": address.expires_at.to_rfc3339(),
             "created_at": address.created_at.to_rfc3339(),
         },
-    }))
+    });
+    if let Some(received_raw) = received_raw {
+        payload["data"]["received_amount_raw"] = serde_json::json!(received_raw.to_string());
+    }
+    Ok(payload)
 }
 
 /// `traffic_rx` is the consumer side of `state.traffic`; it is dropped when
@@ -1307,8 +1407,9 @@ async fn monitor_loop(state: AppState, network: Network, poll_secs: u64) {
     }
 }
 
-/// Poll `network`'s open payments, then expire the stale ones: the sweep
-/// runs only after the poll, so a payment always gets a last look before
+/// Poll `network`'s watched payments (the open ones, then those in their
+/// late watch — ADR 0005), then expire the stale ones: the sweep runs only
+/// after the poll, so a payment always gets a last look before
 /// it expires (no boot-time race either — the first pass of every loop
 /// polls before it expires anything).
 async fn poll_network(state: &AppState, network: Network) -> Result<()> {
@@ -1325,7 +1426,7 @@ async fn poll_network(state: &AppState, network: Network) -> Result<()> {
         return Ok(());
     }
 
-    let addresses = state.db.pending_addresses(network).await?;
+    let addresses = state.db.watched_addresses(network).await?;
     if network == Network::Lightning {
         // A failed reconciliation returns early: nothing expires unpolled.
         reconcile_lightning(state, &addresses).await?;
@@ -2058,6 +2159,7 @@ mod tests {
             api_key_id: None,
             project_id: Some("p1".into()),
             btc_received_raw: None,
+            watch_until: now,
             created_at: now,
             updated_at: now,
         }
@@ -2330,6 +2432,118 @@ mod tests {
             decode_queue_member(&member),
             Some((WebhookEventType::Paid, "dep-123", "ep-456"))
         );
+    }
+
+    fn deposit_row(late: bool, status: DepositStatus) -> db::DepositRow {
+        let now = chrono::Utc::now();
+        db::DepositRow {
+            id: "dep-1".into(),
+            deposit_address_id: "addr-1".into(),
+            tx_hash: "tx-1".into(),
+            amount: rust_decimal::Decimal::new(357, 2),
+            amount_raw: "3570000".into(),
+            confirmations: 19,
+            status: status.as_db().into(),
+            late,
+            detected_at: now,
+            confirmed_at: Some(now),
+        }
+    }
+
+    fn recorded(late: bool, newly_confirmed: bool, paid: bool) -> db::RecordedDeposit {
+        db::RecordedDeposit {
+            deposit: deposit_row(late, if newly_confirmed { DepositStatus::Confirmed } else { DepositStatus::Detected }),
+            newly_confirmed,
+            paid,
+        }
+    }
+
+    #[test]
+    fn paid_fires_once_when_the_total_pays_and_late_once_confirmed() {
+        // The transfer whose confirmation made the total pay the address.
+        assert_eq!(deposit_event(&recorded(false, true, true)), Some(WebhookEventType::Paid));
+        // A first, partial transfer (5 of 8.57) or a detection: nothing.
+        assert_eq!(deposit_event(&recorded(false, true, false)), None);
+        assert_eq!(deposit_event(&recorded(false, false, false)), None);
+        // A late deposit fires `late` when it confirms, not when detected.
+        assert_eq!(deposit_event(&recorded(true, true, false)), Some(WebhookEventType::Late));
+        assert_eq!(deposit_event(&recorded(true, false, false)), None);
+    }
+
+    fn usdt_address(status: DepositAddressStatus) -> DepositAddressRow {
+        DepositAddressRow {
+            network: Network::Tron.as_db().into(),
+            token: Token::Usdt.as_db().into(),
+            address: "TAddr".into(),
+            expected_amount: rust_decimal::Decimal::new(857, 2),
+            ..invoice_row(Network::Tron, status)
+        }
+    }
+
+    #[test]
+    fn deposit_payloads_carry_the_amounts_and_the_late_address_status() {
+        let address = usdt_address(DepositAddressStatus::Paid);
+        let paid = deposit_event_payload(
+            WebhookEventType::Paid,
+            &address,
+            &deposit_row(false, DepositStatus::Confirmed),
+            8_570_000,
+        )
+        .unwrap();
+        assert_eq!(
+            paid,
+            serde_json::json!({
+                "event_type": "deposit_confirmed",
+                "data": {
+                    "deposit_id": "addr-1",
+                    "project_id": "p1",
+                    "address": "TAddr",
+                    "network": "tron",
+                    "token": "USDT",
+                    "amount": "3.570000",
+                    "amount_raw": "3570000",
+                    "tx_hash": "tx-1",
+                    "confirmations": 19,
+                    "status": "confirmed",
+                    "expected_amount_raw": "8570000",
+                    "received_amount_raw": "8570000",
+                },
+            })
+        );
+
+        for (status, api) in [(DepositAddressStatus::Paid, "paid"), (DepositAddressStatus::Expired, "expired")] {
+            let late = deposit_event_payload(
+                WebhookEventType::Late,
+                &usdt_address(status),
+                &deposit_row(true, DepositStatus::Confirmed),
+                12_140_000,
+            )
+            .unwrap();
+            assert_eq!(late["event_type"], "deposit_late");
+            assert_eq!(late["data"]["address_status"], api);
+            assert_eq!(late["data"]["received_amount_raw"], "12140000");
+            assert_eq!(late["data"]["deposit_id"], "addr-1");
+            assert_eq!(late["data"]["status"], "confirmed");
+        }
+        assert!(paid["data"].get("address_status").is_none());
+    }
+
+    #[test]
+    fn the_expired_payload_reports_what_arrived() {
+        let address = usdt_address(DepositAddressStatus::Expired);
+        let expired = address_event_payload(WebhookEventType::Expired, &address, Some(3_000_000)).unwrap();
+        assert_eq!(expired["event_type"], "payment_expired");
+        assert_eq!(expired["data"]["received_amount_raw"], "3000000");
+        assert_eq!(expired["data"]["expected_amount"], "8.57");
+        let pending = address_event_payload(WebhookEventType::Pending, &address, None).unwrap();
+        assert!(pending["data"].get("received_amount_raw").is_none());
+    }
+
+    #[test]
+    fn late_queue_members_carry_their_event_and_deposit() {
+        let member = encode_queue_member(WebhookEventType::Late, "dep-123", "ep-456");
+        assert_eq!(member, "LATE|dep-123|ep-456");
+        assert_eq!(decode_queue_member(&member), Some((WebhookEventType::Late, "dep-123", "ep-456")));
     }
 
     #[test]

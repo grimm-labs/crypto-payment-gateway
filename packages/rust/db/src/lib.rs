@@ -1,8 +1,10 @@
+use std::collections::HashMap;
+
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use domain::{
-    DepositAddressStatus, DepositStatus, Network, Token, WebhookDeliveryStatus, WebhookEventType,
-    WebhookSubject,
+    admit_transfer, decimal_to_raw, is_amount_paid, DepositAddressStatus, DepositStatus, Network,
+    Token, TransferAdmission, WebhookDeliveryStatus, WebhookEventType, WebhookSubject,
 };
 use rust_decimal::Decimal;
 use serde_json::Value;
@@ -70,8 +72,10 @@ pub struct Db {
 // TIMESTAMP(3) column into DateTime<Utc>, so every query that materializes a
 // row must cast enums to text and timestamps to timestamptz (stored values
 // are UTC instants) instead of using SELECT * / RETURNING *.
-const DEPOSIT_ADDRESS_COLUMNS: &str = r#"id, network::text AS network, token::text AS token, address, "derivationIndex", "expectedAmount", status::text AS status, "expiresAt" AT TIME ZONE 'UTC' AS "expiresAt", metadata, "apiKeyId", "projectId", "btcReceivedRaw"::text AS "btcReceivedRaw", "createdAt" AT TIME ZONE 'UTC' AS "createdAt", "updatedAt" AT TIME ZONE 'UTC' AS "updatedAt""#;
-const DEPOSIT_COLUMNS: &str = r#"id, "depositAddressId", "txHash", amount, "amountRaw", confirmations, status::text AS status, "detectedAt" AT TIME ZONE 'UTC' AS "detectedAt", "confirmedAt" AT TIME ZONE 'UTC' AS "confirmedAt""#;
+const DEPOSIT_ADDRESS_COLUMNS: &str = r#"id, network::text AS network, token::text AS token, address, "derivationIndex", "expectedAmount", status::text AS status, "expiresAt" AT TIME ZONE 'UTC' AS "expiresAt", metadata, "apiKeyId", "projectId", "btcReceivedRaw"::text AS "btcReceivedRaw", "watchUntil" AT TIME ZONE 'UTC' AS "watchUntil", "createdAt" AT TIME ZONE 'UTC' AS "createdAt", "updatedAt" AT TIME ZONE 'UTC' AS "updatedAt""#;
+const DEPOSIT_COLUMNS: &str = r#"id, "depositAddressId", "txHash", amount, "amountRaw", confirmations, status::text AS status, late, "detectedAt" AT TIME ZONE 'UTC' AS "detectedAt", "confirmedAt" AT TIME ZONE 'UTC' AS "confirmedAt""#;
+/// The confirmed total of the deposits selected, in base units (text).
+const CONFIRMED_TOTAL: &str = r#"COALESCE(SUM("amountRaw"::numeric), 0)::text"#;
 const WEBHOOK_DELIVERY_COLUMNS: &str = r#"id, "depositId", "depositAddressId", "lightningPaymentId", "withdrawalId", "alertId", "transferId", "eventType", "webhookEndpointId", status::text AS status, attempts, "lastResponse", "lastError", "createdAt" AT TIME ZONE 'UTC' AS "createdAt", "updatedAt" AT TIME ZONE 'UTC' AS "updatedAt""#;
 
 #[derive(Debug, Clone, FromRow)]
@@ -99,6 +103,10 @@ pub struct DepositAddressRow {
     /// (only ever raised). NULL elsewhere.
     #[sqlx(rename = "btcReceivedRaw")]
     pub btc_received_raw: Option<RawAmount>,
+    /// End of the late watch (ADR 0005): a paid or expired address is
+    /// polled until then.
+    #[sqlx(rename = "watchUntil")]
+    pub watch_until: DateTime<Utc>,
     #[sqlx(rename = "createdAt")]
     pub created_at: DateTime<Utc>,
     #[sqlx(rename = "updatedAt")]
@@ -145,10 +153,23 @@ pub struct DepositRow {
     pub amount_raw: String,
     pub confirmations: i32,
     pub status: String,
+    /// First seen once its address had left PENDING (ADR 0005).
+    pub late: bool,
     #[sqlx(rename = "detectedAt")]
     pub detected_at: DateTime<Utc>,
     #[sqlx(rename = "confirmedAt")]
     pub confirmed_at: Option<DateTime<Utc>>,
+}
+
+/// What recording a transfer did (ADR 0005).
+#[derive(Debug, Clone)]
+pub struct RecordedDeposit {
+    pub deposit: DepositRow,
+    /// This call confirmed the deposit (it was detected, or is new).
+    pub newly_confirmed: bool,
+    /// This call set the address PAID: its confirmed total reached the
+    /// expected amount within the tolerance.
+    pub paid: bool,
 }
 
 #[derive(Debug, Clone, FromRow)]
@@ -270,6 +291,7 @@ impl Db {
         derivation_index: i32,
         expected_amount: Decimal,
         expires_at: DateTime<Utc>,
+        watch_until: DateTime<Utc>,
         metadata: Value,
         api_key_id: Option<&str>,
         project_id: Option<&str>,
@@ -279,9 +301,9 @@ impl Db {
         let row = sqlx::query_as::<_, DepositAddressRow>(&format!(
             r#"
             INSERT INTO deposit_addresses
-              (id, network, token, address, "derivationIndex", "expectedAmount", status, "expiresAt", metadata, "createdAt", "updatedAt", "apiKeyId", "projectId")
+              (id, network, token, address, "derivationIndex", "expectedAmount", status, "expiresAt", metadata, "createdAt", "updatedAt", "apiKeyId", "projectId", "watchUntil")
             VALUES
-              ($1, $2::"Network", $3::"Token", $4, $5, $6, 'PENDING'::"DepositAddressStatus", $7, $8, $9, $9, $10, $11)
+              ($1, $2::"Network", $3::"Token", $4, $5, $6, 'PENDING'::"DepositAddressStatus", $7, $8, $9, $9, $10, $11, $12)
             RETURNING {DEPOSIT_ADDRESS_COLUMNS}
             "#
         ))
@@ -296,6 +318,7 @@ impl Db {
         .bind(now)
         .bind(api_key_id)
         .bind(project_id)
+        .bind(watch_until)
         .fetch_one(&self.pool)
         .await?;
         Ok(row)
@@ -421,6 +444,32 @@ impl Db {
         Ok(rows)
     }
 
+    /// The confirmed total of an address in base units, late deposits
+    /// included (ADR 0005); 0 when nothing is confirmed.
+    pub async fn confirmed_total_raw(&self, address_id: &str) -> Result<u128> {
+        Ok(self
+            .confirmed_totals_raw(&[address_id.to_string()])
+            .await?
+            .remove(address_id)
+            .unwrap_or(0))
+    }
+
+    /// `confirmed_total_raw` of several addresses (absent = 0).
+    pub async fn confirmed_totals_raw(&self, address_ids: &[String]) -> Result<HashMap<String, u128>> {
+        if address_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let rows: Vec<(String, RawAmount)> = sqlx::query_as(&format!(
+            r#"SELECT "depositAddressId", {CONFIRMED_TOTAL} FROM deposits
+               WHERE "depositAddressId" = ANY($1) AND status = 'CONFIRMED'::"DepositStatus"
+               GROUP BY "depositAddressId""#
+        ))
+        .bind(address_ids)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(|(id, total)| (id, total.0)).collect())
+    }
+
     /// Transition `network`'s PENDING addresses to EXPIRED once their
     /// deadline is more than `grace_secs` old — unless a DETECTED deposit is
     /// still waiting for its confirmations (then they are held until
@@ -468,16 +517,33 @@ impl Db {
         Ok(rows.into_iter().map(|(id,)| id).collect())
     }
 
-    /// Every PENDING address of `network`, oldest first — deadline passed or
-    /// not: an address is polled until the expiry sweep (which runs right
-    /// after the poll, see `expire_stale_addresses`) has expired it.
-    pub async fn pending_addresses(&self, network: Network) -> Result<Vec<DepositAddressRow>> {
+    /// The addresses the pollers watch on `network` (ADR 0005, the SQL form
+    /// of `domain::is_watched`): every PENDING one — deadline passed or
+    /// not, an address is polled until the expiry sweep (which runs right
+    /// after the poll, see `expire_stale_addresses`) has expired it — then
+    /// the PAID and EXPIRED ones whose late watch is still open or that
+    /// still hold a DETECTED deposit. Never a Lightning invoice once it left
+    /// PENDING (an expired invoice cannot be paid). Open payments first,
+    /// oldest first.
+    pub async fn watched_addresses(&self, network: Network) -> Result<Vec<DepositAddressRow>> {
         let rows = sqlx::query_as::<_, DepositAddressRow>(&format!(
             r#"
-            SELECT {DEPOSIT_ADDRESS_COLUMNS} FROM deposit_addresses
-            WHERE network = $1::"Network"
-              AND status = 'PENDING'::"DepositAddressStatus"
-            ORDER BY "createdAt" ASC
+            SELECT {DEPOSIT_ADDRESS_COLUMNS} FROM deposit_addresses a
+            WHERE a.network = $1::"Network"
+              AND (
+                a.status = 'PENDING'::"DepositAddressStatus"
+                OR (
+                  a.network <> 'LIGHTNING'::"Network"
+                  AND (
+                    a."watchUntil" > (NOW() AT TIME ZONE 'UTC')
+                    OR EXISTS (
+                      SELECT 1 FROM deposits d
+                      WHERE d."depositAddressId" = a.id AND d.status = 'DETECTED'::"DepositStatus"
+                    )
+                  )
+                )
+              )
+            ORDER BY (a.status <> 'PENDING'::"DepositAddressStatus"), a."createdAt" ASC
             "#
         ))
         .bind(network.as_db())
@@ -569,6 +635,15 @@ impl Db {
         Ok(row)
     }
 
+    /// Record a transfer to an address (ADR 0005), under the address row
+    /// lock: a new deposit — `late` when the address had already left
+    /// PENDING — or the progress of a known one. When the call confirms a
+    /// deposit of a PENDING address whose confirmed total now pays it
+    /// (`domain::is_amount_paid`), the address turns PAID in the same
+    /// transaction — the update re-checks PENDING, so exactly one call ever
+    /// pays it. `None` when the transfer is not recorded: no such address, a
+    /// Lightning invoice no longer pending, a new transfer after the watch
+    /// (`domain::admit_transfer`).
     #[allow(clippy::too_many_arguments)]
     pub async fn upsert_deposit_and_maybe_pay(
         &self,
@@ -578,9 +653,29 @@ impl Db {
         amount_raw: &str,
         confirmations: i32,
         status: DepositStatus,
-        mark_paid: bool,
-    ) -> Result<DepositRow> {
+        tolerance_percent: f64,
+    ) -> Result<Option<RecordedDeposit>> {
         let mut tx = self.pool.begin().await?;
+
+        // The address first, then its deposit: every writer of both takes
+        // them in this order.
+        let address: Option<(String, String, String, Decimal, bool)> = sqlx::query_as(
+            r#"
+            SELECT status::text, network::text, token::text, "expectedAmount",
+                   "watchUntil" > (NOW() AT TIME ZONE 'UTC')
+            FROM deposit_addresses WHERE id = $1
+            FOR UPDATE
+            "#,
+        )
+        .bind(deposit_address_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some((address_status, network, token, expected_amount, watch_open)) = address else {
+            return Ok(None);
+        };
+        let address_status = DepositAddressStatus::from_db(&address_status)?;
+        let network = Network::from_db(&network)?;
+        let token = Token::from_db(&token)?;
 
         let existing = sqlx::query_as::<_, DepositRow>(&format!(
             r#"SELECT {DEPOSIT_COLUMNS} FROM deposits WHERE "depositAddressId" = $1 AND "txHash" = $2 FOR UPDATE"#
@@ -590,115 +685,145 @@ impl Db {
         .fetch_optional(&mut *tx)
         .await?;
 
-        let deposit = if let Some(existing) = existing {
-            let confirmed_at = if status == DepositStatus::Confirmed {
-                Some(Utc::now())
-            } else {
-                existing.confirmed_at
-            };
-            sqlx::query_as::<_, DepositRow>(&format!(
-                r#"
-                UPDATE deposits
-                SET confirmations = $2,
-                    status = $3::"DepositStatus",
-                    "confirmedAt" = $4
-                WHERE id = $1
-                RETURNING {DEPOSIT_COLUMNS}
-                "#
-            ))
-            .bind(&existing.id)
-            .bind(confirmations)
-            .bind(status.as_db())
-            .bind(confirmed_at)
-            .fetch_one(&mut *tx)
-            .await?
-        } else {
-            let id = Uuid::new_v4().to_string();
-            let confirmed_at = if status == DepositStatus::Confirmed {
-                Some(Utc::now())
-            } else {
-                None
-            };
-            sqlx::query_as::<_, DepositRow>(&format!(
-                r#"
-                INSERT INTO deposits
-                  (id, "depositAddressId", "txHash", amount, "amountRaw", confirmations, status, "detectedAt", "confirmedAt")
-                VALUES
-                  ($1, $2, $3, $4, $5, $6, $7::"DepositStatus", NOW(), $8)
-                RETURNING {DEPOSIT_COLUMNS}
-                "#
-            ))
-            .bind(&id)
-            .bind(deposit_address_id)
-            .bind(tx_hash)
-            .bind(amount)
-            .bind(amount_raw)
-            .bind(confirmations)
-            .bind(status.as_db())
-            .bind(confirmed_at)
-            .fetch_one(&mut *tx)
-            .await?
+        let confirmed_at = (status == DepositStatus::Confirmed).then(Utc::now);
+        let deposit = match existing {
+            Some(existing) if existing.status == DepositStatus::Confirmed.as_db() => {
+                return Ok(Some(RecordedDeposit { deposit: existing, newly_confirmed: false, paid: false }));
+            }
+            Some(existing) => {
+                sqlx::query_as::<_, DepositRow>(&format!(
+                    r#"
+                    UPDATE deposits
+                    SET confirmations = $2,
+                        status = $3::"DepositStatus",
+                        "confirmedAt" = $4
+                    WHERE id = $1
+                    RETURNING {DEPOSIT_COLUMNS}
+                    "#
+                ))
+                .bind(&existing.id)
+                .bind(confirmations)
+                .bind(status.as_db())
+                .bind(confirmed_at.or(existing.confirmed_at))
+                .fetch_one(&mut *tx)
+                .await?
+            }
+            None => {
+                let TransferAdmission::Record { late } = admit_transfer(network, address_status, watch_open) else {
+                    return Ok(None);
+                };
+                sqlx::query_as::<_, DepositRow>(&format!(
+                    r#"
+                    INSERT INTO deposits
+                      (id, "depositAddressId", "txHash", amount, "amountRaw", confirmations, status, "detectedAt", "confirmedAt", late)
+                    VALUES
+                      ($1, $2, $3, $4, $5, $6, $7::"DepositStatus", NOW(), $8, $9)
+                    RETURNING {DEPOSIT_COLUMNS}
+                    "#
+                ))
+                .bind(Uuid::new_v4().to_string())
+                .bind(deposit_address_id)
+                .bind(tx_hash)
+                .bind(amount)
+                .bind(amount_raw)
+                .bind(confirmations)
+                .bind(status.as_db())
+                .bind(confirmed_at)
+                .bind(late)
+                .fetch_one(&mut *tx)
+                .await?
+            }
         };
 
-        if mark_paid {
-            sqlx::query(
-                r#"
-                UPDATE deposit_addresses
-                SET status = 'PAID'::"DepositAddressStatus", "updatedAt" = NOW()
-                WHERE id = $1
-                "#,
-            )
+        let newly_confirmed = status == DepositStatus::Confirmed;
+        let mut paid = false;
+        if newly_confirmed && address_status == DepositAddressStatus::Pending {
+            let (total,): (RawAmount,) = sqlx::query_as(&format!(
+                r#"SELECT {CONFIRMED_TOTAL} FROM deposits
+                   WHERE "depositAddressId" = $1 AND status = 'CONFIRMED'::"DepositStatus""#
+            ))
             .bind(deposit_address_id)
-            .execute(&mut *tx)
+            .fetch_one(&mut *tx)
             .await?;
+            let expected_raw: u128 = decimal_to_raw(expected_amount, token)
+                .parse()
+                .context("expected amount out of range")?;
+            if is_amount_paid(total.0, expected_raw, tolerance_percent) {
+                paid = sqlx::query(
+                    r#"
+                    UPDATE deposit_addresses
+                    SET status = 'PAID'::"DepositAddressStatus", "updatedAt" = NOW()
+                    WHERE id = $1 AND status = 'PENDING'::"DepositAddressStatus"
+                    "#,
+                )
+                .bind(deposit_address_id)
+                .execute(&mut *tx)
+                .await?
+                .rows_affected()
+                    == 1;
+            }
         }
 
         tx.commit().await?;
-        Ok(deposit)
+        Ok(Some(RecordedDeposit { deposit, newly_confirmed, paid }))
     }
 
-    pub async fn has_delivered_webhook(&self, deposit_id: &str, endpoint_id: &str) -> Result<bool> {
-        let row: Option<(i64,)> = sqlx::query_as(
+    /// Whether the `event` delivery of a deposit (PAID or LATE) towards an
+    /// endpoint was delivered.
+    pub async fn has_delivered_deposit_webhook(
+        &self,
+        event: WebhookEventType,
+        deposit_id: &str,
+        endpoint_id: &str,
+    ) -> Result<bool> {
+        let (delivered,): (bool,) = sqlx::query_as(
             r#"
-            SELECT COUNT(*) FROM webhook_deliveries
-            WHERE "depositId" = $1
-              AND "webhookEndpointId" = $2
-              AND status = 'DELIVERED'::"WebhookDeliveryStatus"
+            SELECT EXISTS (
+              SELECT 1 FROM webhook_deliveries
+              WHERE "depositId" = $1 AND "eventType" = $2 AND "webhookEndpointId" = $3
+                AND status = 'DELIVERED'::"WebhookDeliveryStatus"
+            )
             "#,
         )
         .bind(deposit_id)
+        .bind(event.as_db())
         .bind(endpoint_id)
-        .fetch_optional(&self.pool)
+        .fetch_one(&self.pool)
         .await?;
-        Ok(row.map(|(c,)| c > 0).unwrap_or(false))
+        Ok(delivered)
     }
 
-    pub async fn get_or_create_webhook_delivery(
+    /// Get-or-create for a delivery about a deposit (PAID, LATE), keyed on
+    /// (deposit, event, endpoint).
+    pub async fn get_or_create_deposit_webhook_delivery(
         &self,
+        event: WebhookEventType,
         deposit_id: &str,
         endpoint_id: &str,
     ) -> Result<WebhookDeliveryRow> {
-        if let Some(row) = self.find_webhook_delivery(deposit_id, endpoint_id).await? {
+        if let Some(row) = self.find_deposit_webhook_delivery(event, deposit_id, endpoint_id).await? {
             return Ok(row);
         }
-        self.insert_paid_webhook_delivery(deposit_id, endpoint_id).await
+        self.insert_deposit_webhook_delivery(event, deposit_id, endpoint_id).await
     }
 
-    /// New PAID delivery row; `depositAddressId` is resolved from the deposit.
-    /// A concurrent insert of the same key (unique index) yields the row
-    /// that won instead of a duplicate.
-    async fn insert_paid_webhook_delivery(
+    /// New deposit delivery row; `depositAddressId` is resolved from the
+    /// deposit. A concurrent insert of the same key (unique index) yields
+    /// the row that won instead of a duplicate.
+    async fn insert_deposit_webhook_delivery(
         &self,
+        event: WebhookEventType,
         deposit_id: &str,
         endpoint_id: &str,
     ) -> Result<WebhookDeliveryRow> {
+        deposit_subject(event)?;
         let id = Uuid::new_v4().to_string();
         let now = Utc::now();
         let inserted = sqlx::query_as::<_, WebhookDeliveryRow>(&format!(
             r#"
             INSERT INTO webhook_deliveries
               (id, "depositId", "depositAddressId", "eventType", "webhookEndpointId", status, attempts, "createdAt", "updatedAt")
-            SELECT $1, d.id, d."depositAddressId", 'PAID', $3, 'PENDING'::"WebhookDeliveryStatus", 0, $4, $4
+            SELECT $1, d.id, d."depositAddressId", $5, $3, 'PENDING'::"WebhookDeliveryStatus", 0, $4, $4
             FROM deposits d WHERE d.id = $2
             ON CONFLICT DO NOTHING
             RETURNING {WEBHOOK_DELIVERY_COLUMNS}
@@ -708,12 +833,13 @@ impl Db {
         .bind(deposit_id)
         .bind(endpoint_id)
         .bind(now)
+        .bind(event.as_db())
         .fetch_optional(&self.pool)
         .await?;
         match inserted {
             Some(row) => Ok(row),
             None => self
-                .find_webhook_delivery(deposit_id, endpoint_id)
+                .find_deposit_webhook_delivery(event, deposit_id, endpoint_id)
                 .await?
                 .with_context(|| format!("No delivery row for deposit {deposit_id}")),
         }
@@ -851,7 +977,8 @@ impl Db {
 
     /// Get-or-create for a delivery keyed on (subject, event, endpoint),
     /// the subject column following `event.subject()` — every event but
-    /// PAID (keyed on its deposit, see `get_or_create_webhook_delivery`).
+    /// PAID and LATE (keyed on their deposit, see
+    /// `get_or_create_deposit_webhook_delivery`).
     pub async fn get_or_create_subject_webhook_delivery(
         &self,
         event: WebhookEventType,
@@ -946,18 +1073,22 @@ impl Db {
         Ok(row)
     }
 
-    /// Most recent `webhook_deliveries` row for a (deposit, endpoint) pair.
-    /// There is no UNIQUE constraint, so several rows may exist; the newest
-    /// one is the authoritative one. Legacy rows (NULL endpoint) are excluded.
-    pub async fn find_webhook_delivery(
+    /// Most recent delivery row of a deposit's `event` (PAID, LATE) towards
+    /// an endpoint. The newest row is the authoritative one; legacy rows
+    /// (NULL endpoint) are excluded.
+    pub async fn find_deposit_webhook_delivery(
         &self,
+        event: WebhookEventType,
         deposit_id: &str,
         endpoint_id: &str,
     ) -> Result<Option<WebhookDeliveryRow>> {
         let row = sqlx::query_as::<_, WebhookDeliveryRow>(&format!(
-            r#"SELECT {WEBHOOK_DELIVERY_COLUMNS} FROM webhook_deliveries WHERE "depositId" = $1 AND "webhookEndpointId" = $2 ORDER BY "createdAt" DESC LIMIT 1"#
+            r#"SELECT {WEBHOOK_DELIVERY_COLUMNS} FROM webhook_deliveries
+               WHERE "depositId" = $1 AND "eventType" = $2 AND "webhookEndpointId" = $3
+               ORDER BY "createdAt" DESC LIMIT 1"#
         ))
         .bind(deposit_id)
+        .bind(event.as_db())
         .bind(endpoint_id)
         .fetch_optional(&self.pool)
         .await?;
@@ -982,15 +1113,16 @@ impl Db {
         Ok(rows)
     }
 
-    /// Reset the most recent delivery row of a (deposit, endpoint) pair to
-    /// PENDING / 0 attempts (creating it if none exists) so a manual
+    /// Reset the most recent `event` delivery row of a (deposit, endpoint)
+    /// pair to PENDING / 0 attempts (creating it if none exists) so a manual
     /// retrigger restarts a full retry cycle. Older rows are left untouched.
-    pub async fn reset_webhook_delivery(
+    pub async fn reset_deposit_webhook_delivery(
         &self,
+        event: WebhookEventType,
         deposit_id: &str,
         endpoint_id: &str,
     ) -> Result<WebhookDeliveryRow> {
-        if let Some(existing) = self.find_webhook_delivery(deposit_id, endpoint_id).await? {
+        if let Some(existing) = self.find_deposit_webhook_delivery(event, deposit_id, endpoint_id).await? {
             let row = sqlx::query_as::<_, WebhookDeliveryRow>(&format!(
                 r#"
                 UPDATE webhook_deliveries
@@ -1009,12 +1141,12 @@ impl Db {
             return Ok(row);
         }
 
-        self.insert_paid_webhook_delivery(deposit_id, endpoint_id).await
+        self.insert_deposit_webhook_delivery(event, deposit_id, endpoint_id).await
     }
 
-    /// Authoritative PAID deliveries of `deposit_id` (newest per endpoint)
-    /// that ended FAILED — what a merchant may re-queue.
-    pub async fn failed_paid_deliveries(&self, deposit_id: &str) -> Result<Vec<WebhookDeliveryRow>> {
+    /// Authoritative deliveries of `deposit_id` (PAID or LATE, newest per
+    /// endpoint) that ended FAILED — what a merchant may re-queue.
+    pub async fn failed_deposit_deliveries(&self, deposit_id: &str) -> Result<Vec<WebhookDeliveryRow>> {
         let rows = sqlx::query_as::<_, WebhookDeliveryRow>(&format!(
             r#"
             SELECT * FROM (
@@ -1092,6 +1224,14 @@ fn subject_column(event: WebhookEventType) -> Result<&'static str> {
         WebhookSubject::Withdrawal => "withdrawalId",
         WebhookSubject::Alert => "alertId",
         WebhookSubject::Transfer => "transferId",
-        WebhookSubject::Deposit => anyhow::bail!("PAID deliveries are keyed on their deposit"),
+        WebhookSubject::Deposit => anyhow::bail!("PAID and LATE deliveries are keyed on their deposit"),
     })
+}
+
+/// Deposit deliveries are PAID and LATE only.
+fn deposit_subject(event: WebhookEventType) -> Result<()> {
+    if event.subject() != WebhookSubject::Deposit {
+        anyhow::bail!("{} deliveries are not keyed on a deposit", event.as_api());
+    }
+    Ok(())
 }

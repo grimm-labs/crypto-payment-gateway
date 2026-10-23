@@ -311,8 +311,10 @@ impl WebhookDeliveryStatus {
 }
 
 /// Event a webhook endpoint can subscribe to. Address lifecycle events mirror
-/// `DepositAddressStatus`: PENDING fires at address creation, PAID at deposit
-/// confirmation, EXPIRED when the address expires unpaid. Payout events
+/// `DepositAddressStatus`: PENDING fires at address creation, PAID when the
+/// confirmed total of the address pays it, EXPIRED when the address expires
+/// unpaid; LATE when a late deposit (first seen once the address had left
+/// PENDING, ADR 0005) is confirmed. Payout events
 /// report the final outcome of Lightning wallet sends the gateway did not
 /// make as a withdrawal; withdrawal events follow a withdrawal's lifecycle;
 /// alert events report operational conditions (gas, caps, address book,
@@ -322,6 +324,9 @@ pub enum WebhookEventType {
     Pending,
     Paid,
     Expired,
+    /// A late deposit was confirmed: money arrived on an address already
+    /// paid or expired, within its late watch (ADR 0005).
+    Late,
     PayoutSucceeded,
     PayoutFailed,
     WithdrawalPendingApproval,
@@ -343,7 +348,7 @@ pub enum WebhookEventType {
 /// column holds its subject id.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WebhookSubject {
-    /// `deposits.id` (PAID).
+    /// `deposits.id` (PAID, LATE).
     Deposit,
     /// `deposit_addresses.id` (PENDING / EXPIRED).
     DepositAddress,
@@ -358,10 +363,11 @@ pub enum WebhookSubject {
 }
 
 impl WebhookEventType {
-    pub const ALL: [Self; 16] = [
+    pub const ALL: [Self; 17] = [
         Self::Pending,
         Self::Paid,
         Self::Expired,
+        Self::Late,
         Self::PayoutSucceeded,
         Self::PayoutFailed,
         Self::WithdrawalPendingApproval,
@@ -382,6 +388,7 @@ impl WebhookEventType {
             Self::Pending => "PENDING",
             Self::Paid => "PAID",
             Self::Expired => "EXPIRED",
+            Self::Late => "LATE",
             Self::PayoutSucceeded => "PAYOUT_SUCCEEDED",
             Self::PayoutFailed => "PAYOUT_FAILED",
             Self::WithdrawalPendingApproval => "WITHDRAWAL_PENDING_APPROVAL",
@@ -403,6 +410,7 @@ impl WebhookEventType {
             Self::Pending => "pending",
             Self::Paid => "paid",
             Self::Expired => "expired",
+            Self::Late => "late",
             Self::PayoutSucceeded => "payout_succeeded",
             Self::PayoutFailed => "payout_failed",
             Self::WithdrawalPendingApproval => "withdrawal_pending_approval",
@@ -426,13 +434,14 @@ impl WebhookEventType {
             Self::Pending => "payment_pending",
             Self::Paid => "deposit_confirmed",
             Self::Expired => "payment_expired",
+            Self::Late => "deposit_late",
             other => other.as_api(),
         }
     }
 
     pub fn subject(&self) -> WebhookSubject {
         match self {
-            Self::Paid => WebhookSubject::Deposit,
+            Self::Paid | Self::Late => WebhookSubject::Deposit,
             Self::Pending | Self::Expired => WebhookSubject::DepositAddress,
             Self::PayoutSucceeded | Self::PayoutFailed => WebhookSubject::LightningPayment,
             Self::WithdrawalPendingApproval
@@ -865,26 +874,59 @@ pub fn parse_sats(value: &str) -> Result<u64, DomainError> {
     Ok(sats)
 }
 
-pub fn is_amount_within_tolerance(
-    actual: &str,
-    expected: &str,
-    tolerance_percent: f64,
-) -> bool {
-    let Ok(actual_value) = actual.parse::<Decimal>() else {
-        return false;
-    };
-    let Ok(expected_value) = expected.parse::<Decimal>() else {
-        return false;
-    };
+/// Parts per million of the expected amount in one percent.
+const PPM_PER_PERCENT: f64 = 10_000.0;
+const PPM: u128 = 1_000_000;
 
-    let tolerance_ratio = Decimal::try_from(tolerance_percent / 100.0).unwrap_or(Decimal::ZERO);
-    let tolerance = expected_value * tolerance_ratio;
-    let diff = if actual_value > expected_value {
-        actual_value - expected_value
-    } else {
-        expected_value - actual_value
+/// Whether a confirmed total of `received_raw` base units pays a payment of
+/// `expected_raw` (ADR 0005): at least `100 − tolerance_percent` % of it.
+/// There is no upper bound — an overpayment pays. Integer arithmetic on base
+/// units; the tolerance (0–5 %, checked at boot) is read to the millionth.
+pub fn is_amount_paid(received_raw: u128, expected_raw: u128, tolerance_percent: f64) -> bool {
+    let tolerance_ppm = (tolerance_percent.clamp(0.0, 100.0) * PPM_PER_PERCENT).round() as u128;
+    let Some(floor) = expected_raw.checked_mul(PPM - tolerance_ppm.min(PPM)) else {
+        // Beyond any amount the API accepts: never paid.
+        return false;
     };
-    diff <= tolerance
+    match received_raw.checked_mul(PPM) {
+        Some(received) => received >= floor,
+        // A total too large to scale is above any representable floor.
+        None => true,
+    }
+}
+
+/// How a transfer the gateway has not recorded yet is handled (ADR 0005).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransferAdmission {
+    /// Recorded as a deposit of the address; `late` when the address had
+    /// already left PENDING (it never changes the address's status).
+    Record { late: bool },
+    /// Not recorded: a Lightning invoice is paid once and never late, and a
+    /// transfer seen after the late watch is left to the sweeps
+    /// (unattributed funds).
+    Ignore,
+}
+
+/// The rule for a new transfer to an address in `status`; `watch_open`:
+/// its late watch (`watchUntil`) is still ahead. A deposit already recorded
+/// is always followed to its confirmations, whatever this says.
+pub fn admit_transfer(network: Network, status: DepositAddressStatus, watch_open: bool) -> TransferAdmission {
+    match status {
+        DepositAddressStatus::Pending => TransferAdmission::Record { late: false },
+        _ if network == Network::Lightning || !watch_open => TransferAdmission::Ignore,
+        _ => TransferAdmission::Record { late: true },
+    }
+}
+
+/// Whether the pollers watch an address (`Db::watched_addresses` is the SQL
+/// form of this rule): every PENDING one; a PAID or EXPIRED one while its
+/// late watch is open or a deposit of it still confirms — never a Lightning
+/// invoice once it left PENDING (an expired invoice cannot be paid).
+pub fn is_watched(network: Network, status: DepositAddressStatus, watch_open: bool, has_detected: bool) -> bool {
+    match status {
+        DepositAddressStatus::Pending => true,
+        _ => network != Network::Lightning && (watch_open || has_detected),
+    }
 }
 
 pub fn required_confirmations(network: Network, tron: i32, eth: i32, btc: i32) -> i32 {
@@ -991,10 +1033,67 @@ mod tests {
     }
 
     #[test]
-    fn amount_within_tolerance() {
-        assert!(is_amount_within_tolerance("25", "25.00", 1.0));
-        assert!(is_amount_within_tolerance("25.20", "25.00", 1.0));
-        assert!(!is_amount_within_tolerance("26", "25.00", 1.0));
+    fn a_payment_is_paid_from_99_percent_without_upper_bound() {
+        // USDT, 6 decimals: 8.57 expected.
+        let expected = 8_570_000;
+        assert!(is_amount_paid(8_484_300, expected, 1.0), "99 % pays");
+        assert!(!is_amount_paid(8_484_299, expected, 1.0), "just under 99 % does not");
+        assert!(!is_amount_paid(8_483_443, expected, 1.0), "98.99 % does not");
+        assert!(is_amount_paid(12_855_000, expected, 1.0), "150 % pays");
+        assert!(is_amount_paid(expected, expected, 0.0));
+        assert!(!is_amount_paid(expected - 1, expected, 0.0));
+        assert!(!is_amount_paid(0, expected, 1.0));
+        // BTC, 8 decimals (sats): 10 504 expected.
+        assert!(is_amount_paid(10_399, 10_504, 1.0));
+        assert!(!is_amount_paid(10_398, 10_504, 1.0));
+        assert!(is_amount_paid(1_000_000_000, 10_504, 1.0));
+        // Fractional tolerances are exact to the millionth.
+        assert!(is_amount_paid(99_500, 100_000, 0.5));
+        assert!(!is_amount_paid(99_499, 100_000, 0.5));
+        // Wei-sized totals never overflow.
+        assert!(is_amount_paid(u128::MAX, 10u128.pow(23), 1.0));
+        assert!(!is_amount_paid(1, u128::MAX, 1.0));
+    }
+
+    #[test]
+    fn two_transfers_add_up_to_the_payment() {
+        let expected = 8_570_000;
+        assert!(!is_amount_paid(5_000_000, expected, 1.0));
+        assert!(is_amount_paid(5_000_000 + 3_570_000, expected, 1.0));
+    }
+
+    #[test]
+    fn late_transfers_are_flagged_and_never_on_lightning() {
+        use DepositAddressStatus::{Expired, Paid, Pending};
+        for network in Network::ALL {
+            assert_eq!(admit_transfer(network, Pending, false), TransferAdmission::Record { late: false });
+            assert_eq!(admit_transfer(network, Pending, true), TransferAdmission::Record { late: false });
+        }
+        for status in [Paid, Expired] {
+            assert_eq!(admit_transfer(Network::Tron, status, true), TransferAdmission::Record { late: true });
+            assert_eq!(admit_transfer(Network::Bitcoin, status, true), TransferAdmission::Record { late: true });
+            // After the watch, a new transfer is left to the sweeps.
+            assert_eq!(admit_transfer(Network::Tron, status, false), TransferAdmission::Ignore);
+            // An invoice is paid once.
+            assert_eq!(admit_transfer(Network::Lightning, status, true), TransferAdmission::Ignore);
+        }
+    }
+
+    #[test]
+    fn watched_addresses_follow_the_late_watch() {
+        use DepositAddressStatus::{Expired, Paid, Pending};
+        assert!(is_watched(Network::Tron, Pending, false, false));
+        assert!(is_watched(Network::Lightning, Pending, false, false));
+        // An expired address until its watch ends…
+        assert!(is_watched(Network::Tron, Expired, true, false));
+        assert!(!is_watched(Network::Tron, Expired, false, false));
+        // …and after it while a deposit still confirms.
+        assert!(is_watched(Network::Bitcoin, Expired, false, true));
+        assert!(is_watched(Network::Ethereum, Paid, false, true));
+        assert!(is_watched(Network::Solana, Paid, true, false));
+        for status in [Paid, Expired] {
+            assert!(!is_watched(Network::Lightning, status, true, true));
+        }
     }
 
     #[test]
@@ -1343,7 +1442,7 @@ mod tests {
         );
         assert_eq!(WebhookEventType::PayoutFailed.payload_event_type(), "payout_failed");
         assert!(WebhookEventType::from_db("payout_failed").is_err());
-        assert_eq!(WebhookEventType::ALL.len(), 16);
+        assert_eq!(WebhookEventType::ALL.len(), 17);
     }
 
     #[test]
@@ -1398,6 +1497,18 @@ mod tests {
         }
         // The historical names are untouched.
         assert_eq!(WebhookEventType::Paid.payload_event_type(), "deposit_confirmed");
+    }
+
+    #[test]
+    fn late_deposits_have_their_own_event_on_the_deposit() {
+        let late = WebhookEventType::Late;
+        assert_eq!(late.as_db(), "LATE");
+        assert_eq!(late.as_api(), "late");
+        assert_eq!(late.payload_event_type(), "deposit_late");
+        assert_eq!(late.subject(), WebhookSubject::Deposit);
+        assert_eq!(WebhookEventType::parse_api("late").unwrap(), late);
+        assert_eq!(WebhookEventType::from_db("LATE").unwrap(), late);
+        assert!(!late.is_payout());
     }
 
     #[test]
