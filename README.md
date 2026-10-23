@@ -300,13 +300,17 @@ may still count. Lightning is unaffected (a fixed-amount invoice).
 
 **The late watch.** A `paid` or `expired` address is still polled until `watch_until`
 (`expires_at` + `LATE_WATCH_HOURS`, 24 h by default, `0` turns the watch off), and after it
-while one of its deposits is still `detected`. A transfer first seen once the address left
+while one of its deposits is still `detected` — for 24 more hours at most
+(`DETECTED_DEPOSIT_HOLD_SECS`): a replaced or dropped transaction never confirms, and such a
+stuck deposit no longer keeps the address watched nor blocks its sweep. Payments created
+before the late watch existed keep none. A transfer first seen once the address left
 `pending` is a **late deposit** (`deposits[].late: true`): it is followed to its
 confirmations, counts in `received_amount` and in the project balance like any deposit, is
 swept like any other, and **never changes the address's status** — an expired payment stays
 `expired` even when a late transfer completes it; the receiver decides (Kivoo pays the order
-when the late total reaches 99 %). Its confirmation fires the `late` webhook
-(`deposit_late`). A transfer seen after the watch is not recorded: it is left to the sweeps as
+when the late total reaches 99 %). The `late` webhook (`deposit_late`) fires when a deposit
+is confirmed once its address has left `pending`: a late deposit, or one detected earlier
+that confirms after another transfer paid the address or after it expired. A transfer seen after the watch is not recorded: it is left to the sweeps as
 unattributed funds. Lightning is unchanged: an invoice is paid once, for its amount, and is
 never watched once paid or expired (an expired invoice cannot be paid). The gateway's own gas
 top-ups to a deposit address are never recorded as deposits.
@@ -314,9 +318,11 @@ top-ups to a deposit address are never recorded as deposits.
 **Polling cost.** Each monitor pass reads one provider call per watched address with a
 300 ms pause between addresses (`ADDRESS_REQUEST_DELAY_MS`), so a 10-second cycle carries
 about 33 addresses per network; beyond that the passes run back to back (300 watched
-addresses ≈ 1.5 min per pass, 1 000 ≈ 5 min) and detection slows accordingly. The watched set
-is the open payments plus those of the last `LATE_WATCH_HOURS` past their deadline; open
-payments are polled first.
+addresses ≈ 1.5 min per pass, 1 000 ≈ 5 min) and detection slows accordingly. Open payments
+are polled every pass (`POLLING_INTERVAL_SECONDS`, 10 s), first; the addresses in their late
+watch — paid and expired payments of the last `LATE_WATCH_HOURS` past their deadline, about
+48 times as many with a one-hour expiry — only every `LATE_WATCH_POLL_SECONDS` (300 s), so a
+late deposit is seen and confirmed within ~5 minutes and open payments keep their cadence.
 
 ### List deposit addresses
 
@@ -367,6 +373,10 @@ curl http://localhost:3000/api/v1/deposit-addresses/<id>
 ```
 
 `deposits[].late` is `true` for a transfer first seen once the address had left `pending`.
+A manual replay of a deposit's webhook (dashboard, merchant retry) sends the event its
+confirmation fired — `paid` for the transfer that paid the address only, `late` for one
+confirmed once the address had left `pending` — and refuses (`409`) a deposit that fired none
+(a partial transfer).
 Each entry in the returned `deposits[]` includes a `webhook` object with the delivery state (`status`: `pending` / `delivered` / `failed`, `attempts`, `last_response`, `updated_at`), or `null` if no delivery was attempted yet. Endpoint URLs and delivery errors are admin data: they only appear on the dashboard (`/api/admin/v1`), never on `/api/v1`.
 
 ### Retry a webhook delivery
@@ -679,7 +689,8 @@ Internal transfer payload (`from` / `to`: `{ "type": "project", "id": "uuid" }` 
 Payload of `paid` (historical shape plus `project_id`, `expected_amount_raw` and
 `received_amount_raw`): `amount` / `tx_hash` / `confirmations` are those of the transfer whose
 confirmation paid the address; `received_amount_raw` is the confirmed total of the address
-when the webhook is sent. It fires once per payment.
+when the event happened (stored with the delivery: every retry of an `event_id` sends the same
+body). It fires once per payment.
 
 ```json
 {
@@ -701,8 +712,8 @@ when the webhook is sent. It fires once per payment.
 }
 ```
 
-Payload of `late` (`deposit_late`): the `paid` payload of the late transfer plus
-`address_status` (`paid` or `expired`, which a late deposit never changes):
+Payload of `late` (`deposit_late`): the `paid` payload of the transfer confirmed after its
+address left `pending` plus `address_status` (`paid` or `expired`, which it never changes):
 
 ```json
 {
@@ -964,6 +975,7 @@ To report a vulnerability, use [GitHub Security Advisories](https://github.com/n
 | `BREEZ_STORAGE_DIR` | No | `./.breez-data` | Breez SDK local storage (SQLite), resolved to an absolute path at startup. Must persist across restarts (docker compose mounts the `breez_data` volume) |
 | `OUTFLOWS_FROZEN` | No | `false` | `true` forces the [outflow freeze](#treasury-sweeps--withdrawals-operator-runbook): no withdrawal, sweep or gas top-up leaves the gateway, and the dashboard cannot lift it while set |
 | `LATE_WATCH_HOURS` | No | `24` | Hours a paid or expired payment stays watched past its deadline, for [late deposits](#payments-the-total-of-their-transfers) (0–72; `0` turns the watch off) |
+| `LATE_WATCH_POLL_SECONDS` | No | `300` | Seconds between two polls of the payments in their late watch (1–3600); open payments keep `POLLING_INTERVAL_SECONDS` |
 | `CHAIN_MODE` | No | `mainnet` | `testnet` (refused with `APP_ENV=production`) moves every network to its test chain — see [Testnet mode](#testnet-mode) |
 | `TESTNET_USDT_ETH_CONTRACT`, `TESTNET_USDT_TRON_CONTRACT`, `TESTNET_USDT_SOLANA_MINT` | With `CHAIN_MODE=testnet` | — | Test tokens standing in for USDT |
 

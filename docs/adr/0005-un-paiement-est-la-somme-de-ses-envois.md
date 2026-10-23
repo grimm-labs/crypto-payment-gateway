@@ -14,7 +14,7 @@ Payers send from exchanges that take their fee off the amount, wallets that roun
 ## Consequences
 
 - The ledger counts every recorded deposit, late ones included: what used to become unattributed funds at the sweep is now credited to the project. Only transfers seen after the watch, or of another token, remain unattributed.
-- Polling grows with the watched set: the open payments plus those of the last 24 hours past their deadline (open payments first). With the 300 ms pause per address, a 10-second cycle carries about 33 addresses per network; beyond that cycles run back to back and detection slows.
+- Polling grows with the watched set: the open payments plus those of the last 24 hours past their deadline. Open payments are polled every cycle and first, the addresses in their late watch only every 5 minutes (`LATE_WATCH_POLL_SECONDS`); with the 300 ms pause per address, a 10-second cycle carries about 33 addresses per network. A deposit still detected keeps its address watched for 24 hours past the watch at most.
 - A receiver must read `received_amount_raw` and the status rather than count `deposit_confirmed` webhooks: `paid` fires once per payment, not once per transfer, and a partial transfer fires nothing.
 - A gateway gas top-up reaching a watched deposit address (a sweep of another token) is the gateway's own money and is never recorded as a deposit.
 - Adding up every transfer makes funds already on the address count too (a restored derivation counter, a reused seed, unswept Bitcoin): a transfer whose block is more than 10 minutes older than the payment's creation is never one of its deposits; an unconfirmed one always is.

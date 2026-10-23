@@ -668,8 +668,8 @@ pub enum RetriggerError {
     /// No FAILED delivery to replay (merchant replays never resend a
     /// delivered webhook).
     NothingToRetry,
-    /// A confirmed deposit that notifies nothing: neither late nor part of
-    /// a paid address (a partial payment that expired, ADR 0005).
+    /// A confirmed deposit whose confirmation fired no event (a partial
+    /// transfer, ADR 0005), or not the event asked for.
     NoDepositEvent,
     Other(anyhow::Error),
 }
@@ -680,42 +680,38 @@ impl From<anyhow::Error> for RetriggerError {
     }
 }
 
-/// The event a confirmed deposit notifies on a replay (ADR 0005): `late`
-/// for a late deposit, `paid` for a deposit of a paid address — never a
-/// `deposit_confirmed` for a partial payment that expired. `None` for a
-/// deposit whose address is gone.
-async fn deposit_replay_event(state: &AppState, deposit: &db::DepositRow) -> Result<Option<WebhookEventType>> {
-    if deposit.late {
-        return Ok(Some(WebhookEventType::Late));
-    }
-    let Some(address) = state.db.find_deposit_address(&deposit.deposit_address_id).await? else {
-        return Ok(None);
-    };
-    Ok((address.status == DepositAddressStatus::Paid.as_db()).then_some(WebhookEventType::Paid))
+/// The event a deposit's confirmation fired (`deposits."webhookEvent"`):
+/// `paid` for the deposit that paid its address — only that one —, `late`
+/// for one confirmed once its address had left PENDING, none for a partial
+/// transfer. A replay sends that event and nothing else.
+pub fn deposit_replay_event(deposit: &db::DepositRow) -> Option<WebhookEventType> {
+    deposit
+        .webhook_event
+        .as_deref()
+        .and_then(|event| WebhookEventType::from_db(event).ok())
+        .filter(|event| event.subject() == WebhookSubject::Deposit)
 }
 
 /// Manual replay for the dashboard: for every active endpoint of the
-/// deposit's owner subscribed to its event (`paid`, or `late` for a late
-/// deposit), reset the delivery row to PENDING / 0 attempts, then schedule
-/// an immediate attempt. Never touches `deposits` or `deposit_addresses`.
+/// deposit's owner subscribed to the event its confirmation fired
+/// (`deposit_replay_event`; none → `NoDepositEvent`), reset the delivery
+/// row to PENDING / 0 attempts, then schedule an immediate attempt. Never
+/// touches `deposits` or `deposit_addresses`.
 pub async fn retrigger_webhook(state: &AppState, deposit_id: &str) -> Result<(), RetriggerError> {
     let deposit = state
         .db
         .find_deposit(deposit_id)
         .await?
         .ok_or(RetriggerError::DepositNotFound)?;
-    let event = if deposit.late { WebhookEventType::Late } else { WebhookEventType::Paid };
+    if deposit.status != DepositStatus::Confirmed.as_db() {
+        return Err(RetriggerError::DepositNotConfirmed);
+    }
+    let event = deposit_replay_event(&deposit).ok_or(RetriggerError::NoDepositEvent)?;
     let endpoints = webhooks::endpoints_for_subject(state, event, &deposit.id)
         .await?
         .ok_or(RetriggerError::DepositNotFound)?;
     if endpoints.is_empty() {
         return Err(RetriggerError::NoActiveEndpoints);
-    }
-    if deposit.status != DepositStatus::Confirmed.as_db() {
-        return Err(RetriggerError::DepositNotConfirmed);
-    }
-    if deposit_replay_event(state, &deposit).await? != Some(event) {
-        return Err(RetriggerError::NoDepositEvent);
     }
 
     for endpoint in &endpoints {
@@ -1045,7 +1041,7 @@ async fn prepare_delivery(
                 .db
                 .get_or_create_deposit_webhook_delivery(event, subject_id, endpoint_id)
                 .await?;
-            let received_raw = state.db.confirmed_total_raw(&address.id).await?;
+            let received_raw = received_snapshot(state, &delivery, &address.id).await?;
             let payload = deposit_event_payload(event, &address, &deposit, received_raw)?;
             let occurred_at = deposit.confirmed_at.unwrap_or(deposit.detected_at);
             Ok(Some((delivery, payload, occurred_at)))
@@ -1063,7 +1059,7 @@ async fn prepare_delivery(
                 _ => address.updated_at,
             };
             let received_raw = match event {
-                WebhookEventType::Expired => Some(state.db.confirmed_total_raw(&address.id).await?),
+                WebhookEventType::Expired => Some(received_snapshot(state, &delivery, &address.id).await?),
                 _ => None,
             };
             Ok(Some((delivery, address_event_payload(event, &address, received_raw)?, occurred_at)))
@@ -1123,6 +1119,20 @@ async fn prepare_delivery(
                 .get_or_create_subject_webhook_delivery(event, subject_id, endpoint_id)
                 .await?;
             Ok(Some((delivery, alerts::alert_payload(&alert)?, alert.created_at)))
+        }
+    }
+}
+
+/// The `received_amount_raw` a delivery sends on every attempt: the
+/// snapshot taken when its row was written (in the status transaction), or —
+/// for a row without one — the confirmed total now, stored for the next
+/// attempts.
+async fn received_snapshot(state: &AppState, delivery: &db::WebhookDeliveryRow, address_id: &str) -> Result<u128> {
+    match delivery.received_raw {
+        Some(snapshot) => Ok(snapshot.0),
+        None => {
+            let now = state.db.confirmed_total_raw(address_id).await?;
+            state.db.snapshot_received_raw(&delivery.id, now).await
         }
     }
 }
@@ -1403,12 +1413,25 @@ async fn monitor_loop(state: AppState, network: Network, poll_secs: u64) {
     let mut interval = tokio::time::interval(Duration::from_secs(poll_secs));
     // A pass longer than the interval must not trigger a burst of passes.
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let late_every = Duration::from_secs(state.config.late_watch_poll_seconds);
+    let mut last_late_pass: Option<std::time::Instant> = None;
     loop {
         interval.tick().await;
-        if let Err(err) = poll_network(&state, network).await {
+        let include_late = late_pass_due(last_late_pass, std::time::Instant::now(), late_every);
+        if include_late {
+            last_late_pass = Some(std::time::Instant::now());
+        }
+        if let Err(err) = poll_network(&state, network, include_late).await {
             error!("{network:?} monitor error: {err:#}");
         }
     }
+}
+
+/// Whether a monitor pass also polls the addresses in their late watch:
+/// the first pass, then once `every` (`LATE_WATCH_POLL_SECONDS`) has passed
+/// since the last one that did. Open payments are polled every pass.
+pub fn late_pass_due(last: Option<std::time::Instant>, now: std::time::Instant, every: Duration) -> bool {
+    last.is_none_or(|last| now.saturating_duration_since(last) >= every)
 }
 
 /// Poll `network`'s watched payments (the open ones, then those in their
@@ -1416,7 +1439,9 @@ async fn monitor_loop(state: AppState, network: Network, poll_secs: u64) {
 /// after the poll, so a payment always gets a last look before
 /// it expires (no boot-time race either — the first pass of every loop
 /// polls before it expires anything).
-async fn poll_network(state: &AppState, network: Network) -> Result<()> {
+/// `include_late`: also the paid and expired addresses in their late watch
+/// (`late_pass_due`).
+async fn poll_network(state: &AppState, network: Network, include_late: bool) -> Result<()> {
     if !state.is_network_enabled(network) {
         debug!(
             "Skipping {:?} monitor — {}",
@@ -1430,7 +1455,7 @@ async fn poll_network(state: &AppState, network: Network) -> Result<()> {
         return Ok(());
     }
 
-    let addresses = state.db.watched_addresses(network).await?;
+    let addresses = state.db.watched_addresses(network, include_late).await?;
     if network == Network::Lightning {
         // A failed reconciliation returns early: nothing expires unpolled.
         reconcile_lightning(state, &addresses).await?;
@@ -2539,6 +2564,7 @@ mod tests {
             confirmations: 19,
             status: status.as_db().into(),
             late,
+            webhook_event: None,
             detected_at: now,
             confirmed_at: Some(now),
         }
@@ -2611,6 +2637,38 @@ mod tests {
         assert_eq!(expired["data"]["expected_amount"], "8.57");
         let pending = address_event_payload(WebhookEventType::Pending, &address, None).unwrap();
         assert!(pending["data"].get("received_amount_raw").is_none());
+    }
+
+    #[test]
+    fn a_replay_sends_the_event_the_confirmation_fired_and_nothing_else() {
+        let with = |event: Option<&str>| db::DepositRow {
+            webhook_event: event.map(str::to_string),
+            ..deposit_row(false, DepositStatus::Confirmed)
+        };
+        // The deposit that paid its address: `paid`.
+        assert_eq!(deposit_replay_event(&with(Some("PAID"))), Some(WebhookEventType::Paid));
+        // Confirmed once the address had left PENDING (late, or detected
+        // before another transfer paid it): `late`.
+        assert_eq!(deposit_replay_event(&with(Some("LATE"))), Some(WebhookEventType::Late));
+        // Another deposit of a paid address (a partial transfer): nothing —
+        // never a second `paid` with a new event id.
+        assert_eq!(deposit_replay_event(&with(None)), None);
+        assert_eq!(deposit_replay_event(&with(Some("EXPIRED"))), None);
+        assert_eq!(deposit_replay_event(&with(Some("BOGUS"))), None);
+    }
+
+    #[test]
+    fn late_watch_addresses_are_polled_at_their_own_cadence() {
+        let every = Duration::from_secs(300);
+        let start = std::time::Instant::now();
+        // The first pass polls everything.
+        assert!(late_pass_due(None, start, every));
+        // Then open payments only, until 5 minutes have passed.
+        assert!(!late_pass_due(Some(start), start + Duration::from_secs(10), every));
+        assert!(!late_pass_due(Some(start), start + Duration::from_secs(299), every));
+        assert!(late_pass_due(Some(start), start + Duration::from_secs(300), every));
+        // A clock that does not move forward never panics.
+        assert!(!late_pass_due(Some(start + Duration::from_secs(5)), start, every));
     }
 
     #[test]

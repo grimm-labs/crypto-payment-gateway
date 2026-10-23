@@ -251,6 +251,11 @@ pub const AMOUNT_TOLERANCE_PERCENT_MAX: f64 = 5.0;
 /// this many hours past its deadline (`LATE_WATCH_HOURS`, 0 turns it off).
 pub const LATE_WATCH_HOURS_DEFAULT: i64 = 24;
 pub const LATE_WATCH_HOURS_MAX: i64 = 72;
+/// Paid and expired addresses in their late watch are polled at most this
+/// often (`LATE_WATCH_POLL_SECONDS`), open payments every pass
+/// (`POLLING_INTERVAL_SECONDS`): the watch multiplies the watched set.
+pub const LATE_WATCH_POLL_SECONDS_DEFAULT: u64 = 300;
+pub const LATE_WATCH_POLL_SECONDS_MAX: u64 = 3600;
 pub const ACCESS_TOKEN_TTL_MAX_MINUTES: i64 = 60;
 pub const REFRESH_TOKEN_TTL_MAX_DAYS: i64 = 90;
 pub const JWT_SECRET_MIN_LEN: usize = 32;
@@ -309,6 +314,8 @@ pub struct AppConfig {
     pub amount_tolerance_percent: f64,
     /// Hours a paid or expired address stays watched past its deadline.
     pub late_watch_hours: i64,
+    /// Seconds between two polls of the addresses in their late watch.
+    pub late_watch_poll_seconds: u64,
     pub trongrid_api_key: Option<String>,
     pub alchemy_api_key: Option<String>,
     pub helius_api_key: Option<String>,
@@ -360,6 +367,7 @@ impl std::fmt::Debug for AppConfig {
             .field("tron_confirmations", &self.tron_confirmations)
             .field("amount_tolerance_percent", &self.amount_tolerance_percent)
             .field("late_watch_hours", &self.late_watch_hours)
+            .field("late_watch_poll_seconds", &self.late_watch_poll_seconds)
             .field("trongrid_api_key", &redact(&self.trongrid_api_key))
             .field("alchemy_api_key", &redact(&self.alchemy_api_key))
             .field("helius_api_key", &redact(&self.helius_api_key))
@@ -449,6 +457,7 @@ impl AppConfig {
             tron_confirmations: vars.parse_or("TRON_CONFIRMATIONS", 19)?,
             amount_tolerance_percent: vars.parse_or("AMOUNT_TOLERANCE_PERCENT", 1.0)?,
             late_watch_hours: vars.parse_or("LATE_WATCH_HOURS", LATE_WATCH_HOURS_DEFAULT)?,
+            late_watch_poll_seconds: vars.parse_or("LATE_WATCH_POLL_SECONDS", LATE_WATCH_POLL_SECONDS_DEFAULT)?,
             trongrid_api_key: vars.optional("TRONGRID_API_KEY"),
             alchemy_api_key: vars.optional("ALCHEMY_API_KEY"),
             helius_api_key: vars.optional("HELIUS_API_KEY"),
@@ -521,6 +530,9 @@ impl AppConfig {
         }
         if !(0..=LATE_WATCH_HOURS_MAX).contains(&self.late_watch_hours) {
             bail!("LATE_WATCH_HOURS must be between 0 and {LATE_WATCH_HOURS_MAX}");
+        }
+        if !(1..=LATE_WATCH_POLL_SECONDS_MAX).contains(&self.late_watch_poll_seconds) {
+            bail!("LATE_WATCH_POLL_SECONDS must be between 1 and {LATE_WATCH_POLL_SECONDS_MAX}");
         }
         if self.polling_interval_seconds == 0 {
             bail!("POLLING_INTERVAL_SECONDS must be at least 1");
@@ -966,6 +978,8 @@ mod tests {
             ("AMOUNT_TOLERANCE_PERCENT", "-1"),
             ("LATE_WATCH_HOURS", "73"),
             ("LATE_WATCH_HOURS", "-1"),
+            ("LATE_WATCH_POLL_SECONDS", "0"),
+            ("LATE_WATCH_POLL_SECONDS", "3601"),
             ("ACCESS_TOKEN_TTL_MINUTES", "0"),
             ("ACCESS_TOKEN_TTL_MINUTES", "1440"),
             ("REFRESH_TOKEN_TTL_DAYS", "365"),
@@ -985,6 +999,9 @@ mod tests {
         assert_eq!(config_with(&[("LATE_WATCH_HOURS", "72")]).unwrap().late_watch_hours, 72);
         let err = config_with(&[("LATE_WATCH_HOURS", "a day")]).unwrap_err();
         assert!(format!("{err:#}").contains("LATE_WATCH_HOURS"));
+        // Watched addresses past their deadline: every 5 minutes by default.
+        assert_eq!(config_with(&[]).unwrap().late_watch_poll_seconds, 300);
+        assert_eq!(config_with(&[("LATE_WATCH_POLL_SECONDS", "60")]).unwrap().late_watch_poll_seconds, 60);
     }
 
     #[test]

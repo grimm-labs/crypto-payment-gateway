@@ -938,26 +938,18 @@ pub fn admit_transfer(network: Network, status: DepositAddressStatus, watch_open
 }
 
 /// The event recording a transfer fires (ADR 0005): `paid` when it set its
-/// address PAID, `late` when it confirmed a late deposit, nothing otherwise
-/// (a partial transfer, a detection, a repeat).
-pub fn deposit_event(paid: bool, newly_confirmed: bool, late: bool) -> Option<WebhookEventType> {
+/// address PAID; `late` when it confirmed a deposit once its address had
+/// left PENDING (`address_pending`: the status read under the lock, before
+/// the call) — a late deposit, or one detected while the address was
+/// pending that confirms after another transfer paid it or after it
+/// expired; nothing otherwise (a partial transfer, a detection, a repeat).
+pub fn deposit_event(paid: bool, newly_confirmed: bool, address_pending: bool) -> Option<WebhookEventType> {
     if paid {
         Some(WebhookEventType::Paid)
-    } else if newly_confirmed && late {
+    } else if newly_confirmed && !address_pending {
         Some(WebhookEventType::Late)
     } else {
         None
-    }
-}
-
-/// Whether the pollers watch an address (`Db::watched_addresses` is the SQL
-/// form of this rule): every PENDING one; a PAID or EXPIRED one while its
-/// late watch is open or a deposit of it still confirms — never a Lightning
-/// invoice once it left PENDING (an expired invoice cannot be paid).
-pub fn is_watched(network: Network, status: DepositAddressStatus, watch_open: bool, has_detected: bool) -> bool {
-    match status {
-        DepositAddressStatus::Pending => true,
-        _ => network != Network::Lightning && (watch_open || has_detected),
     }
 }
 
@@ -1129,30 +1121,15 @@ mod tests {
     #[test]
     fn paid_fires_once_when_the_total_pays_and_late_once_confirmed() {
         // The transfer whose confirmation made the total pay the address.
-        assert_eq!(deposit_event(true, true, false), Some(WebhookEventType::Paid));
+        assert_eq!(deposit_event(true, true, true), Some(WebhookEventType::Paid));
         // A first, partial transfer (5 of 8.57) or a detection: nothing.
-        assert_eq!(deposit_event(false, true, false), None);
-        assert_eq!(deposit_event(false, false, false), None);
-        // A late deposit fires `late` when it confirms, not when detected.
-        assert_eq!(deposit_event(false, true, true), Some(WebhookEventType::Late));
+        assert_eq!(deposit_event(false, true, true), None);
         assert_eq!(deposit_event(false, false, true), None);
-    }
-
-    #[test]
-    fn watched_addresses_follow_the_late_watch() {
-        use DepositAddressStatus::{Expired, Paid, Pending};
-        assert!(is_watched(Network::Tron, Pending, false, false));
-        assert!(is_watched(Network::Lightning, Pending, false, false));
-        // An expired address until its watch ends…
-        assert!(is_watched(Network::Tron, Expired, true, false));
-        assert!(!is_watched(Network::Tron, Expired, false, false));
-        // …and after it while a deposit still confirms.
-        assert!(is_watched(Network::Bitcoin, Expired, false, true));
-        assert!(is_watched(Network::Ethereum, Paid, false, true));
-        assert!(is_watched(Network::Solana, Paid, true, false));
-        for status in [Paid, Expired] {
-            assert!(!is_watched(Network::Lightning, status, true, true));
-        }
+        // Confirmed once the address left PENDING — a late deposit, or one
+        // detected before another transfer paid it or before it expired:
+        // `late`, when it confirms, never when detected.
+        assert_eq!(deposit_event(false, true, false), Some(WebhookEventType::Late));
+        assert_eq!(deposit_event(false, false, false), None);
     }
 
     #[test]

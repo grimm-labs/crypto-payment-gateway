@@ -137,9 +137,16 @@ async fn set_status(
 }
 
 /// Statuses a deposit address must have to be swept: the payment can no
-/// longer complete.
-const FINAL_ADDRESS: &str = r#"a.status IN ('PAID'::"DepositAddressStatus", 'EXPIRED'::"DepositAddressStatus")
-  AND NOT EXISTS (SELECT 1 FROM deposits d WHERE d."depositAddressId" = a.id AND d.status = 'DETECTED'::"DepositStatus")"#;
+/// longer complete, and no deposit of it is still confirming
+/// (`crate::still_confirming`: a DETECTED one stuck past the hold — a
+/// dropped transaction — no longer blocks the sweep).
+fn final_address() -> String {
+    format!(
+        r#"a.status IN ('PAID'::"DepositAddressStatus", 'EXPIRED'::"DepositAddressStatus")
+  AND NOT ({})"#,
+        crate::still_confirming("a")
+    )
+}
 
 impl Db {
     /// Create a sweep; `None` when one is already in progress for the
@@ -298,7 +305,8 @@ impl Db {
                   AND s.status NOT IN ('CONFIRMED'::"SweepStatus", 'FAILED'::"SweepStatus", 'SKIPPED'::"SweepStatus")
               )
             ORDER BY a."createdAt" ASC
-            "#
+            "#,
+            FINAL_ADDRESS = final_address(),
         ))
         .bind(network.as_db())
         .fetch_all(&self.pool)
@@ -319,7 +327,8 @@ impl Db {
                   AND s.status NOT IN ('CONFIRMED'::"SweepStatus", 'FAILED'::"SweepStatus", 'SKIPPED'::"SweepStatus")
               )
             ORDER BY a."createdAt" ASC
-            "#
+            "#,
+            FINAL_ADDRESS = final_address(),
         ))
         .bind(network.as_db())
         .fetch_all(&self.pool)
