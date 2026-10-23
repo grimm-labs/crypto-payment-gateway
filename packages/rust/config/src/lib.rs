@@ -224,6 +224,16 @@ pub const WEBHOOK_DELIVERY_CONCURRENCY: usize = 16;
 /// the worker dies mid-delivery the member reappears (at-least-once).
 pub const WEBHOOK_CLAIM_LEASE_SECS: i64 = 60;
 const _: () = assert!(WEBHOOK_CLAIM_LEASE_SECS as u64 > WEBHOOK_HTTP_TIMEOUT_SECS * 3);
+/// Deliveries are written with their status change and queued after the
+/// commit; this often, every PENDING one whose next attempt is due and
+/// whose queue member is missing (a crash or a failed `ZADD`) is queued
+/// again — read in pages of `WEBHOOK_RECONCILE_BATCH` rows.
+pub const WEBHOOK_RECONCILE_INTERVAL_SECS: u64 = 60;
+pub const WEBHOOK_RECONCILE_BATCH: i64 = 500;
+/// A PENDING delivery untouched for longer than this is history (deliveries
+/// span about an hour): the reconciliation leaves it to a manual retry
+/// rather than replaying a week-old event.
+pub const WEBHOOK_RECONCILE_MAX_AGE_SECS: i64 = 7 * 24 * 60 * 60;
 
 /// Staff passwords (argon2id): the upper bound caps the hashing cost.
 pub const PASSWORD_MIN_LEN: usize = 12;

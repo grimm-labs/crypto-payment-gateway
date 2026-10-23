@@ -918,6 +918,19 @@ pub fn admit_transfer(network: Network, status: DepositAddressStatus, watch_open
     }
 }
 
+/// The event recording a transfer fires (ADR 0005): `paid` when it set its
+/// address PAID, `late` when it confirmed a late deposit, nothing otherwise
+/// (a partial transfer, a detection, a repeat).
+pub fn deposit_event(paid: bool, newly_confirmed: bool, late: bool) -> Option<WebhookEventType> {
+    if paid {
+        Some(WebhookEventType::Paid)
+    } else if newly_confirmed && late {
+        Some(WebhookEventType::Late)
+    } else {
+        None
+    }
+}
+
 /// Whether the pollers watch an address (`Db::watched_addresses` is the SQL
 /// form of this rule): every PENDING one; a PAID or EXPIRED one while its
 /// late watch is open or a deposit of it still confirms — never a Lightning
@@ -1077,6 +1090,18 @@ mod tests {
             // An invoice is paid once.
             assert_eq!(admit_transfer(Network::Lightning, status, true), TransferAdmission::Ignore);
         }
+    }
+
+    #[test]
+    fn paid_fires_once_when_the_total_pays_and_late_once_confirmed() {
+        // The transfer whose confirmation made the total pay the address.
+        assert_eq!(deposit_event(true, true, false), Some(WebhookEventType::Paid));
+        // A first, partial transfer (5 of 8.57) or a detection: nothing.
+        assert_eq!(deposit_event(false, true, false), None);
+        assert_eq!(deposit_event(false, false, false), None);
+        // A late deposit fires `late` when it confirms, not when detected.
+        assert_eq!(deposit_event(false, true, true), Some(WebhookEventType::Late));
+        assert_eq!(deposit_event(false, false, true), None);
     }
 
     #[test]

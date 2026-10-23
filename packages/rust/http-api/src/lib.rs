@@ -19,7 +19,7 @@ use domain::{
 };
 use jobs::{
     get_cached_wallet_balances, get_live_balances, lightning_payment_entry,
-    lightning_payment_history, notify_address_event, retrigger_failed_deposit_webhooks,
+    lightning_payment_history, queue_deliveries, retrigger_failed_deposit_webhooks,
     retrigger_webhook, Actor, AppState, LightningError, LightningHistoryEntry, RetriggerError,
 };
 use middleware::{ClientIp, CurrentApiKey, CurrentStaff};
@@ -395,7 +395,7 @@ async fn create_deposit_address(
     let metadata = body.metadata.unwrap_or_else(|| json!({}));
     // The late watch (ADR 0005): polled this long past the deadline.
     let watch_until = expires_at + Duration::hours(state.config.late_watch_hours);
-    let row = state
+    let (row, deliveries) = state
         .db
         .create_deposit_address(
             network,
@@ -408,14 +408,14 @@ async fn create_deposit_address(
             metadata,
             api_key.as_deref().map(|key| key.id.as_str()),
             project_id.as_deref(),
+            jobs::projects::projects_exist(&state).await?,
         )
         .await?;
 
-    // The address is created PENDING — fan out the PENDING event to the
-    // subscribed endpoints. A queueing failure must not fail the creation.
-    if let Err(err) = notify_address_event(&state, &row.id, WebhookEventType::Pending).await {
-        tracing::warn!("Failed to queue PENDING webhook for address {}: {err:#}", row.id);
-    }
+    // The address is created PENDING, its `pending` deliveries written with
+    // it: queue them. A queueing failure must not fail the creation (the
+    // reconciliation queues them again).
+    queue_deliveries(&state, WebhookEventType::Pending, &row.id, &deliveries).await;
 
     Ok((StatusCode::CREATED, Json(to_response(&row, 0, &state.config)?)))
 }

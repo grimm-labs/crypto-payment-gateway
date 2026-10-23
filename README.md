@@ -747,6 +747,15 @@ If no active webhook endpoint is configured, a warning is logged at startup and 
 
 Delivery is attempted up to 5 times with increasing gaps — 90s, 4m30, 13m30, 40m30 — so the 5th and final attempt starts ~1h after the first. After that the delivery is marked `failed` and can only be resent via the retry endpoint. Delivery is **at least once**: a worker stopped mid-delivery (deploy, crash) leaves a 60 s lease after which the delivery is retried, so receivers must treat replays as the same event (deduplicate on `event_id`). Up to 16 deliveries run concurrently.
 
+The payment events are **written with their status change**: the delivery rows of `pending`,
+`paid`, `expired` and `late` (one per target endpoint) are inserted in the database
+transaction that creates the address, pays it, expires it or confirms the late deposit, then
+queued in Redis after the commit. A crash or a Redis failure between the two loses nothing:
+every 60 seconds (and at boot) a **reconciliation** queues again each pending delivery whose
+next attempt is due and that is neither queued nor being delivered (deliveries untouched for
+more than 7 days are left to a manual retry). A delivered or failed delivery is never sent by
+it.
+
 ## Deployment (Kamal)
 
 Deploys use [Kamal 2](https://kamal-deploy.org): `config/deploy.yml` is one file for the

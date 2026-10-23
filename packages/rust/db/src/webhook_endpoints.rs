@@ -6,6 +6,15 @@ use uuid::Uuid;
 
 use crate::{owner_condition, Db, OwnerFilter};
 
+/// The endpoints an event fans out to (spec §10.1), over `webhook_endpoints
+/// e`: active, subscribed to the event at `$event`, and — when `$filtered`
+/// (once projects exist) — owned by the project at `$project` (NULL: the
+/// merchant). `jobs::webhooks::endpoints_for` and the deliveries written
+/// with a status change both use it.
+pub(crate) fn subscribed_endpoints(event: &str, filtered: &str, project: &str) -> String {
+    format!(r#"e."isActive" = true AND {event} = ANY(e.events) AND (NOT {filtered} OR e."projectId" IS NOT DISTINCT FROM {project})"#)
+}
+
 const WEBHOOK_ENDPOINT_COLUMNS: &str = r#"id, url, "isActive", events, secret, "createdById", "projectId", "createdAt" AT TIME ZONE 'UTC' AS "createdAt", "updatedAt" AT TIME ZONE 'UTC' AS "updatedAt""#;
 
 #[derive(Clone, FromRow)]
@@ -193,11 +202,11 @@ impl Db {
     ) -> Result<Vec<WebhookEndpointRow>> {
         let rows = sqlx::query_as::<_, WebhookEndpointRow>(&format!(
             r#"
-            SELECT {WEBHOOK_ENDPOINT_COLUMNS} FROM webhook_endpoints
-            WHERE "isActive" = true AND $1 = ANY(events)
-              AND (NOT $2 OR "projectId" IS NOT DISTINCT FROM $3)
+            SELECT {WEBHOOK_ENDPOINT_COLUMNS} FROM webhook_endpoints e
+            WHERE {}
             ORDER BY "createdAt" ASC
-            "#
+            "#,
+            subscribed_endpoints("$1", "$2", "$3")
         ))
         .bind(event.as_db())
         .bind(owner.is_some())
