@@ -6,3 +6,15 @@ allowBuilds:
   '@tailwindcss/oxide': true
   esbuild: true
   nx: true
+
+# Transitive versions raised within their major line, until the parents
+# (shadcn, @dotenvx/dotenvx, nx, eslint, ajv, tailwind) require them.
+overrides:
+  brace-expansion@<1.1.21: 1.1.21
+  brace-expansion@>=5.0.0 <5.0.12: 5.0.12
+  fast-uri@>=3.0.0 <3.1.9: 3.1.9
+  js-yaml@>=4.0.0 <4.3.2: 4.3.2
+  source-map-js@<1.2.2: 1.2.2
+  systeminformation@<5.33.19: 5.33.19
+  undici@>=7.0.0 <7.30.2: 7.30.1
+  zod@>=4.0.0 <4.6.7: 4.6.7
