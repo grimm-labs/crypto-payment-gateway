@@ -27,6 +27,8 @@ jobs:
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           fetch-depth: 0
+          # Nothing in this job pushes: no token left in .git/config.
+          persist-credentials: false
 
       # Pinned explicitly (matches package.json's packageManager).
       - uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320 # v4.4.0

@@ -24,7 +24,8 @@ anyhow = "1"
 argon2 = { version = "0.5", features = ["std"] }
 async-trait = "0.1"
 axum = { version = "0.8", features = ["macros"] }
-jsonwebtoken = "9"
+# rust_crypto: the pure-Rust backend (HS256 only is used, see packages/rust/auth).
+jsonwebtoken = { version = "10", features = ["rust_crypto"] }
 rand = "0.8"
 subtle = "2"
 base58 = "0.2"

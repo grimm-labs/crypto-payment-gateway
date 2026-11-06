@@ -32,6 +32,14 @@ ignore = [
     # Drop when solana-sdk is replaced by the solana-pubkey/spl crates or upgraded.
     { id = "RUSTSEC-2024-0344", reason = "curve25519-dalek 3.x via solana-sdk 2.x, never used to sign (Solana signatures use ed25519-dalek 2)" },
     { id = "RUSTSEC-2022-0093", reason = "the gateway never signs with ed25519-dalek 1.x (solana_sdk::Keypair); Solana signatures use ed25519-dalek 2" },
+    # rsa 0.9 only arrives through jsonwebtoken's rust_crypto backend. Staff
+    # JWTs are HS256 only (auth::issue_access_token / decode_access_token pin
+    # Algorithm::HS256): no RSA key is ever loaded or used.
+    { id = "RUSTSEC-2023-0071", reason = "rsa via jsonwebtoken rust_crypto; tokens are HS256 only, no RSA key is ever used" },
+    # crypto-bigint 0.5 comes with elliptic-curve 0.13 (k256 for alloy and the wallet signer,
+    # p256/p384). Only the 0.7 line has the fix, and it needs elliptic-curve/k256 0.14, still
+    # pre-release: drop this entry when alloy and k256 move to it.
+    { id = "RUSTSEC-2026-0387", reason = "crypto-bigint 0.5 via elliptic-curve 0.13 (k256, p256, p384); fix only in 0.7, which needs k256 0.14 (pre-release)" },
 ]
 
 [licenses]
